@@ -11,6 +11,7 @@
 #include "bt_a2dp.h"
 #include "sys_monitor.h"
 #include "cover.h"
+#include "likes.h"
 
 /* 系统级消息队列句柄 (跨模块共享) */
 static QueueHandle_t s_app_cmd_queue  = NULL;   /* 应用命令队列: console→app 层(扫描/连接/播放等) */
@@ -33,6 +34,8 @@ void app_main(void)
     power_mgr_boot_battery_check();
 
     nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
+
+    likes_init();       /* 载入喜欢列表到 RAM (文件浏览器显示爱心图标用) */
 
     /* 创建三个系统队列 (容量 10/10/5, 元素为对应命令结构体) */
     s_app_cmd_queue  = xQueueCreate(10, sizeof(app_cmd_t));    /* 应用命令 */

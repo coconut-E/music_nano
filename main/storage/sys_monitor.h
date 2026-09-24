@@ -54,6 +54,20 @@ void music_scan_init(void);
 /* 强制全量扫描标志: 置位后 music_scan_init 忽略空间阈值, 用完自动清除 */
 extern volatile bool g_music_scan_force;
 
+/* ── 删除文件请求 (UI→sys_monitor 任务) ──
+ * UI 调 sd_request_delete_file() 发请求; sys_monitor 任务执行 remove 并把结果写进
+ * g_sd_delete_status (1=成功, -1=失败); UI 读后清零. */
+typedef struct {
+    char group[FS_GROUP_MAX];
+    char name [FS_NAME_MAX];
+    int  idx;
+} sd_delete_req_t;
+
+extern volatile int g_sd_delete_status;   /* 0=空闲/进行中, 1=成功, -1=失败 */
+
+/* 发送删除请求 (非阻塞): 清状态→写参数→置标志; 已有请求未处理时返回 false */
+bool sd_request_delete_file(const char *group, const char *name, int idx);
+
 /* 供其他模块读取的共享状态 (原子/volatile) */
 extern volatile bool   g_sd_ready;    /* SD 卡就绪标志 */
 extern volatile float  g_vbat;        /* 电池电压 (V) */

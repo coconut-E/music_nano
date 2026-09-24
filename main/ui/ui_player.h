@@ -34,6 +34,13 @@ void player_set_was_playing(bool v);
 const char *player_current_group(void);  /* 当前分组 */
 const char *player_current_name(void);   /* 当前文件名 */
 
+/* 循环次数 (随机/顺序: 每首重复次数, 1~9) */
+int  player_get_loop_count(void);
+void player_set_loop_count(int n);       /* 钳制 1~9, 并写 NVS */
+
+/* 删除当前播放文件: 关弹框后调用. 停音频→等其释放 SD→删除→修位图→重扫 (异步, 不阻塞 UI) */
+bool player_request_delete_current_file(void);
+
 #ifdef __cplusplus
 }
 #endif

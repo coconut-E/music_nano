@@ -29,6 +29,9 @@ int  played_bits_pick(const char *group);
 /* 将 group 的第 idx 位置 1 并持久化; 失败返回 false */
 bool played_bits_mark(const char *group, int idx);
 
+/* 删除第 idx 个文件后修正位图: 丢弃 idx 位, 其后各位左移 1 位, valid_bits-1, 持久化 */
+bool played_bits_remove_at(const char *group, int idx);
+
 #ifdef __cplusplus
 }
 #endif

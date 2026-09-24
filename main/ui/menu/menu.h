@@ -39,6 +39,7 @@ void fs_browser_on_sd_ready(void);                    /* SD 就绪 → 加载列
 void fs_browser_on_sd_remove(void);                   /* SD 拔出 → 清列表 */
 void fs_browser_refresh(void);                        /* 刷新列表 */
 void fs_browser_jump(void);                           /* 跳到当前播放歌曲 */
+void fs_browser_likes_changed(void);                  /* 喜欢状态变化: 重建列表图标 */
 
 /* ── 蓝牙设备列表 (menu_bt.c) ── */
 void bt_list_init(bt_a2dp_iface_t *iface);            /* 初始化蓝牙列表 */

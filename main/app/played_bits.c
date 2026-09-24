@@ -393,3 +393,154 @@ bool played_bits_mark(const char *group, int idx)
     pb_write_entry(pe);
     return true;
 }
+
+/* 在 NVS 中按 group 找该文件夹位图的键号 (无则返回 0).
+ * 冻结会释放 RAM 缓存, 故这里直接遍历字符串记录按路径匹配. */
+static uint32_t pb_find_id_by_group(nvs_handle_t h, const char *group)
+{
+    uint32_t found = 0;
+    nvs_iterator_t it = NULL;
+    esp_err_t res = nvs_entry_find_in_handle(h, NVS_TYPE_STR, &it);
+
+    while (res == ESP_OK && found == 0) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        if (info.key[0] == 'b') {
+            char *e = NULL;
+            unsigned long id = strtoul(info.key + 1, &e, 10);
+            if (e && *e == '\0' && id > 0 && id <= 0xFFFFFFFFul) {
+                size_t len = 0;
+                if (nvs_get_str(h, info.key, NULL, &len) == ESP_OK && len > 1 && len <= PB_VAL_MAX) {
+                    char *val = pb_alloc(len);
+                    if (val && nvs_get_str(h, info.key, val, &len) == ESP_OK) {
+                        char *p = val;
+                        char *e2 = NULL;
+                        unsigned long ver = strtoul(p, &e2, 10);
+                        if (ver == PB_VER && e2 && *e2 == ' ') {
+                            strtoul(e2 + 1, &e2, 10);          /* 跳过 valid_bits */
+                            if (e2 && *e2 == ' ') {
+                                char *pathhex = e2 + 1;
+                                char *sp = strchr(pathhex, ' ');
+                                if (sp) {
+                                    char path[FS_GROUP_MAX];
+                                    int plen = pb_hex_decode(pathhex, (size_t)(sp - pathhex),
+                                                             (uint8_t *)path, sizeof(path) - 1);
+                                    if (plen > 0) {
+                                        path[plen] = '\0';
+                                        for (char *q = path; *q; q++) {
+                                            if (*q == '%') *q = '/';   /* 兼容旧格式 */
+                                        }
+                                        if (strcmp(path, group) == 0) found = (uint32_t)id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (val) heap_caps_free(val);
+                }
+            }
+        }
+        res = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    return found;
+}
+
+/* 删除 group 第 idx 个文件后修正其 NVS 位图 (不依赖 RAM 缓存).
+ * 打开临时句柄 → 找到该文件夹记录 → 删 idx 位、其后左移 1、valid_bits-1 → 写回. */
+bool played_bits_remove_at(const char *group, int idx)
+{
+    if (!group || idx < 0) return false;
+
+    nvs_handle_t h;
+    if (nvs_open(PB_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+
+    uint32_t id = pb_find_id_by_group(h, group);
+    if (id == 0) { nvs_close(h); return false; }   /* 无记录: 从未置位, 无需修正 */
+
+    char key[16];
+    pb_key(key, sizeof(key), id);
+
+    size_t len = 0;
+    if (nvs_get_str(h, key, NULL, &len) != ESP_OK || len <= 1 || len > PB_VAL_MAX) {
+        nvs_close(h);
+        return false;
+    }
+    char *val = pb_alloc(len);
+    if (!val) { nvs_close(h); return false; }
+    if (nvs_get_str(h, key, val, &len) != ESP_OK) {
+        heap_caps_free(val);
+        nvs_close(h);
+        return false;
+    }
+
+    /* 解析 "ver valid_bits pathhex bitshex" */
+    char *e = NULL;
+    unsigned long ver = strtoul(val, &e, 10);
+    unsigned long vb  = 0;
+    char *pathhex = NULL, *sp = NULL;
+    bool ok = (ver == PB_VER && e && *e == ' ');
+    if (ok) {
+        vb = strtoul(e + 1, &e, 10);
+        ok = (e && *e == ' ');
+    }
+    if (ok) {
+        pathhex = e + 1;
+        sp = strchr(pathhex, ' ');
+        ok = (sp != NULL);
+    }
+    if (!ok || (int)vb <= idx) {   /* 解析失败或 idx 越界 */
+        heap_caps_free(val);
+        nvs_close(h);
+        return false;
+    }
+    const char *bitshex = sp + 1;
+
+    uint32_t nbytes = ((uint32_t)vb + 7) / 8;
+    uint8_t *bits = pb_alloc(nbytes);
+    if (!bits) { heap_caps_free(val); nvs_close(h); return false; }
+    memset(bits, 0, nbytes);
+    if (pb_hex_decode(bitshex, strlen(bitshex), bits, nbytes) < 0) {
+        heap_caps_free(bits); heap_caps_free(val); nvs_close(h);
+        return false;
+    }
+
+    /* 丢弃 idx 位, 其后各位整体前移 1 位 */
+    for (uint32_t i = (uint32_t)idx; i + 1 < (uint32_t)vb; i++) {
+        bool b = (bits[(i + 1) >> 3] >> ((i + 1) & 7)) & 1u;
+        uint32_t byte = i >> 3;
+        uint8_t  mask = (uint8_t)(1u << (i & 7));
+        if (b) bits[byte] |= mask;
+        else   bits[byte] &= (uint8_t)~mask;
+    }
+    uint32_t last = (uint32_t)vb - 1;
+    bits[last >> 3] &= (uint8_t)~(1u << (last & 7));   /* 清最高位 */
+    uint32_t nvb = (uint32_t)vb - 1;
+    uint32_t new_nbytes = (nvb + 7) / 8;
+
+    /* 重新编码 "1 <nvb> <pathhex> <bitshex>" 写回 */
+    size_t pathhex_len = (size_t)(sp - pathhex);
+    size_t need = 2 + 12 + 1 + pathhex_len + 1 + (size_t)new_nbytes * 2 + 1;
+    char *out = pb_alloc(need);
+    if (!out) { heap_caps_free(bits); heap_caps_free(val); nvs_close(h); return false; }
+
+    size_t pos = (size_t)snprintf(out, need, "%d %u ", PB_VER, (unsigned)nvb);
+    memcpy(out + pos, pathhex, pathhex_len);
+    pos += pathhex_len;
+    out[pos++] = ' ';
+    pos += pb_hex_encode(bits, new_nbytes, out + pos);
+    out[pos] = '\0';
+
+    esp_err_t r = nvs_set_str(h, key, out);
+    if (r == ESP_OK) r = nvs_commit(h);
+    if (r != ESP_OK) ESP_LOGW(TAG, "修正位图失败 %s: %s", key, esp_err_to_name(r));
+
+    heap_caps_free(out);
+    heap_caps_free(bits);
+    heap_caps_free(val);
+    nvs_close(h);
+
+    if (r == ESP_OK) ESP_LOGI(TAG, "位图删除 idx=%d (%s), 余 %u 位", idx, group, (unsigned)nvb);
+    return (r == ESP_OK);
+}

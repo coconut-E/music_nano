@@ -225,3 +225,34 @@ void settings_mode_save(play_mode_t mode)
         nvs_close(h);
     }
 }
+
+/* ──────────────────────────── 循环次数 ──────────────────────────── */
+#define LOOP_KEY   "loop_count"
+
+/* 读循环次数 (随机/顺序每首重复次数): 无记录/越界返回 1 */
+int settings_loop_count_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return LOOP_COUNT_MIN;
+
+    int32_t v = LOOP_COUNT_MIN;
+    esp_err_t ret = nvs_get_i32(h, LOOP_KEY, &v);
+    nvs_close(h);
+
+    if (ret == ESP_OK && v >= LOOP_COUNT_MIN && v <= LOOP_COUNT_MAX) return (int)v;
+    return LOOP_COUNT_MIN;
+}
+
+/* 保存循环次数到 NVS (钳制到 1~9) */
+void settings_loop_count_save(int n)
+{
+    if (n < LOOP_COUNT_MIN) n = LOOP_COUNT_MIN;
+    if (n > LOOP_COUNT_MAX) n = LOOP_COUNT_MAX;
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, LOOP_KEY, (int32_t)n);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}

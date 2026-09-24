@@ -17,8 +17,12 @@
 #include "ui_core.h"
 #include "ui_player.h"
 #include "menu.h"
+#include "menu_like.h"
+#include "menu_mode.h"
 #include "power_mgr.h"
 #include "played_bits.h"
+#include "song_hash.h"
+#include "likes.h"
 
 extern const lv_font_t lv_font_global_16;
 
@@ -125,9 +129,25 @@ static int  s_pl_index = 0;             /* 当前播放项索引 */
 static int  s_pl_count = 0;             /* 当前分组歌曲数 */
 
 static play_mode_t s_play_mode = PLAY_MODE_SEQUENTIAL;  /* 播放模式 */
+static int         s_loop_count = 1;           /* 随机/顺序: 每首重复次数 (1~9) */
+static int         s_cur_plays = 1;            /* 当前曲已播放次数 */
 static bool        s_auto_advancing = false;   /* 是否自动切歌中 (决定文件缺失时行为) */
 static int64_t     s_last_user_cmd_us = 0;     /* 上次用户命令时刻 (节流) */
 static bool        s_was_playing = false;      /* 影子播放状态 (蓝牙重连续播用) */
+
+/* ── 删除文件流程 (异步: 等音频释放 SD → 请求系统任务删除 → 修位图 → 重扫) ── */
+static lv_timer_t *s_del_timer = NULL;
+static char        s_del_group[FS_GROUP_MAX];
+static char        s_del_name[FS_NAME_MAX];
+static int         s_del_idx   = -1;
+static bool        s_del_sent  = false;   /* 是否已把请求发给系统任务 */
+static int64_t     s_del_t0    = 0;
+
+#define DEL_POLL_MS          20        /* 轮询周期 */
+#define DEL_AUDIO_TIMEOUT_US 500000    /* 段1: 等音频释放 SD 的上限 500ms */
+#define DEL_DONE_TIMEOUT_US  3000000   /* 段2: 等系统任务删除的上限 3s */
+
+static void del_wait_audio_cb(lv_timer_t *tmr);
 
 /* ── 文件不存在提示弹窗 ── */
 static lv_obj_t *s_dialog = NULL;
@@ -228,6 +248,20 @@ void player_show_cover(void *buf)
     cover_show(buf);
 }
 
+/* 封面容器长按: 有歌曲时弹出 喜欢/删除 窗口 */
+static void album_art_long_press(void)
+{
+    printf("[LVGL] album art long press\n");
+    if (!atomic_load_bool(&g_song_info_valid)) return;   /* 无歌曲: 忽略 */
+    like_menu_open();
+}
+
+static void album_art_long_press_cb(lv_event_t *e)
+{
+    (void)e;
+    album_art_long_press();
+}
+
 static void player_play_index(int idx)
 {
     if (s_pl_count <= 0) return;
@@ -250,6 +284,7 @@ static void player_play_index(int idx)
     if (!audio_user_send(&cmd)) return;
 
     s_pl_index = idx;
+    s_cur_plays = 1;                 /* 新曲: 已播次数归 1 */
     s_auto_advancing = false;
     s_was_playing = true;
     printf("[LVGL] PLAY: %s\n", path);
@@ -305,6 +340,7 @@ void player_advance(void)
     xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
     s_pl_index = next;
+    s_cur_plays = 1;                 /* 新曲: 已播次数归 1 */
     s_auto_advancing = true;
     s_was_playing = true;
     printf("[LVGL] AUTO PLAY: %s (mode %d)\n", path, s_play_mode);
@@ -319,9 +355,51 @@ void player_advance(void)
     fs_browser_refresh();
 }
 
+/* 重播当前曲 (随机/顺序的重复播放用): 不动索引, 不重置已播次数 */
+static void player_replay(void)
+{
+    const char *name = player_file_name_at(s_pl_group, s_pl_index);
+    if (!name) { player_advance(); return; }
+
+    char path[512];
+    fs_build_real_path(s_pl_group, name, path, sizeof(path));
+
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_PLAY;
+    size_t plen = strnlen(path, sizeof(cmd.path) - 1);
+    memcpy(cmd.path, path, plen);
+    cmd.path[plen] = '\0';
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
+
+    s_auto_advancing = true;
+    s_was_playing = true;
+    printf("[LVGL] REPLAY %d/%d: %s\n", s_cur_plays, s_loop_count, path);
+}
+
+/* 当前曲是否"喜欢" (键与文件浏览器一致: 文件名去扩展名 → xxHash32) */
+static bool current_song_is_liked(void)
+{
+    const char *name = player_current_name();
+    if (!name) return false;
+    char key[160];
+    song_hash_name_key(name, key, sizeof(key));
+    return likes_contains(song_hash32(key, strlen(key)));
+}
+
 void player_on_song_finished(void)
 {
     s_auto_advancing = true;
+
+    /* 随机/顺序: 仅"喜欢"的歌未播满 s_loop_count 次才重播 (单曲循环不受此影响) */
+    if ((s_play_mode == PLAY_MODE_RANDOM || s_play_mode == PLAY_MODE_SEQUENTIAL)
+        && s_cur_plays < s_loop_count
+        && current_song_is_liked()) {
+        s_cur_plays++;
+        player_replay();
+        return;
+    }
+
     player_advance();
 }
 
@@ -337,6 +415,75 @@ void player_on_file_not_found(void)
     }
 }
 
+/* 定时器回调: 两段式. 段1 等音频释放 SD; 段2 等系统任务删除完成, 再修位图并重扫 */
+static void del_wait_audio_cb(lv_timer_t *tmr)
+{
+    if (!s_del_sent) {
+        /* 段1: 等音频真正关闭解码器 (跨核并发, 必须等到它不再读 SD) */
+        bool open    = atomic_load_bool(&g_audio_decoder_open);
+        bool timeout = (esp_timer_get_time() - s_del_t0) > DEL_AUDIO_TIMEOUT_US;
+        if (open && !timeout) return;
+
+        /* 交给系统任务删除 (只置参数+标志, 立即返回, 不阻塞 UI) */
+        if (!sd_request_delete_file(s_del_group, s_del_name, s_del_idx)) {
+            lv_timer_del(tmr);
+            s_del_timer = NULL;
+            g_sd_manual_rescan = true;   /* 发不出去: 放弃并重扫恢复 UI */
+            return;
+        }
+        s_del_sent = true;
+        s_del_t0   = esp_timer_get_time();   /* 段2 计时起点 */
+        return;
+    }
+
+    /* 段2: 等系统任务回报结果 (1=成功, -1=失败) */
+    int st = g_sd_delete_status;
+    if (st == 0) {
+        if ((esp_timer_get_time() - s_del_t0) > DEL_DONE_TIMEOUT_US) st = -1;   /* 超时按失败 */
+        else return;
+    }
+    g_sd_delete_status = 0;   /* 清零 */
+
+    /* 成功才修位图 (纯 NVS, RAM 位图已被冻结释放); 失败不动位图 */
+    if (st == 1) played_bits_remove_at(s_del_group, s_del_idx);
+
+    /* 恢复 UI: 拔卡/插卡 + 全量重扫 (失败也重扫, 否则冻结状态卡住) */
+    g_sd_manual_rescan = true;
+
+    lv_timer_del(tmr);
+    s_del_timer = NULL;
+    s_del_sent  = false;
+}
+
+bool player_request_delete_current_file(void)
+{
+    if (s_del_timer || s_pl_count <= 0) return false;
+    const char *name = player_current_name();
+    if (!name) return false;
+
+    /* 先拷贝: 冻结/重扫后 g_fs_cache 指针会失效 */
+    snprintf(s_del_group, sizeof(s_del_group), "%s", s_pl_group);
+    snprintf(s_del_name,  sizeof(s_del_name),  "%s", name);
+    s_del_idx  = s_pl_index;
+    s_del_sent = false;
+
+    /* 1. 冻结 UI: 走拔卡路径(不卸载), 50ms 内清理: 停音频/复位播放器/清浏览器/置空缓存 */
+    atomic_store_bool(&g_sd_ready, false);
+
+    /* 2. 立即停音频 (清理分支也会发, 这里更及时) */
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_STOP;
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
+
+    /* 3. 建定时器: 等音频停稳 → 请求系统任务删除 → 等结果 → 修位图 → 重扫 */
+    s_del_t0    = esp_timer_get_time();
+    s_del_timer = lv_timer_create(del_wait_audio_cb, DEL_POLL_MS, NULL);
+    lv_timer_ready(s_del_timer);
+    printf("[LVGL] 请求删除: %s\n", name);
+    return true;
+}
+
 bool player_was_playing(void)
 {
     return s_was_playing;
@@ -345,6 +492,19 @@ bool player_was_playing(void)
 void player_set_was_playing(bool v)
 {
     s_was_playing = v;
+}
+
+int player_get_loop_count(void)
+{
+    return s_loop_count;
+}
+
+void player_set_loop_count(int n)
+{
+    if (n < LOOP_COUNT_MIN) n = LOOP_COUNT_MIN;
+    if (n > LOOP_COUNT_MAX) n = LOOP_COUNT_MAX;
+    s_loop_count = n;
+    settings_loop_count_save(n);
 }
 
 static void mode_update_icon(void)
@@ -360,8 +520,28 @@ static void mode_update_icon(void)
     }
 }
 
+static bool s_mode_long_pressed = false;   /* 长按已处理: 忽略松手后 LVGL 仍发的 CLICKED */
+
+static void mode_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    s_mode_long_pressed = false;   /* 每次按下复位, 保证标志只对本次长按有效 */
+}
+
+static void mode_long_press_cb(lv_event_t *e)
+{
+    (void)e;
+    s_mode_long_pressed = true;
+    mode_menu_open();
+}
+
 static void mode_btn_click_cb(lv_event_t *e)
 {
+    if (s_mode_long_pressed) {   /* 长按后松手仍会发 CLICKED, 吞掉这一次 */
+        s_mode_long_pressed = false;
+        return;
+    }
+
     s_play_mode = (play_mode_t)((s_play_mode + 1) % 3);
     mode_update_icon();
     printf("[LVGL] 播放模式: %d\n", s_play_mode);
@@ -612,6 +792,10 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
         s_pl_count = 0;
         s_pl_index = 0;
         player_update_label();
+
+        /* 置空缓存指针: 浏览器/播放器立即 inert, 重开文件管理器也是空列表.
+         * deinit 里还会再置一次并 free(s_fs_cache_owned), 重复置空无害. */
+        g_fs_cache = NULL;
 
         cover_clear();
 
@@ -1003,6 +1187,8 @@ void ui_player_init(void)
 {
     play_mode_t m;
     if (settings_mode_load(&m)) s_play_mode = m;
+    s_loop_count = settings_loop_count_load();
+    s_cur_plays  = 1;
 
     lv_obj_t *scr = lv_scr_act();
 
@@ -1088,6 +1274,8 @@ void ui_player_init(void)
     /* 封面铺满容器: 去内边距 + 禁止滚动 */
     lv_obj_set_style_pad_all(s_album_art, 0, 0);
     lv_obj_clear_flag(s_album_art, LV_OBJ_FLAG_SCROLLABLE);
+    /* 长按封面容器: 触发一次 (默认阈值 400ms) */
+    lv_obj_add_event_cb(s_album_art, album_art_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     lv_obj_t *album_icon = lv_label_create(s_album_art);
     lv_label_set_text(album_icon, LV_SYMBOL_AUDIO);
@@ -1249,6 +1437,8 @@ void ui_player_init(void)
     lv_obj_center(s_mode_icon);
     mode_update_icon();
     lv_obj_add_event_cb(mode_btn, mode_btn_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(mode_btn, mode_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(mode_btn, mode_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     /* ── 技术参数信息 (右侧 2x2) ── */
     /* 左上: 格式 */

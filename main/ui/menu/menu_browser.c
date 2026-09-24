@@ -6,6 +6,8 @@
 #include "sys_monitor.h"
 #include "ui_res.h"
 #include "ui_player.h"
+#include "song_hash.h"
+#include "likes.h"
 #include "menu.h"
 
 extern const lv_font_t lv_font_global_16;
@@ -67,6 +69,7 @@ static const char *s_cur_name  = NULL;
 
 static lv_img_dsc_t s_fs_icon_dir;    /* 文件夹图标 */
 static lv_img_dsc_t s_fs_icon_music;  /* 音乐文件图标 */
+static lv_img_dsc_t s_fs_icon_heart;  /* 已喜欢文件图标 (粉色爱心) */
 
 static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 点击播放回调 */
 
@@ -186,7 +189,15 @@ static void fs_row_set(lv_obj_t *btn, fs_entry_t *entry)
     }
 
     lv_obj_clear_flag(icon, LV_OBJ_FLAG_HIDDEN);
-    lv_img_set_src(icon, entry->is_dir ? &s_fs_icon_dir : &s_fs_icon_music);
+    if (entry->is_dir) {
+        lv_img_set_src(icon, &s_fs_icon_dir);
+    } else {
+        /* 已喜欢的文件显示粉色爱心, 否则显示 music 图标 */
+        char key[160];
+        song_hash_name_key(entry->name, key, sizeof(key));
+        bool liked = likes_contains(song_hash32(key, strlen(key)));
+        lv_img_set_src(icon, liked ? &s_fs_icon_heart : &s_fs_icon_music);
+    }
     lv_label_set_text(label, entry->name);
     lv_obj_set_user_data(btn, entry);   /* 存条目指针供点击回调 */
 
@@ -406,6 +417,11 @@ bool fs_browser_precreate_step(int budget_us)
             s_fs_icon_music.data_size = 16 * 21 * 2;
             s_fs_icon_music.header.cf = LV_IMG_CF_TRUE_COLOR;
             s_fs_icon_music.data = (const uint8_t *)icon_file[1];
+            s_fs_icon_heart.header.w = 16;
+            s_fs_icon_heart.header.h = 21;
+            s_fs_icon_heart.data_size = 16 * 21 * 2;
+            s_fs_icon_heart.header.cf = LV_IMG_CF_TRUE_COLOR;
+            s_fs_icon_heart.data = (const uint8_t *)icon_heart;
             s_fs_pc_step = FS_PC_OVERLAY;
             break;
 
@@ -688,6 +704,15 @@ void fs_browser_refresh(void)
     lv_coord_t scroll_y = lv_obj_get_scroll_y(s_fs_list);
     fs_browser_show_page(s_fs_page);
     lv_obj_scroll_to_y(s_fs_list, scroll_y, LV_ANIM_OFF);
+}
+
+/* 喜欢状态变化: 让已构建列表失效 (下次打开重建), 可见则立即重绘爱心图标 */
+void fs_browser_likes_changed(void)
+{
+    s_fs_built_valid = false;
+    if (s_fs_visible) {
+        fs_browser_show_page(s_fs_page);
+    }
 }
 
 /* 导航到当前播放歌曲所在目录并高亮 (SD 恢复时使用) */

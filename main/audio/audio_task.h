@@ -10,7 +10,8 @@
 extern "C" {
 #endif
 
-extern volatile bool g_pcm_active;   /* 是否正在推送 PCM 到蓝牙 (全局标志) */
+extern volatile bool g_pcm_active;          /* 是否正在推送 PCM 到蓝牙 (全局标志) */
+extern volatile bool g_audio_decoder_open;  /* 解码器是否已打开 (占用 SD 文件时为 true) */
 
 /* 音频命令类型 (UI 通过 cmd_queue 发来) */
 typedef enum {

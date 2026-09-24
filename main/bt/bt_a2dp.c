@@ -54,6 +54,7 @@ static bool s_connected = false;        /* A2DP 已连接 */
 static bool s_scanning = false;         /* 正在扫描 */
 static bool s_connecting = false;       /* 正在连接 */
 static bool s_stream_started = false;   /* 媒体流是否已启动 (START/SUSPEND 状态) */
+static volatile bool s_start_retry = false;  /* START 被 BUSY 拒绝, 待前一条命令完成后重发 */
 static esp_bd_addr_t s_peer_bda;        /* 对端(耳机)蓝牙地址 */
 
 /* 连接后音量时序: 等 AVRC 连上后延迟 VOL_SET_DELAY_MS 发音量, 期间禁止启动流 */
@@ -401,6 +402,7 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             s_connected = true;
             s_connecting = false;
             s_stream_started = false;
+            s_start_retry = false;
             memcpy(s_peer_bda, a2d->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
             /* 进入音量待设窗口: 等 AVRC 连上后再延迟发音量, 期间不启动流 */
             s_pending_vol = true;
@@ -418,6 +420,7 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             s_connected = false;
             s_connecting = false;
             s_stream_started = false;
+            s_start_retry = false;
             s_pending_vol = false;
             s_avrc_connected = false;
             s_avrc_at_us = 0;
@@ -439,6 +442,11 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
                    a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             ESP_LOGI(BT_TAG, "A2DP 流媒体已挂起");
             send_evt(BT_EVT_STREAM_STOPPED, NULL, 0);
+        } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
+                   a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_BUSY) {
+            /* 前一条命令尚未 ACK, START 被丢弃: 标记, 待其完成后重发 (非阻塞) */
+            s_start_retry = true;
+            ESP_LOGW(BT_TAG, "START 被 BUSY 拒绝, 稍后重发");
         }
         break;
     }
@@ -761,7 +769,11 @@ static void bt_a2dp_task(void *arg)
                 }
                 if (!s_pending_vol) {   /* 音量窗口结束后, 按播放状态启停流 */
                     bool want = atomic_load_bool(&g_pcm_active);
-                    if (want != s_stream_started) {
+                    if (want && s_start_retry) {
+                        /* 上次 START 被 BUSY 丢弃: 前一条命令完成后重发 (非阻塞) */
+                        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                        s_start_retry = false;
+                    } else if (want != s_stream_started) {
                         esp_a2d_media_ctrl(want ? ESP_A2D_MEDIA_CTRL_START
                                                 : ESP_A2D_MEDIA_CTRL_SUSPEND);
                         s_stream_started = want;

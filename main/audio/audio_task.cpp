@@ -26,6 +26,7 @@
 
 extern "C" {
 volatile bool g_pcm_active = false;         /* 是否正在推流 (供 UI/电源判断播放中) */
+volatile bool g_audio_decoder_open = false; /* 解码器是否已打开 (可能占用 SD 文件) */
 song_info_t g_song_info = {};               /* 当前歌曲信息 (解码任务写, UI 读) */
 volatile bool g_song_info_valid = false;    /* 信息有效标志 */
 }
@@ -220,6 +221,7 @@ static void audio_task(void *arg)
 
     while (1) {
         atomic_store_bool(&g_pcm_active, (s_state == STATE_PLAYING));   /* 更新全局播放标志 */
+        atomic_store_bool(&g_audio_decoder_open, s_decoder != NULL);    /* 解码器是否占用 SD 文件 */
 
         switch (s_state) {
 

@@ -49,6 +49,13 @@ typedef enum {
 bool settings_mode_load(play_mode_t *mode);     /* 从 NVS 读播放模式, 成功返回 true; mode=输出 */
 void settings_mode_save(play_mode_t mode);      /* 保存播放模式到 NVS */
 
+/* ── 循环次数 (随机/顺序: 每首重复次数, 1~9) ── */
+#define LOOP_COUNT_MIN  1
+#define LOOP_COUNT_MAX  9
+
+int  settings_loop_count_load(void);            /* 读循环次数, 无记录/越界返回 1 */
+void settings_loop_count_save(int n);           /* 保存循环次数到 NVS (钳制 1~9) */
+
 #ifdef __cplusplus
 }
 #endif

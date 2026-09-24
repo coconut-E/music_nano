@@ -18,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include "atomic_utils.h"
 #include "power_mgr.h"
+#include "played_bits.h"
 #include "sys_monitor.h"
 
 /* 安全拷贝: 把 src 复制到 dst (目标大小 dst_sz), 保证结尾 '\0' */
@@ -54,6 +55,23 @@ volatile float g_vbat     = 0.0f;       /* 电池电压 (V) */
 volatile float g_cpu_temp = 0.0f;       /* CPU 温度 (C) */
 volatile bool  g_sd_manual_rescan = false;  /* 手动重扫标志 */
 fs_cache_t     *g_fs_cache     = NULL;      /* 文件缓存指针 (PSRAM) */
+
+/* 删除文件请求 (UI→本任务): 标志 + 参数, 结果写进 g_sd_delete_status */
+static volatile bool   s_del_req  = false;
+static sd_delete_req_t s_del_data;
+volatile int           g_sd_delete_status = 0;   /* 0=空闲/进行中, 1=成功, -1=失败 */
+
+bool sd_request_delete_file(const char *group, const char *name, int idx)
+{
+    if (s_del_req || !group || !name || idx < 0) return false;
+
+    g_sd_delete_status = 0;                                   /* 先清状态 */
+    buf_copy(s_del_data.group, sizeof(s_del_data.group), group);   /* 再写参数 */
+    buf_copy(s_del_data.name,  sizeof(s_del_data.name),  name);
+    s_del_data.idx = idx;
+    s_del_req = true;                                         /* 后置标志 (release) */
+    return true;
+}
 
 static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
 static bool          s_mounted = false;  /* 是否已挂载 */
@@ -336,6 +354,17 @@ static void sys_monitor_task(void *arg)
 
     while (1) {
         bool current = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 当前电平 */
+
+        /* 删除文件请求 (UI 已冻结界面并停音频): 删除并把结果回报给 UI */
+        if (s_del_req) {
+            char path[512];
+            fs_build_real_path(s_del_data.group, s_del_data.name, path, sizeof(path));
+            ESP_LOGI(TAG_DETECT, "执行删除: %s", path);
+            int r = remove(path);
+            if (r != 0) ESP_LOGW(TAG_DETECT, "删除失败: %s", path);
+            g_sd_delete_status = (r == 0) ? 1 : -1;   /* 1=成功, -1=失败 */
+            s_del_req = false;
+        }
 
         /* 手动重扫: 模拟拔卡→插卡流程 */
         if (g_sd_manual_rescan) {
