@@ -64,11 +64,11 @@ extern const lv_font_t lv_font_global_16;
 #define BRI_BTN_Y       46              /* 大触发按钮(容器内局部) y (避开顶部菜单按钮) */
 #define BRI_BTN_W       20              /* 大触发按钮宽 (比灰条宽, 好点) */
 #define BRI_BTN_H       100             /* 大触发按钮高 */
-#define BRI_BTN_TUNE_CLR lv_color_hex(0xFF0000)  /* 仅供透明前临时占位, 可删 */
+#define BRI_BTN_TUNE_CLR lv_color_hex(0xFF0000)  /* 触发按钮底色 (随即被设为全透明, 仅调试观察区域用) */
 #define BRI_DRAW_W      (BRI_PANEL_W + BRI_BTN_W)  /* 容器总宽 (必须包住整个大按钮, 否则超出的部分会被容器裁切) */
 #define BRI_DRAW_H      200             /* 容器总高 */
 #define BRI_ANIM_IN_MS  150             /* 弹出: overshoot 过冲 */
-#define BRI_ANIM_OUT_MS 300             /* 收回: 线性 */
+#define BRI_ANIM_OUT_MS 300             /* 收回: ease_in (先慢后快) */
 
 /* ── 电池图标: 顶部居中, 位于 n/n 标签上方 ── */
 #define BAT_BODY_W      18
@@ -136,12 +136,12 @@ static int64_t     s_last_user_cmd_us = 0;     /* 上次用户命令时刻 (节�
 static bool        s_was_playing = false;      /* 影子播放状态 (蓝牙重连续播用) */
 
 /* ── 删除文件流程 (异步: 等音频释放 SD → 请求系统任务删除 → 修位图 → 重扫) ── */
-static lv_timer_t *s_del_timer = NULL;
-static char        s_del_group[FS_GROUP_MAX];
-static char        s_del_name[FS_NAME_MAX];
-static int         s_del_idx   = -1;
+static lv_timer_t *s_del_timer = NULL;                       /* 驱动删除流程的两段式定时器 */
+static char        s_del_group[FS_GROUP_MAX];               /* 待删文件的 group (先拷贝防失效) */
+static char        s_del_name[FS_NAME_MAX];                 /* 待删文件名 */
+static int         s_del_idx   = -1;                        /* 待删文件在文件夹内的索引 (修位图用) */
 static bool        s_del_sent  = false;   /* 是否已把请求发给系统任务 */
-static int64_t     s_del_t0    = 0;
+static int64_t     s_del_t0    = 0;                         /* 当前阶段计时起点 (us) */
 
 #define DEL_POLL_MS          20        /* 轮询周期 */
 #define DEL_AUDIO_TIMEOUT_US 500000    /* 段1: 等音频释放 SD 的上限 500ms */
@@ -243,6 +243,7 @@ static void cover_show(void *buf)
     if (s_album_icon) lv_obj_add_flag(s_album_icon, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* 显示解码完成的封面 (供 audio/cover 任务投递的指针调用) */
 void player_show_cover(void *buf)
 {
     cover_show(buf);
@@ -256,12 +257,14 @@ static void album_art_long_press(void)
     like_menu_open();
 }
 
+/* LVGL 事件回调: 封面长按 */
 static void album_art_long_press_cb(lv_event_t *e)
 {
     (void)e;
     album_art_long_press();
 }
 
+/* 按索引播放 (索引自动取模回绕), 解析路径并投递 AUDIO_CMD_PLAY */
 static void player_play_index(int idx)
 {
     if (s_pl_count <= 0) return;
@@ -387,6 +390,7 @@ static bool current_song_is_liked(void)
     return likes_contains(song_hash32(key, strlen(key)));
 }
 
+/* 一首播放完毕: 喜欢歌未播满循环次数则重播, 否则前进到下一首 */
 void player_on_song_finished(void)
 {
     s_auto_advancing = true;
@@ -403,6 +407,7 @@ void player_on_song_finished(void)
     player_advance();
 }
 
+/* 文件不存在: 自动前进中则跳过, 否则复位信息并弹"重新扫描"对话框 */
 void player_on_file_not_found(void)
 {
     if (s_auto_advancing) {
@@ -455,6 +460,7 @@ static void del_wait_audio_cb(lv_timer_t *tmr)
     s_del_sent  = false;
 }
 
+/* 请求删除当前文件: 冻结 UI → 停音频 → (定时器)请求系统任务删除 → 修位图 → 重扫 */
 bool player_request_delete_current_file(void)
 {
     if (s_del_timer || s_pl_count <= 0) return false;
@@ -489,6 +495,7 @@ bool player_was_playing(void)
     return s_was_playing;
 }
 
+/* 设置"播放中"影子标志 (供蓝牙重连后续播判断) */
 void player_set_was_playing(bool v)
 {
     s_was_playing = v;
@@ -499,6 +506,7 @@ int player_get_loop_count(void)
     return s_loop_count;
 }
 
+/* 设置循环次数 (钳制到 1~9) 并持久化到 NVS */
 void player_set_loop_count(int n)
 {
     if (n < LOOP_COUNT_MIN) n = LOOP_COUNT_MIN;
@@ -507,6 +515,7 @@ void player_set_loop_count(int n)
     settings_loop_count_save(n);
 }
 
+/* 按当前播放模式刷新模式按钮图标 */
 static void mode_update_icon(void)
 {
     const char *sym = LV_SYMBOL_LEFT;
@@ -522,12 +531,14 @@ static void mode_update_icon(void)
 
 static bool s_mode_long_pressed = false;   /* 长按已处理: 忽略松手后 LVGL 仍发的 CLICKED */
 
+/* 模式按钮按下: 复位长按标志 */
 static void mode_pressed_cb(lv_event_t *e)
 {
     (void)e;
     s_mode_long_pressed = false;   /* 每次按下复位, 保证标志只对本次长按有效 */
 }
 
+/* 模式按钮长按: 打开循环次数设置弹窗, 并标记长按已处理 */
 static void mode_long_press_cb(lv_event_t *e)
 {
     (void)e;
@@ -535,6 +546,7 @@ static void mode_long_press_cb(lv_event_t *e)
     mode_menu_open();
 }
 
+/* 模式按钮单击: 长按后的 CLICKED 吞掉, 否则轮换播放模式并持久化 */
 static void mode_btn_click_cb(lv_event_t *e)
 {
     if (s_mode_long_pressed) {   /* 长按后松手仍会发 CLICKED, 吞掉这一次 */
@@ -549,6 +561,7 @@ static void mode_btn_click_cb(lv_event_t *e)
     settings_mode_save(s_play_mode);
 }
 
+/* 播放指定分组下的文件: 建立播放列表并定位到该文件 (供文件浏览器/恢复上次歌曲调用) */
 void player_play_file(const char *group, const char *name)
 {
     if (!group || !name) return;
@@ -568,18 +581,21 @@ void player_play_file(const char *group, const char *name)
     player_play_index(found);
 }
 
+/* 下一首 */
 void player_next(void)
 {
     if (s_pl_count <= 0) return;
     player_play_index(s_pl_index + 1);
 }
 
+/* 上一首 */
 void player_prev(void)
 {
     if (s_pl_count <= 0) return;
     player_play_index(s_pl_index - 1);
 }
 
+/* LVGL 事件回调: 上一首 / 下一首 */
 static void player_prev_click_cb(lv_event_t *e) { player_prev(); }
 static void player_next_click_cb(lv_event_t *e) { player_next(); }
 
@@ -614,6 +630,7 @@ void player_toggle_play(void)
     }
 }
 
+/* LVGL 事件回调: 播放/暂停 */
 static void play_btn_click_cb(lv_event_t *e)
 {
     player_toggle_play();
@@ -630,6 +647,7 @@ static void dialog_rescan_cb(lv_event_t *e)
     printf("[LVGL] 请求重新扫描\n");
 }
 
+/* 弹出"文件不存在"对话框 (含重新扫描按钮) */
 static void show_file_not_found(void)
 {
     if (s_dialog) lv_obj_del(s_dialog);
@@ -955,7 +973,7 @@ typedef struct {
     bool    repeating;  /* 是否已进入长按重复模式 */
     int64_t next_us;    /* 下次允许步进的时刻 (us) */
 } vol_key_state_t;
-static vol_key_state_t s_vol_up, s_vol_down;
+static vol_key_state_t s_vol_up, s_vol_down;   /* 音量+ / 音量- 各自的状态机 */
 
 /* 单个音量键状态机: pin=引脚, dir=+1/-1, st=该键状态 */
 static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
@@ -1187,6 +1205,7 @@ static void bri_draw_create(void)
 }
 
 /* ── 主界面构建 ── */
+/* 初始化播放器界面: 恢复设置, 建控件, 建各定时器 (SD/歌曲信息/音量/按键) */
 void ui_player_init(void)
 {
     play_mode_t m;

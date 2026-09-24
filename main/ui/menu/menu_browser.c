@@ -17,7 +17,6 @@ extern const lv_font_t lv_font_global_16;
 #define FS_X        0      /* 面板 X (从左上角展开) */
 #define FS_Y        3      /* 面板 Y */
 #define FS_ITEMS    30     /* 每页条目数 */
-#define FS_ROW_H    18     /* 行高 (实际运行时覆盖为 30) */
 
 /* 文件浏览器控件句柄 */
 static lv_obj_t  *s_fs_overlay   = NULL;  /* 全屏透明遮罩 */
@@ -30,7 +29,7 @@ static lv_obj_t  *s_fs_next_btn  = NULL;  /* 下一页按钮 */
 
 static int   s_fs_page            = 0;     /* 当前页 */
 static int   s_fs_total           = 0;     /* 总页数 */
-static bool  s_fs_inside          = false; /* 是否已进入子目录 */
+static bool  s_fs_inside          = false; /* 是否已进入子目录 (目前仅赋值, 未被读取: 遗留状态) */
 static const char *s_fs_group    = NULL;   /* 当前分组 (sdcard / sdcard/a/b) */
 static lv_obj_t *s_fs_current_btn = NULL; /* 当前播放歌曲对应的列表行按钮 */
 
@@ -159,7 +158,7 @@ static bool fs_entry_is_current(fs_entry_t *entry)
 static lv_obj_t *fs_row_create(void)
 {
     lv_obj_t *btn = lv_list_add_btn(s_fs_list, &s_fs_icon_music, "");
-    lv_obj_set_height(btn, 30);
+    lv_obj_set_height(btn, 30);   /* 行高固定 30 (原 FS_ROW_H 宏未使用, 已删除) */
     lv_obj_set_style_pad_all(btn, 0, 0);
     lv_obj_set_style_pad_top(btn, 3, 0);
 
@@ -353,7 +352,7 @@ static void fs_browser_enter_dir(const char *parent_group, const char *name)
     s_fs_inside = true;
 
     char child[FS_GROUP_MAX];
-    fs_child_group(parent_group, name, child, sizeof(child));   /* 组名 = 父%子 */
+    fs_child_group(parent_group, name, child, sizeof(child));   /* 组名 = 父/子 (真实 '/') */
     fs_set_group(child);
 
     lv_label_set_text(s_fs_title, name);   /* 标题 = 目录名 */

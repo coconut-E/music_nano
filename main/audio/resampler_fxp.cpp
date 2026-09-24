@@ -17,7 +17,7 @@
  *   ipos = floor(n*q/p), frac = (n*q mod p)/p
  * 输出 y[n] = Σ_j x[ipos - (j - half + 1)] * h[frac][j]
  * 其中 h[phase][j] = 窗函数化的 sinc 低通在 u = frac + (j - half + 1) 处取值,
- * 每个相位归一化到 Q15 (DC 增益 1)。整数实现, int64 累加。
+ * 每个相位归一化到 Q14 (满量程 16384, DC 增益 1)。整数实现, int32 累加。
  */
 
 typedef struct resampler_fxp_s {
@@ -30,7 +30,7 @@ typedef struct resampler_fxp_s {
     int32_t   pos;         /* 相位累加 0..p-1 (frac = pos/p) */
     int32_t   ipos;        /* 当前输出对应的输入样本绝对位置 */
     int32_t   in_next;     /* 已读入输入样本数 (历史窗口上界, 绝对) */
-    int16_t  *coeff;       /* [p][taps] Q15 系数 (PSRAM, 只读) */
+    int16_t  *coeff;       /* [p][taps] Q14 系数 (PSRAM, 只读) */
     int16_t   hist[2][32]; /* 环形历史 (内部 RAM, 常驻, 每输出都访问) */
     int16_t   rowbuf[32];  /* 当前相位系数行 staging (内部 RAM, 避免逐抽头 PSRAM 缺失) */
 } resampler_fxp_t;
@@ -113,7 +113,7 @@ bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
         }
 
         /* 每相位归一化到 Q14 (满量程 16384): int32 累加安全
-         * (Σ|c|≤33517 × 输入32767 = 1.1e9 < 2^31), 避免 int64 carry 序列 */
+         * (Σ|c| 约 ≤3.36e4, ×输入32767 ≈ 1.1e9 < 2^31), 避免 int64 carry 序列 */
         for (int32_t j = 0; j < taps; j++) {
             double u = frac + (double)(j - half + 1);
             double s;

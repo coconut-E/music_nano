@@ -139,6 +139,7 @@ static void enter_deep_sleep_now(void)
     gpio_deep_sleep_hold_en();             /* 允许深睡期间保持引脚 */
 
     esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);   /* GPIO37 高电平唤醒 */
+    vTaskDelay(pdMS_TO_TICKS(500));
     esp_deep_sleep_start();                          /* 进入深睡 (此处不返回) */
 }
 

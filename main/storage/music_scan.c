@@ -27,7 +27,7 @@ static const char *MUSIC_EXTENSIONS[] = {
     ".mp3", ".flac", ".wav", ".aac",
     ".MP3", ".FLAC", ".WAV", ".AAC",
 };
-static const int NUM_EXTENSIONS = sizeof(MUSIC_EXTENSIONS) / sizeof(MUSIC_EXTENSIONS[0]);
+static const int NUM_EXTENSIONS = sizeof(MUSIC_EXTENSIONS) / sizeof(MUSIC_EXTENSIONS[0]);   /* 扩展名条目数 */
 
 /* 目录工作栈 (变长 LIFO, 全部在 PSRAM):
  * 记录格式 = [路径字节]['\0'][uint16 长度], 只存实际路径长度.
@@ -315,7 +315,7 @@ static void write_space_cache(uint64_t used_kb)
     close(fd);
 }
 
-/* 清理 .music_cache 下旧缓存: legacy sdcard*.txt 与旧索引文件 */
+/* 清理 .music_cache 下旧缓存: 文件名以 "sdcard" 开头的 legacy 文件, 及旧索引 index.bin/.tmp */
 static void clean_cache_files(void)
 {
     DIR *dir = opendir(MUSIC_CACHE_DIR);
@@ -336,8 +336,7 @@ static void clean_cache_files(void)
     closedir(dir);
 }
 
-/* 把构建器序列化为 index.bin (先写临时文件再改名, 防掉电半写) */
-/* 写索引文件: 成功返回 true */
+/* 把构建器序列化为 index.bin (先写临时文件再改名, 防掉电半写). 成功返回 true */
 static bool write_index_bin(cache_builder_t *b)
 {
     char tmp_path[128];

@@ -20,7 +20,7 @@ typedef enum {
     AUDIO_CMD_PAUSE           = 2,   /* 暂停 */
     AUDIO_CMD_BT_CONNECTED    = 3,   /* 蓝牙已连接 (可开始推流) */
     AUDIO_CMD_BT_DISCONNECTED = 4,   /* 蓝牙断开 (停推) */
-    AUDIO_CMD_SEEK            = 5,   /* 跳转 (param=字节偏移) */
+    AUDIO_CMD_SEEK            = 5,   /* 跳转 (param=千分比 0~1000, 非字节偏移) */
 } audio_cmd_type_t;
 
 /* 音频命令结构体: type=命令, path=播放路径, param=附加参数 */

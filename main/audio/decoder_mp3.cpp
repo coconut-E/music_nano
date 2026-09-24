@@ -67,7 +67,10 @@ static void parse_id3v2(FILE *f, long *off,
     *off = 0;
     uint8_t h[10];
     if(fread(h,1,10,f)!=10 || memcmp(h,"ID3",3)) { fseek(f,0,SEEK_SET); return; }   /* 非 ID3 头 */
-    uint8_t v=h[3]; bool ft=(h[4]&0x10); uint32_t ts=syncsafe(h+6);   /* 版本/扩展标志/标签大小 */
+    /* ID3v2 头: [0..2]="ID3", [3]=主版本, [4]=修订号, [5]=标志, [6..9]=标签大小(同步安全整数).
+     * 标志位: 0x80=非同步, 0x40=扩展头, 0x20=实验, 0x10=footer(仅 v2.4).
+     * 注意标志在 h[5] 而非 h[4] (h[4] 是修订号). */
+    uint8_t v=h[3]; bool ft=(h[5]&0x10); uint32_t ts=syncsafe(h+6);   /* 版本/footer标志/标签大小 */
     ESP_LOGI(MP3_TAG, "ID3v2.%u 标签, 大小 %" PRIu32, v, ts);
     uint32_t pos=10;   /* 当前标签内偏移 */
     while(pos<ts){
@@ -109,7 +112,7 @@ static void parse_id3v2(FILE *f, long *off,
         }
         free(d);
     }
-    *off=10+ts+(ft?10:0);   /* MP3 数据偏移 = 标签头 + 标签体 (+ 扩展头) */
+    *off=10+ts+(ft?10:0);   /* 音频偏移 = 10 字节头 + 标签体 (+ 10 字节 footer, 仅 v2.4; 扩展头已计入 ts) */
 }
 
 /* 打开 MP3 文件: 解析 ID3, 创建解码器 */

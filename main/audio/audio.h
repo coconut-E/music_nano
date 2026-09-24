@@ -22,7 +22,7 @@ extern "C" {
 typedef struct {
     char     title[SONG_TITLE_MAX];    /* 歌名 */
     char     artist[SONG_ARTIST_MAX];  /* 歌手 */
-    char     format[SONG_FORMAT_MAX];  /* 编码格式 (MP3/FLAC/WAV) */
+    char     format[SONG_FORMAT_MAX];  /* 编码格式 (MP3/FLAC/WAV/AAC, 仅按扩展名判定) */
     uint32_t sample_rate;              /* 采样率 (Hz) */
     uint8_t  channels;                 /* 声道数 */
     uint8_t  bits_per_sample;          /* 位深 */
@@ -51,7 +51,7 @@ typedef struct audio_decoder_s {
     uint8_t   (*get_bits)(struct audio_decoder_s *self);                /* 位深 */
     uint32_t  (*get_bitrate)(struct audio_decoder_s *self);             /* 码率 */
     uint32_t  (*get_file_size)(struct audio_decoder_s *self);           /* 文件大小 (字节) */
-    uint32_t  (*get_position)(struct audio_decoder_s *self);            /* 当前解码位置 (字节) */
+    uint32_t  (*get_position)(struct audio_decoder_s *self);            /* 当前解码位置 (字节); FLAC 为文件读游标, 含预读 */
     bool      (*seek)(struct audio_decoder_s *self, uint32_t byte_offset);  /* 按字节偏移 seek, 成功返回 true */
     const char *(*get_title)(struct audio_decoder_s *self);             /* 歌名 (无则 NULL) */
     const char *(*get_artist)(struct audio_decoder_s *self);            /* 歌手 (无则 NULL) */

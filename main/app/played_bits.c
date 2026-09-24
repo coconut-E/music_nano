@@ -23,7 +23,7 @@ static const char *TAG = "PBITS";
 #define PB_NS        "pbits"        /* 独立命名空间, 与设置 "player" 隔离 */
 #define PB_KEY_NEXT  "nextid"       /* u32: 下一个可用 id (单调递增, 不复用) */
 #define PB_VER       1              /* value 格式版本 */
-#define PB_VAL_MAX   4096           /* 单条 value 上限 (NVS 字符串上限 4000) */
+#define PB_VAL_MAX   4000           /* 单条 value 上限 (NVS 字符串含结尾 NUL 上限 4000 字节, 见 IDF nvs.h) */
 
 /* 每个文件夹一条记录 (常驻 PSRAM) */
 typedef struct {

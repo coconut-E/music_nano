@@ -349,10 +349,10 @@ static void bt_a2dp_hdl_avrc_tg_evt(uint16_t event, void *p_param)
 }
 
 /* ── A2DP data callback ── */
-static uint32_t s_cb_call_count    = 0;
-static uint64_t s_cb_total_bytes   = 0;
-static uint64_t s_cb_total_got     = 0;
-static int64_t  s_cb_last_print_us = 0;
+static uint32_t s_cb_call_count    = 0;   /* 数据回调调用次数 (诊断) */
+static uint64_t s_cb_total_bytes   = 0;   /* 编码器累计请求字节数 (诊断) */
+static uint64_t s_cb_total_got     = 0;   /* 从 PCM 流累计实得字节数 (诊断; 差=欠载) */
+static int64_t  s_cb_last_print_us = 0;   /* 上次统计打印时刻 (限频) */
 
 /* 欠载诊断: pcm_stream 不够取时记录 (已禁用, 调试用) */
 #if 0
@@ -362,6 +362,7 @@ static uint32_t s_cb_underrun_count   = 0;
 static uint32_t s_cb_underrun_empty   = 0;
 #endif
 
+/* A2DP 源数据回调 (BT 上下文): 从 PCM 流取 len 字节填入编码器缓冲, 不足补静音 */
 static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
 {
     if (!data || len <= 0) {
@@ -998,6 +999,7 @@ bt_state_t bt_a2dp_get_state(void)
     return BT_STATE_DISCONNECTED;
 }
 
+/* 是否已连接 (A2DP 已连 且 协议栈就绪), 原子读供 UI/电源跨任务判断 */
 bool bt_a2dp_is_connected(void)
 {
     return atomic_load_bool(&s_connected) && atomic_load_bool(&s_bt_ready);

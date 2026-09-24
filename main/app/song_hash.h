@@ -10,7 +10,8 @@ extern "C" {
 
 /*
  * 歌曲哈希 (xxHash32, seed=0)
- * 键格式与基准测试生成器一致: artist + '\x1f' + title
+ * 说明: 当前工程实际只用 song_hash_name_key() (以"去扩展名的文件名"为键),
+ * 未使用 song_hash_key() 的 "artist + '\x1f' + title" 键 (保留供参考/基准测试)。
  */
 
 /* 计算 32 位哈希: data=数据, len=长度 */

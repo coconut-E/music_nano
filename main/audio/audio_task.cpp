@@ -150,8 +150,8 @@ static void set_format_from_path(const char *path)
     g_song_info.format[SONG_FORMAT_MAX - 1] = '\0';
 }
 
-/* 更新码率/总时长/已播时长 (按平均码率估算) */
-static void update_duration_elapsed(void)
+/* 更新码率/总时长/已播时长 (按平均码率估算). 要求调用方已持有 s_info_mux */
+static void update_duration_elapsed_locked(void)
 {
     uint32_t kbps = s_decoder->get_bitrate(s_decoder);
     uint32_t bps  = kbps * 125;   /* kbps → 字节每秒 */
@@ -160,6 +160,14 @@ static void update_duration_elapsed(void)
     g_song_info.bitrate_kbps = kbps ? kbps : 128;
     g_song_info.duration_sec = s_decoder->get_file_size(s_decoder) / bps;   /* 文件大小/码率=时长 */
     g_song_info.elapsed_sec  = s_decoder->get_position(s_decoder) / bps;    /* 已解码字节/码率 */
+}
+
+/* 独立调用版本: 自行加锁 (decode 循环里周期性更新进度) */
+static void update_duration_elapsed(void)
+{
+    if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
+    update_duration_elapsed_locked();
+    if (s_info_mux) xSemaphoreGive(s_info_mux);
 }
 
 /* 填充完整歌曲信息 (标题/歌手/格式/参数), 最后原子置有效标志.
@@ -194,7 +202,7 @@ static void fill_song_info(void)
     g_song_info.sample_rate  = s_decoder->get_sample_rate(s_decoder);
     g_song_info.channels     = s_decoder->get_channels(s_decoder);
     g_song_info.bits_per_sample = (s_decoder->get_bits ? s_decoder->get_bits(s_decoder) : 16);
-    update_duration_elapsed();
+    update_duration_elapsed_locked();   /* 已持锁, 用 _locked 版本避免重复加锁 */
 
     atomic_store_bool(&g_song_info_valid, true);   /* 最后才置有效位 (先写字段后发信号) */
     printf("[音频] 信息: %s | %s | %s | %" PRIu32 "Hz/%uch/%ubit/%" PRIu32 "kbps | %" PRIu32 "s\n",
@@ -336,8 +344,10 @@ static void audio_task(void *arg)
                         xStreamBufferReset(s_pcm_stream);
                         s_pending_pcm = false;
                         s_pcm_offset = 0;
-                        g_song_info.elapsed_sec =   /* 同步进度显示 */
+                        if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
+                        g_song_info.elapsed_sec =   /* 同步进度显示 (与快照读取互斥) */
                             (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                        if (s_info_mux) xSemaphoreGive(s_info_mux);
                     }
                     break;
                 case AUDIO_CMD_BT_CONNECTED:
@@ -421,7 +431,7 @@ static void audio_task(void *arg)
                 }
 
                 /* 转换到 44.1k stereo 输出缓冲 */
-                size_t frames = s_pcm_bytes / (ch * 2);   /* 样本数 = 字节/声道数/2 */
+                size_t frames = s_pcm_bytes / (ch * 2);   /* 帧数 = 字节/(声道数×2字节/样本) */
                 s_out_bytes = pcm_pipeline_process(s_pipeline, s_pcm_buf, frames,
                                                    (uint8_t*)s_out_buf, PCM_OUT_BUF_SAMPLES * sizeof(int16_t));
 
@@ -478,8 +488,10 @@ static void audio_task(void *arg)
                     sd_fs_lock();
                     s_decoder->seek(s_decoder, target);
                     sd_fs_unlock();
+                    if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
                     g_song_info.elapsed_sec =
                         (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                    if (s_info_mux) xSemaphoreGive(s_info_mux);
                 }
                 break;
             case AUDIO_CMD_PAUSE:

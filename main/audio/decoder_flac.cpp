@@ -59,7 +59,7 @@ typedef struct {
     uint64_t                  skip_remaining; /* 跳过的交错样本数 (seek 用) */
     uint32_t                  audio_start;    /* 音频数据起始字节偏移 (头部结束处) */
     bool                      seek_resync;    /* seek 后需要重同步到下一帧 */
-    uint32_t                  resync_budget;  /* 重同步最大扫描字节数 */
+    uint32_t                  resync_budget;  /* 重同步剩余尝试次数 (每次在当前输入块内找同步字) */
 
     /* 重同步耗时调试 */
     int64_t                   resync_t0_us;   /* 重同步开始时刻 */
@@ -89,7 +89,7 @@ static uint32_t le32(const uint8_t *p)
 }
 
 /* ── Vorbis 注释解析 (原生 FLAC 内为小端) ──
- * 提取 TITLE=/ARTIST=/ALBUM= 键值对到输出缓冲. */
+ * 提取 TITLE=/ARTIST= 到输出缓冲 (ALBUM 仅打印日志, 不输出) */
 static void parse_vorbis_comments(const uint8_t *data, size_t len,
                                   char *title, size_t title_size,
                                   char *artist, size_t artist_size)
@@ -271,6 +271,7 @@ static bool flac_parse_header(decoder_flac_t *d)
     return false;
 }
 
+/* 打开 FLAC: 解析头部/流信息/元数据, 分配解码与输出缓冲 */
 static bool flac_open(audio_decoder_t *iface, const char *path)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
@@ -324,8 +325,7 @@ static bool flac_open(audio_decoder_t *iface, const char *path)
     const micro_flac::FLACStreamInfo &info = flac->get_stream_info();
     d->sample_rate = info.sample_rate();
     d->channels    = (uint8_t)info.num_channels();
-    /* 仅支持 1/2 声道: 管线只接受单/双声道, 且调用方 PCM 缓冲按 2 声道分配,
-     * 多声道继续解码会写越界, 这里直接拒绝打开 */
+    /* 仅支持 1/2 声道: 转换管线只接受单/双声道, 多声道无意义; 提前拒绝打开 */
     if (d->channels < 1 || d->channels > 2) {
         ESP_LOGW(FLAC_TAG, "不支持 %u 声道 (仅 1/2), 跳过: %s", d->channels, path);
         flac_free_state(d);
@@ -384,7 +384,7 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
     while (1) {
         /* 有解码好的帧 → 先喂给调用方 */
         if (d->out_remaining > 0) {
-            size_t max_samples = FLAC_SERVE_FRAMES * d->channels;   /* 本次最多输出帧数 */
+            size_t max_samples = FLAC_SERVE_FRAMES * d->channels;   /* 本次最多输出样本数 (帧×声道) */
             if (cap_samples && max_samples > cap_samples) max_samples = cap_samples;   /* 不超过调用方容量 */
             size_t n = d->out_remaining < max_samples ? d->out_remaining : max_samples;
 
@@ -463,7 +463,7 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
                            d->resync_iters, (unsigned)d->in_off, (unsigned)d->in_len, dt);
                 }
             }
-            /* 在当前缓冲内线性扫描帧同步字 0xFF F8/F9/FA/FB */
+            /* 在当前缓冲内线性扫描帧同步字: 0xFF 后跟 0xF8/0xF9 (掩码 &0xFE == 0xF8) */
             size_t j = 1;
             const uint8_t *b = d->inbuf + d->in_off;
             while (j + 1 < d->in_len &&
@@ -488,26 +488,31 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
     }
 }
 
+/* 是否已到文件尾 */
 static bool flac_is_eof(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->eof;
 }
 
+/* 关闭并释放全部解码器状态 */
 static void flac_close(audio_decoder_t *iface)
 {
     flac_free_state((decoder_flac_t *)iface);
 }
 
+/* 采样率 (Hz) */
 static uint32_t flac_get_sample_rate(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->sample_rate;
 }
 
+/* 声道数 */
 static uint8_t flac_get_channels(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->channels;
 }
 
+/* 位深 */
 static uint8_t flac_get_bits(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->bits_per_sample;
@@ -523,11 +528,13 @@ static uint32_t flac_get_bitrate(audio_decoder_t *iface)
     return (uint32_t)(((uint64_t)d->file_size * 8) / dur / 1000);   /* 位/秒 → kbps */
 }
 
+/* 文件大小 (整文件字节数) */
 static uint32_t flac_get_file_size(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->file_size;
 }
 
+/* 当前文件读位置 (ftell; 含缓冲预读, 用于进度估算) */
 static uint32_t flac_get_position(audio_decoder_t *iface)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
@@ -587,7 +594,7 @@ static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
     /* 跳过一整块 (以解码缓冲容量估算) 后再开始输出, 抹平定位误差 */
     d->skip_remaining = (uint64_t)(d->out_cap / (d->channels ? d->channels : 1)) * d->channels;
     d->seek_resync = true;
-    d->resync_budget = 65536;   /* 最多扫描 64KB 找同步字 */
+    d->resync_budget = 65536;   /* 重同步最多尝试 65536 次 (是迭代次数, 不是字节数) */
     d->resync_t0_us = esp_timer_get_time();
     d->resync_iters = 0;
     d->resync_skips = 0;
@@ -595,26 +602,31 @@ static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
     return true;
 }
 
+/* 歌名 (无则空串) */
 static const char *flac_get_title(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->title;
 }
 
+/* 歌手 (无则空串) */
 static const char *flac_get_artist(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->artist;
 }
 
+/* 内嵌封面数据指针 (无则 NULL) */
 static const uint8_t *flac_get_cover_data(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->cover_data;
 }
 
+/* 内嵌封面大小 */
 static size_t flac_get_cover_size(audio_decoder_t *iface)
 {
     return ((decoder_flac_t *)iface)->cover_size;
 }
 
+/* 所有权移交封面模块后置空, 避免 close 时重复释放 */
 static void flac_take_cover(audio_decoder_t *iface)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
@@ -622,6 +634,7 @@ static void flac_take_cover(audio_decoder_t *iface)
     d->cover_size = 0;
 }
 
+/* 工厂: 创建 FLAC 解码器, 填充接口函数指针 */
 audio_decoder_t *decoder_flac_create(void)
 {
     decoder_flac_t *d = (decoder_flac_t *)calloc(1, sizeof(decoder_flac_t));

@@ -16,7 +16,8 @@ using namespace esp_audio_libs;
 /* 最坏输入: MPEG1 stereo 1152 帧/块 */
 #define MAX_IN_FRAMES  1152
 
-/* 最低支持源采样率: 低于此值单块重采样输出会超出调用方缓冲 (见 PCM_OUT_BUF_SAMPLES), 直接拒绝 */
+/* 最低支持源采样率: 低于此值单块重采样输出会逼近/超出调用方缓冲, 保守拒绝.
+ * (真实溢出边界 = 1152×44100/8192 ≈ 6202Hz, 取 8kHz 整数留余量) */
 #define MIN_SRC_RATE   8000
 
 /* 转换层内部结构 */
@@ -45,7 +46,8 @@ pcm_pipeline_t *pcm_pipeline_create(void)
     pcm_pipeline_t *p = (pcm_pipeline_t *)calloc(1, sizeof(*p));
     if (!p) return NULL;
 
-    /* 上混临时缓冲: 最多 1152 帧 × 双声道 × 4 字节/样本 (32bit 兼容) */
+    /* 上混临时缓冲: 最多 1152 帧 × 双声道 × 4 字节/样本 (按最大位深 32bit 预留, 
+     * 当前解码器均为 16bit, 实际仅用前 2 字节/样本) */
     p->stereo_in = (uint8_t *)malloc(MAX_IN_FRAMES * TARGET_CH * 4);
     if (!p->stereo_in) {
         free(p);

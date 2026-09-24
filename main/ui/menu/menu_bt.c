@@ -29,9 +29,9 @@ static bt_state_t   s_bt_state = BT_STATE_DISCONNECTED;   /* 影子连接状态 
 static char         s_bt_connect_name[32];     /* 当前连接/连接中的设备名 */
 
 static char         s_bt_display[BT_BUF_MAX][32];  /* 当前显示的设备名列表 */
-static int          s_bt_display_count = 0;
+static int          s_bt_display_count = 0;        /* s_bt_display 有效条目数 */
 static char         s_bt_pending[BT_BUF_MAX][32];  /* 扫描结果缓冲 (扫描完成一次性刷新) */
-static int          s_bt_pending_count = 0;
+static int          s_bt_pending_count = 0;        /* s_bt_pending 已累积条目数 */
 
 static bt_a2dp_iface_t *s_bt_iface = NULL;   /* 蓝牙接口 */
 
@@ -345,25 +345,30 @@ void bt_list_on_scan_done(void)
 
     bt_refresh_list();
 
-    bt_maybe_start_scan();   /* 若列表空可再扫一轮 */
+    bt_maybe_start_scan();   /* 列表开着且未连接时继续下一轮扫描 (无"列表空"判断) */
 }
 
+/* BT 任务回调: A2DP 连接成功 */
 void bt_list_on_connected(const char *name)
 {
     bt_apply_state(BT_STATE_CONNECTED, name);
 }
 
+/* BT 任务回调: 连接失败 → 回到未连接 */
 void bt_list_on_connect_failed(const char *name)
 {
+    (void)name;
     bt_apply_state(BT_STATE_DISCONNECTED, NULL);
 }
 
+/* BT 任务回调: 链路断开 → 清连接名并回到未连接 */
 void bt_list_on_disconnected(void)
 {
     memset(s_bt_connect_name, 0, sizeof(s_bt_connect_name));
     bt_apply_state(BT_STATE_DISCONNECTED, NULL);
 }
 
+/* BT 任务回调: 查询状态应答 → 应用到影子状态 */
 void bt_list_on_state_rsp(bt_state_t state, const char *name)
 {
     bt_apply_state(state, name);

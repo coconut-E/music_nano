@@ -22,7 +22,7 @@ extern "C" {
  * 同一目录下所有文件的 group 共享同一段, 不再每条各存一份. */
 typedef struct {
     const char *name;    /* 文件名 (指向字符串池) */
-    const char *group;   /* 所属分组 (指向字符串池, 如 "sdcard" 或 "sdcard_xxx") */
+    const char *group;   /* 所属分组 (指向字符串池, 用真实 '/' 如 "sdcard" 或 "sdcard/子目录") */
     bool        is_dir;  /* 是否目录 */
 } fs_entry_t;
 
@@ -42,7 +42,7 @@ bool sdmmc_disk_is_mounted(void);       /* 查询 SD 卡是否已挂载 */
 /* 手动触发重新扫描: 置位后由 sys_monitor 任务模拟"拔卡→插卡"走现有流程 */
 extern volatile bool g_sd_manual_rescan;
 
-/* 磁盘事件回调类型: event=事件串 (如 mount/unmount), user_data=用户数据 */
+/* 磁盘事件回调类型: event=事件串 ("mounted"/"unmounted"/"mount_failed"), user_data=用户数据 */
 typedef void (*sd_event_cb_t)(const char *event, void *user_data);
 void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data);   /* 注册磁盘事件回调 */
 

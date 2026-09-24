@@ -17,7 +17,6 @@
 #include "app.h"
 #include "sys_monitor.h"
 
-#define SERIAL_TAG    "SYS_SERIAL"
 #define LINE_BUF_SIZE 64   /* 串口命令行缓冲长度 */
 
 static QueueHandle_t s_app_cmd_queue = NULL;   /* 应用命令队列 (解析出的命令投递到这里) */

@@ -46,7 +46,7 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 
 #define SAMPLE_COUNT  10             /* 采样次数 (取平均滤波) */
 #define SAMPLE_DELAY_MS 10           /* 相邻两次采样间隔 */
-#define SENSOR_INTERVAL_TICKS 20     /* 传感器采样周期计数 (×50ms = 1s) */
+#define SENSOR_INTERVAL_TICKS 20     /* 传感器采样周期计数 (每轮 50ms, 标称 1s; 采样本身另耗 ~200ms) */
 
 #define CPU_TEMP_OFFSET_C  0.0f     /* CPU 内部温度传感器校准偏移 */
 #define VBAT_CRITICAL_LOW_V  3.25f   /* 运行中临界电压 (低于此值直接深睡关机) */
@@ -63,6 +63,7 @@ static volatile bool   s_del_req  = false;
 static sd_delete_req_t s_del_data;
 volatile int           g_sd_delete_status = 0;   /* 0=空闲/进行中, 1=成功, -1=失败 */
 
+/* 投递删除请求 (UI→本任务, 非阻塞): 写参数后置标志; 已有请求未处理或参数非法返回 false */
 bool sd_request_delete_file(const char *group, const char *name, int idx)
 {
     if (s_del_req || !group || !name || idx < 0) return false;
@@ -175,7 +176,7 @@ static fs_cache_t *sd_load_cache_bin(void)
     return cache;
 }
 
-/* 扫描 SD 卡根目录: 打印文件数 + 容量信息 (诊断用) */
+/* 扫描 SD 卡根目录: 统计普通文件数 (仅计数, 未输出) 并打印容量信息 (诊断用) */
 static void sd_scan_files(void)
 {
     int count = 0;
@@ -232,6 +233,7 @@ bool fs_cache_find_by_path(const char *path,
     return false;
 }
 
+/* 探测并挂载 SD 卡: 成功则扫描音乐 + 载入 index.bin 缓存, 最后置 g_sd_ready */
 void sdmmc_disk_init(void)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -275,6 +277,7 @@ void sdmmc_disk_init(void)
     if (s_event_cb) s_event_cb("mounted", s_event_ctx);
 }
 
+/* 卸载 SD 卡: 先置 g_sd_ready=false 让 audio 释放文件, 排空 FATFS 后在锁内卸载 */
 void sdmmc_disk_deinit(void)
 {
     if (!s_mounted) return;
@@ -320,6 +323,7 @@ void sd_fs_lock(void)
     if (s_sd_fs_mutex) xSemaphoreTake(s_sd_fs_mutex, portMAX_DELAY);
 }
 
+/* 释放 SD/FATFS 互斥锁 */
 void sd_fs_unlock(void)
 {
     if (s_sd_fs_mutex) xSemaphoreGive(s_sd_fs_mutex);
@@ -335,6 +339,7 @@ void fs_cache_reap(void)
     }
 }
 
+/* 查询 SD 卡当前是否已挂载 */
 bool sdmmc_disk_is_mounted(void)
 {
     return s_mounted;
@@ -380,6 +385,7 @@ static void sample_sensors(void)
     atomic_store_float(&g_vbat, vbat_avg);
 }
 
+/* 系统监视主循环: SD 插拔处理 / 延迟删除 / 手动重扫 / 周期传感器采样与低压关机 */
 static void sys_monitor_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(150));

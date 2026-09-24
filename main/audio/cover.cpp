@@ -41,7 +41,7 @@ static const char *jpeg_err_str(int err)
 
 static QueueHandle_t     s_app_cmd_queue = NULL;   /* 完成通知队列 (发 APP_CMD_COVER_READY) */
 static TaskHandle_t      s_task = NULL;            /* 解码任务句柄 */
-static StaticTask_t     *s_tcb = NULL;             /* 静态任务 TCB (PSRAM) */
+static StaticTask_t     *s_tcb = NULL;             /* 静态任务 TCB (必须放内部 RAM) */
 static StackType_t      *s_stack = NULL;           /* 静态任务栈 (PSRAM) */
 static SemaphoreHandle_t s_job_sem = NULL;         /* 作业信号量 (计数=待处理作业数) */
 static SemaphoreHandle_t s_slot_mutex = NULL;      /* 保护 s_job_data/s_job_size */
@@ -63,7 +63,8 @@ static int cover_jpeg_draw(JPEGDRAW *pDraw)
 {
     if (!s_raw) return 0;
 
-    /* JPEGDEC 右边缘只裁 iWidthUsed, iWidth 保留整块宽 → 必须用 iWidthUsed 拷宽 */
+    /* JPEGDEC 提供的块: 拷贝宽度取 iWidthUsed (右边缘被裁掉多余列),
+     * 但源数据每行跨度是整块宽 iWidth (JPEGDEC 内部 iPitch == iWidth) */
     int w = pDraw->iWidthUsed;
     int h = pDraw->iHeight;
     int x = pDraw->x;
@@ -80,8 +81,8 @@ static int cover_jpeg_draw(JPEGDRAW *pDraw)
     const uint16_t *src = pDraw->pPixels;
     while (h-- > 0) {   /* 逐行拷贝 */
         memcpy(dest, src, (size_t)w * sizeof(uint16_t));
-        dest += s_raw_w;               /* 源/目标行宽不同, 分别步进 */
-        src  += (size_t)pDraw->iWidthUsed;
+        dest += s_raw_w;                /* 目标行宽 = s_raw_w */
+        src  += (size_t)pDraw->iWidth;  /* 源行跨度 = 整块宽 (不是 iWidthUsed) */
     }
     return 1;
 }
@@ -148,8 +149,8 @@ static void cover_swap_rgb565(uint16_t *buf, int n)
     }
 }
 
-/* 用指定缩放选项解码一次: 成功返回 1 (已缩放写入 s_out_buf), 失败返回 0.
- * opt=JPEG 缩放选项, w/h=原图尺寸 */
+/* 用指定缩放选项解码到中间缓冲 s_raw (后续 crop/缩放写入 s_out_buf).
+ * 成功返回 1, 失败返回 0. opt=JPEG 缩放选项, w/h=原图尺寸 */
 static int cover_decode_attempt(int opt, int w, int h)
 {
     int rw = w, rh = h;   /* 解码目标尺寸 (缩放后) */
@@ -157,7 +158,8 @@ static int cover_decode_attempt(int opt, int w, int h)
     else if (opt == JPEG_SCALE_QUARTER) { rw = w / 4; rh = h / 4; }
     else if (opt == JPEG_SCALE_HALF)    { rw = w / 2; rh = h / 2; }
 
-    /* +16 边缘缓冲, 避免 MCU 块越界 */
+    /* 中间缓冲留 16 行列余量 (JPEGDEC 按 MCU 块写, 边缘可能越界); 
+     * 回调内已按 s_raw_w/h 钳制, 真正防越界靠钳制 */
     size_t raw_bytes = (size_t)(rw + 16) * (rh + 16) * sizeof(uint16_t);
     uint16_t *raw = (uint16_t *)heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
     if (!raw) {
@@ -302,7 +304,7 @@ void cover_init(QueueHandle_t app_cmd_queue)
     s_job_sem = xSemaphoreCreateCounting(4, 0);   /* 计数信号量, 最多积压 4 个作业 */
     s_slot_mutex = xSemaphoreCreateMutex();
 
-    /* 常驻缓冲全部放 PSRAM, 省内部 RAM */
+    /* 常驻缓冲尽量放 PSRAM 省内部 RAM (TCB 例外, 必须内部 RAM) */
     s_out_buf = (uint16_t *)heap_caps_malloc(COVER_PIXELS * sizeof(uint16_t),
                                              MALLOC_CAP_SPIRAM);
     s_jpeg = (JPEGIMAGE *)heap_caps_malloc(sizeof(JPEGIMAGE), MALLOC_CAP_SPIRAM);

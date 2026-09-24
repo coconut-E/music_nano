@@ -29,7 +29,7 @@ typedef struct {
 
     uint32_t data_start;     /* PCM 数据起始字节偏移 */
     uint32_t data_size;      /* PCM 数据字节数 (get_file_size) */
-    uint32_t data_pos;       /* 已交付给调用方的 PCM 字节数 (get_position) */
+    uint32_t data_pos;       /* 已从 data 块消费的源 PCM 字节数 (get_position); 16bit 时等于输出字节数 */
     uint32_t file_size;      /* 整个文件大小 */
 
     char     title[SONG_TITLE_MAX];    /* 标题 (LIST/INFO INAM) */
@@ -51,7 +51,7 @@ static uint16_t le16(const uint8_t *p)
 }
 
 /* ── RIFF LIST/INFO 子块: INAM=标题, IART=作者, IPRD=专辑 ── */
-/* 提取文本并去掉首尾空白: d=数据, len=长度, out=输出, out_size=缓冲大小 */
+/* 提取文本并去掉尾部空白: d=数据, len=长度, out=输出, out_size=缓冲大小 */
 static void copy_info_text(const uint8_t *d, uint32_t len, char *out, size_t out_size)
 {
     size_t o = 0;
@@ -258,32 +258,37 @@ static bool wav_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *bytes
     return true;
 }
 
+/* 是否已到 data 区末尾 */
 static bool wav_is_eof(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->eof;
 }
 
+/* 关闭并释放文件/缓冲 */
 static void wav_close(audio_decoder_t *iface)
 {
     wav_free_state((decoder_wav_t *)iface);
 }
 
+/* 采样率 (Hz) */
 static uint32_t wav_get_sample_rate(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->sample_rate;
 }
 
+/* 声道数 */
 static uint8_t wav_get_channels(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->channels;
 }
 
+/* 位深 (8/16/24/32) */
 static uint8_t wav_get_bits(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->bits_per_sample;
 }
 
-/* 精确字节率: 采样率×声道×位深/1000 (kbps) */
+/* 精确码率(kbps): 采样率×声道×位深/1000 */
 static uint32_t wav_get_bitrate(audio_decoder_t *iface)
 {
     decoder_wav_t *d = (decoder_wav_t *)iface;
@@ -296,6 +301,7 @@ static uint32_t wav_get_file_size(audio_decoder_t *iface)
     return ((decoder_wav_t *)iface)->data_size;
 }
 
+/* 已消费的源 PCM 字节数 (16bit 时即输出字节数) */
 static uint32_t wav_get_position(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->data_pos;
@@ -313,11 +319,13 @@ static bool wav_seek(audio_decoder_t *iface, uint32_t byte_offset)
     return true;
 }
 
+/* 标题 (LIST/INFO INAM) */
 static const char *wav_get_title(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->title;
 }
 
+/* 作者 (LIST/INFO IART) */
 static const char *wav_get_artist(audio_decoder_t *iface)
 {
     return ((decoder_wav_t *)iface)->artist;
