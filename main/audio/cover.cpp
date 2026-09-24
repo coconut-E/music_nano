@@ -322,10 +322,11 @@ void cover_init(QueueHandle_t app_cmd_queue)
     ESP_LOGI(COVER_TAG, "封面解码任务已创建 (PSRAM 栈)");
 }
 
-/* 提交封面解码作业: jpg=JPEG数据 (所有权移交封面模块), size=数据大小 */
-void cover_submit_job(const uint8_t *jpg, size_t size)
+/* 提交封面解码作业: jpg=JPEG数据 (所有权移交封面模块), size=数据大小.
+ * 返回 true=已接管; false=因未就绪/参数非法未接管, 调用方仍持有数据需自行释放 */
+bool cover_submit_job(const uint8_t *jpg, size_t size)
 {
-    if (!jpg || size == 0 || !s_task || !s_job_sem || !s_slot_mutex) return;
+    if (!jpg || size == 0 || !s_task || !s_job_sem || !s_slot_mutex) return false;
 
     xSemaphoreTake(s_slot_mutex, portMAX_DELAY);
     if (s_job_data) {
@@ -336,6 +337,7 @@ void cover_submit_job(const uint8_t *jpg, size_t size)
     xSemaphoreGive(s_slot_mutex);
 
     xSemaphoreGive(s_job_sem);   /* 唤醒解码任务 */
+    return true;
 }
 
 /* 通知 UI: 当前歌曲无内嵌封面, 回退默认图标 */

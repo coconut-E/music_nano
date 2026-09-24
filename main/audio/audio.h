@@ -34,6 +34,10 @@ typedef struct {
 extern song_info_t g_song_info;        /* 歌曲信息 (全局实例) */
 extern volatile bool g_song_info_valid; /* 信息有效性标志 (先置字段后置此位) */
 
+/* 取一份一致的歌曲信息快照 (与解码任务的成组写入互斥).
+ * out=输出; 返回 true=当前信息有效且已完整拷贝; 供 UI 单次一致读取, 避免撕裂 */
+bool song_info_snapshot(song_info_t *out);
+
 /* ──────────────────────── 解码器抽象接口 ──────────────────────── */
 /* 所有解码器实现同一组函数指针, 音频任务不关心具体格式.
  * self=解码器对象 (各实现自定义结构, 首字段是本接口). */

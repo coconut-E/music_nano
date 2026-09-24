@@ -74,6 +74,15 @@ extern volatile float  g_vbat;        /* 电池电压 (V) */
 extern volatile float  g_cpu_temp;    /* CPU 温度 (C) */
 extern fs_cache_t     *g_fs_cache;    /* 文件缓存 (PSRAM) */
 
+/* 回收已下线的旧文件缓存 (仅 UI 任务调用, 见实现说明) */
+void fs_cache_reap(void);
+
+/* SD/FATFS 访问互斥: 所有跨任务的文件操作 (解码器 fopen/fread/fseek/fclose)
+ * 须用 sd_fs_lock/unlock 包住; sdmmc_disk_deinit 在持锁时卸载,
+ * 避免卸载瞬间其它任务仍在 FATFS 内持有卷锁 (否则 _lock_close 断言崩溃) */
+void sd_fs_lock(void);
+void sd_fs_unlock(void);
+
 /* 由 group/name 拼出真实路径: group=分组, name=文件名, out=输出缓冲, out_size=缓冲大小 */
 void fs_build_real_path(const char *group, const char *name,
                         char *out, size_t out_size);

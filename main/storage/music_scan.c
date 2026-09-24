@@ -337,7 +337,8 @@ static void clean_cache_files(void)
 }
 
 /* 把构建器序列化为 index.bin (先写临时文件再改名, 防掉电半写) */
-static void write_index_bin(cache_builder_t *b)
+/* 写索引文件: 成功返回 true */
+static bool write_index_bin(cache_builder_t *b)
 {
     char tmp_path[128];
     snprintf(tmp_path, sizeof(tmp_path), "%s/index.bin.tmp", FS_CACHE_DIR);
@@ -345,7 +346,7 @@ static void write_index_bin(cache_builder_t *b)
     int fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0);
     if (fd < 0) {
         ESP_LOGE(TAG_MUSIC_SCAN, "无法创建索引文件: %s", tmp_path);
-        return;
+        return false;
     }
 
     fs_cache_t hdr;
@@ -371,20 +372,21 @@ static void write_index_bin(cache_builder_t *b)
     if (!ok) {
         ESP_LOGE(TAG_MUSIC_SCAN, "索引写入失败");
         remove(tmp_path);
-        return;
+        return false;
     }
 
     remove(FS_CACHE_BIN_PATH);   /* FatFs rename 目标已存在时可能失败 */
     if (rename(tmp_path, FS_CACHE_BIN_PATH) != 0) {
         ESP_LOGE(TAG_MUSIC_SCAN, "索引改名失败: %s", strerror(errno));
         remove(tmp_path);
-        return;
+        return false;
     }
     ESP_LOGI(TAG_MUSIC_SCAN, "索引已写入: %d 条目, 池 %zu 字节",
              hdr.count, hdr.pool_size);
+    return true;
 }
 
-/* 校验 index.bin 是否存在且头部有效 */
+/* 校验 index.bin 是否存在且完整有效 (与 sd_load_cache_bin 的校验一致: 头部 + 精确长度) */
 static bool index_bin_valid(void)
 {
     int fd = open(FS_CACHE_BIN_PATH, O_RDONLY);
@@ -392,8 +394,20 @@ static bool index_bin_valid(void)
 
     fs_cache_t hdr;
     ssize_t n = read(fd, &hdr, sizeof(hdr));
+    if (n != (ssize_t)sizeof(hdr) || hdr.magic != FS_CACHE_MAGIC || hdr.count < 0) {
+        close(fd);
+        return false;
+    }
+
+    struct stat st;
+    bool ok = false;
+    if (fstat(fd, &st) == 0) {
+        size_t expect = sizeof(fs_cache_t) + (size_t)hdr.count * sizeof(fs_entry_t)
+                        + hdr.pool_size;
+        ok = ((size_t)st.st_size == expect);   /* 长度必须精确匹配, 防截断/多余被误判有效 */
+    }
     close(fd);
-    return n == (ssize_t)sizeof(hdr) && hdr.magic == FS_CACHE_MAGIC && hdr.count >= 0;
+    return ok;
 }
 
 /* 扫描单个目录: 目录/文件条目写入构建器, 子目录入栈 (不递归).
@@ -482,11 +496,13 @@ static void music_scan_run(void)
 
     dir_stack_push(&ctx.stack, MOUNT_POINT);
 
+    bool scan_ok = true;
     while (ctx.stack.used > 0) {
         const char *top = dir_stack_top(&ctx.stack);   /* 栈顶路径 */
         size_t tl = strlen(top);
         char *cur = ensure_cap(&ctx.cur_dir, &ctx.cur_dir_cap, tl + 1);
         if (!cur) {
+            scan_ok = false;   /* 分配失败: 扫描不完整, 不得写出部分索引 */
             break;
         }
         memcpy(cur, top, tl + 1);   /* 先拷出稳定副本 (入栈会 realloc 栈池) */
@@ -494,7 +510,12 @@ static void music_scan_run(void)
         scan_one_dir(&ctx, cur);
     }
 
-    write_index_bin(&ctx.b);
+    bool wrote = false;
+    if (scan_ok) {
+        wrote = write_index_bin(&ctx.b);
+    } else {
+        ESP_LOGW(TAG_MUSIC_SCAN, "扫描未完成(内存不足), 跳过写索引, 下次开机重扫");
+    }
 
     dir_stack_free(&ctx.stack);
     heap_caps_free(ctx.cur_dir);
@@ -504,7 +525,7 @@ static void music_scan_run(void)
     heap_caps_free(ctx.b.pool);
 
     uint64_t used_kb = get_used_space_kb();
-    write_space_cache(used_kb);
+    if (wrote) write_space_cache(used_kb);   /* 仅索引成功写入才更新空间快照 */
 
     int64_t elapsed = esp_timer_get_time() - t0;
     ESP_LOGI(TAG_MUSIC_SCAN, "扫描完成, 耗时 %.2f ms", elapsed / 1000.0f);

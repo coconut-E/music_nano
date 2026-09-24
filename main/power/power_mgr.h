@@ -20,7 +20,8 @@ void power_mgr_init(void);
 void power_mgr_boot_battery_check(void);
 
 /* 单次读取电池电压 (V): 供 sys_monitor 周期采样等复用.
- * 首次调用会幂等初始化 ADC */
+ * 首次调用会幂等初始化 ADC. 返回负值表示 ADC 不可用/读取失败,
+ * 调用方必须先判 v>=0 再参与低压判断, 避免误判 0V */
 float power_mgr_vbat_read_once(void);
 
 /* 紧急关机 (运行中电压过低时调用, 无动画):

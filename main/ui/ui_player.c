@@ -728,35 +728,36 @@ static void song_info_monitor_cb(lv_timer_t *timer)
                           atomic_load_bool(&g_pcm_active) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
 
-    if (atomic_load_bool(&g_song_info_valid)) {
-        lv_label_set_text(s_title_label, g_song_info.title[0] ? g_song_info.title : " ");
-        lv_label_set_text(s_artist_label, g_song_info.artist[0] ? g_song_info.artist : " ");
-        lv_label_set_text(s_fmt_val, g_song_info.format);
+    song_info_t info;
+    if (song_info_snapshot(&info)) {   /* 一次性取一致快照, 避免与解码任务并发撕裂 */
+        lv_label_set_text(s_title_label, info.title[0] ? info.title : " ");
+        lv_label_set_text(s_artist_label, info.artist[0] ? info.artist : " ");
+        lv_label_set_text(s_fmt_val, info.format);
 
         char buf[16];
         /* 采样率: 整除1000 → "48k", 否则 "44.1k" */
-        if (g_song_info.sample_rate % 1000 == 0) {
-            snprintf(buf, sizeof(buf), "%" PRIu32 "k", g_song_info.sample_rate / 1000);
+        if (info.sample_rate % 1000 == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu32 "k", info.sample_rate / 1000);
         } else {
-            snprintf(buf, sizeof(buf), "%.1fk", (double)g_song_info.sample_rate / 1000.0);
+            snprintf(buf, sizeof(buf), "%.1fk", (double)info.sample_rate / 1000.0);
         }
         lv_label_set_text(s_sr_val, buf);
 
         /* 声道 */
         lv_label_set_text(s_ch_val,
-                          g_song_info.channels == 2 ? "2ch" :
-                          (g_song_info.channels == 1 ? "1ch" : " "));
+                          info.channels == 2 ? "2ch" :
+                          (info.channels == 1 ? "1ch" : " "));
 
         /* 右下: MP3 → 码率, FLAC/WAV → 位深 */
-        if (strcmp(g_song_info.format, "MP3") == 0) {
-            snprintf(buf, sizeof(buf), "%" PRIu32 "k", g_song_info.bitrate_kbps);
+        if (strcmp(info.format, "MP3") == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu32 "k", info.bitrate_kbps);
         } else {
-            snprintf(buf, sizeof(buf), "%ubit", g_song_info.bits_per_sample);
+            snprintf(buf, sizeof(buf), "%ubit", info.bits_per_sample);
         }
         lv_label_set_text(s_bit_val, buf);
 
-        uint32_t cur = g_song_info.elapsed_sec;
-        uint32_t tot = g_song_info.duration_sec;
+        uint32_t cur = info.elapsed_sec;
+        uint32_t tot = info.duration_sec;
         snprintf(buf, sizeof(buf), "%" PRIu32 ":%02" PRIu32, cur / 60, cur % 60);
         lv_label_set_text(s_time_current, buf);
         snprintf(buf, sizeof(buf), "%" PRIu32 ":%02" PRIu32, tot / 60, tot % 60);
@@ -779,6 +780,9 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
 {
     static bool last_ready = false;
     bool sd_ready = atomic_load_bool(&g_sd_ready);
+
+    /* 回收 sys_monitor 移交的旧缓存 (本任务即所有 g_fs_cache 读者, 此刻必无并发遍历) */
+    fs_cache_reap();
 
     if (!sd_ready && last_ready) {   /* 刚拔出 */
         /* 音频立即停止, 干净 close_decoder */

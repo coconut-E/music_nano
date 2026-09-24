@@ -16,6 +16,9 @@ using namespace esp_audio_libs;
 /* 最坏输入: MPEG1 stereo 1152 帧/块 */
 #define MAX_IN_FRAMES  1152
 
+/* 最低支持源采样率: 低于此值单块重采样输出会超出调用方缓冲 (见 PCM_OUT_BUF_SAMPLES), 直接拒绝 */
+#define MIN_SRC_RATE   8000
+
 /* 转换层内部结构 */
 struct pcm_pipeline_s {
     resampler_fxp_t *res_fxp;   /* 重采样器 (仅需重采样时非 NULL) */
@@ -82,8 +85,8 @@ bool pcm_pipeline_open(pcm_pipeline_t *p, uint32_t src_rate, uint8_t src_bits, u
 
     pcm_pipeline_close(p);   /* 先释放旧配置 */
 
-    /* 参数合法性校验 */
-    if (src_rate == 0 || src_bits == 0 || (src_ch != 1 && src_ch != 2)) {
+    /* 参数合法性校验 (源率过低会使单块重采样输出超出缓冲, 拒绝) */
+    if (src_rate < MIN_SRC_RATE || src_bits == 0 || (src_ch != 1 && src_ch != 2)) {
         return false;
     }
 

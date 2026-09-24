@@ -324,6 +324,13 @@ static bool flac_open(audio_decoder_t *iface, const char *path)
     const micro_flac::FLACStreamInfo &info = flac->get_stream_info();
     d->sample_rate = info.sample_rate();
     d->channels    = (uint8_t)info.num_channels();
+    /* 仅支持 1/2 声道: 管线只接受单/双声道, 且调用方 PCM 缓冲按 2 声道分配,
+     * 多声道继续解码会写越界, 这里直接拒绝打开 */
+    if (d->channels < 1 || d->channels > 2) {
+        ESP_LOGW(FLAC_TAG, "不支持 %u 声道 (仅 1/2), 跳过: %s", d->channels, path);
+        flac_free_state(d);
+        return false;
+    }
     d->bits_per_sample = (uint8_t)info.bits_per_sample();
     d->total_samples = info.total_samples_per_channel();
 
@@ -371,10 +378,14 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
 
     if (!d->file || !d->flac || !d->out32) return false;
 
+    /* 调用方经 *bytes 传入输出缓冲容量(字节), 据此限幅, 防止越界写 */
+    size_t cap_samples = *bytes / sizeof(int16_t);
+
     while (1) {
         /* 有解码好的帧 → 先喂给调用方 */
         if (d->out_remaining > 0) {
             size_t max_samples = FLAC_SERVE_FRAMES * d->channels;   /* 本次最多输出帧数 */
+            if (cap_samples && max_samples > cap_samples) max_samples = cap_samples;   /* 不超过调用方容量 */
             size_t n = d->out_remaining < max_samples ? d->out_remaining : max_samples;
 
             if (d->skip_remaining > 0) {   /* seek 跳转后: 丢弃前若干样本 */

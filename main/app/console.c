@@ -27,9 +27,10 @@ static TaskStatus_t *s_stats_prev       = NULL;   /* 上次采样的任务状态
 static UBaseType_t   s_stats_prev_count = 0;      /* 上次采样到的任务个数 */
 static uint32_t      s_stats_prev_total = 0;      /* 上次采样的总运行时间计数 */
 static TickType_t    s_stats_prev_tick  = 0;      /* 上次采样的 tick */
-static portMUX_TYPE  s_stats_lock       = portMUX_INITIALIZER_UNLOCKED;   /* 保护上面的快照数据 */
+static SemaphoreHandle_t s_stats_mux    = NULL;   /* 保护上面的快照数据 (互斥量, 允许锁外释放/分配) */
 
-/* 定时器回调: 每秒采样一次全任务状态, 覆盖式保存到 s_stats_prev */
+/* 定时器回调: 每秒采样一次全任务状态, 覆盖式保存到 s_stats_prev.
+ * 分配/释放在锁外进行, 仅指针交换在锁内, 避免在临界区调用 heap */
 static void stats_timer_cb(TimerHandle_t xTimer)
 {
     UBaseType_t n = uxTaskGetNumberOfTasks();          /* 当前任务总数 */
@@ -39,24 +40,37 @@ static void stats_timer_cb(TimerHandle_t xTimer)
     uint32_t total = 0;                                /* 输出: 采样时刻的总运行时间计数 */
     n = uxTaskGetSystemState(snap, n, &total);         /* 获取所有任务状态快照 */
 
-    portENTER_CRITICAL(&s_stats_lock);                 /* 写快照时禁止被中断抢占 */
-    if (s_stats_prev) free(s_stats_prev);              /* 释放旧的快照 */
+    if (!s_stats_mux) { free(snap); return; }
+    TaskStatus_t *old = NULL;
+    xSemaphoreTake(s_stats_mux, portMAX_DELAY);
+    old = s_stats_prev;                                /* 换出新快照 */
     s_stats_prev       = snap;
     s_stats_prev_count = n;
     s_stats_prev_total = total;
     s_stats_prev_tick  = xTaskGetTickCount();          /* 记录采样时刻 */
-    portEXIT_CRITICAL(&s_stats_lock);
+    xSemaphoreGive(s_stats_mux);
+    if (old) free(old);                                /* 锁外释放 */
 }
 
 /* stats 命令: 打印两次采样窗口内各任务 CPU 占用百分比 */
 static void cmd_stats(void)
 {
-    portENTER_CRITICAL(&s_stats_lock);                 /* 取走上次快照的副本 */
-    TaskStatus_t *prev = s_stats_prev;
-    UBaseType_t   prev_count  = s_stats_prev_count;
-    uint32_t      prev_total  = s_stats_prev_total;
-    TickType_t    prev_tick   = s_stats_prev_tick;
-    portEXIT_CRITICAL(&s_stats_lock);
+    if (!s_stats_mux) {
+        printf("[stats] 统计未就绪\n");
+        return;
+    }
+
+    /* 锁内深拷贝上次快照: 之后不再引用 s_stats_prev, 解锁后由本函数独占副本 */
+    xSemaphoreTake(s_stats_mux, portMAX_DELAY);
+    UBaseType_t prev_count = s_stats_prev_count;
+    uint32_t    prev_total = s_stats_prev_total;
+    TickType_t  prev_tick  = s_stats_prev_tick;
+    TaskStatus_t *prev = NULL;
+    if (s_stats_prev && prev_count) {
+        prev = malloc(prev_count * sizeof(TaskStatus_t));
+        if (prev) memcpy(prev, s_stats_prev, prev_count * sizeof(TaskStatus_t));
+    }
+    xSemaphoreGive(s_stats_mux);
 
     if (!prev) {
         printf("[stats] 暂无数据，请等待下一次采样\n");
@@ -67,6 +81,7 @@ static void cmd_stats(void)
     TaskStatus_t *cur = malloc(n * sizeof(TaskStatus_t));   /* 当前快照 */
     if (!cur) {
         printf("[stats] 内存不足\n");
+        free(prev);
         return;
     }
 
@@ -80,6 +95,7 @@ static void cmd_stats(void)
     if (delta_total == 0) {
         printf("[stats] 测不到有效差值, 请稍后再试\n");
         free(cur);
+        free(prev);
         return;
     }
 
@@ -105,6 +121,7 @@ static void cmd_stats(void)
     printf("===============================\n");
 
     free(cur);
+    free(prev);
 }
 
 /* ram 命令: 打印内部 RAM 空闲情况 */
@@ -266,6 +283,8 @@ static void console_task(void *arg)
 void console_init(QueueHandle_t app_cmd_queue)
 {
     s_app_cmd_queue = app_cmd_queue;
+
+    s_stats_mux = xSemaphoreCreateMutex();   /* 统计快照互斥量 (须在定时器启动前建好) */
 
     TimerHandle_t timer = xTimerCreate("stats", pdMS_TO_TICKS(1000),
                                        pdTRUE, NULL, stats_timer_cb);   /* 自动重载定时器 */

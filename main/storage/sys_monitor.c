@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -19,6 +20,7 @@
 #include "atomic_utils.h"
 #include "power_mgr.h"
 #include "played_bits.h"
+#include "audio_task.h"
 #include "sys_monitor.h"
 
 /* 安全拷贝: 把 src 复制到 dst (目标大小 dst_sz), 保证结尾 '\0' */
@@ -44,9 +46,9 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 
 #define SAMPLE_COUNT  10             /* 采样次数 (取平均滤波) */
 #define SAMPLE_DELAY_MS 10           /* 相邻两次采样间隔 */
-#define SENSOR_INTERVAL_TICKS 10     /* 传感器采样周期计数 (×100ms = 1s) */
+#define SENSOR_INTERVAL_TICKS 20     /* 传感器采样周期计数 (×50ms = 1s) */
 
-#define CPU_TEMP_OFFSET_C  20.0f     /* CPU 内部温度传感器校准偏移 */
+#define CPU_TEMP_OFFSET_C  0.0f     /* CPU 内部温度传感器校准偏移 */
 #define VBAT_CRITICAL_LOW_V  3.25f   /* 运行中临界电压 (低于此值直接深睡关机) */
 
 /* 跨模块共享状态 */
@@ -77,6 +79,8 @@ static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
 static bool          s_mounted = false;  /* 是否已挂载 */
 
 static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的缓存指针 (用于释放) */
+static fs_cache_t   *s_fs_cache_retire = NULL;  /* 已下线待回收的旧缓存 (交由 UI 任务释放) */
+static SemaphoreHandle_t s_sd_fs_mutex = NULL;  /* SD/FATFS 访问互斥 (卸载与解码器 IO 互斥) */
 
 static sd_event_cb_t  s_event_cb  = NULL;   /* 磁盘事件回调 */
 static void          *s_event_ctx = NULL;   /* 回调用户数据 */
@@ -275,16 +279,30 @@ void sdmmc_disk_deinit(void)
 {
     if (!s_mounted) return;
 
-    atomic_store_bool(&g_sd_ready, false);
+    atomic_store_bool(&g_sd_ready, false);   /* 先通知 audio 停止占用 SD */
 
-    /* 先置空缓存指针再释放, LVGL 并发访问只会读到 NULL, 不会读已释放内存 */
+    /* 先置空缓存指针; 实际内存移交 retire, 由 UI 任务在确认无读者时释放,
+     * 避免本任务释放时 UI 已取得旧指针正在遍历导致 use-after-free */
     g_fs_cache = NULL;
     if (s_fs_cache_owned) {
-        heap_caps_free(s_fs_cache_owned);
+        s_fs_cache_retire = s_fs_cache_owned;
         s_fs_cache_owned = NULL;
     }
 
+    /* 等 audio 关闭解码器并释放打开的文件, 同时排空在途 FATFS 调用:
+     * 反复尝试取锁; 拿到锁且确认无打开文件后再卸载. 这样卸载时卷锁必为空,
+     * 不会触发 _lock_close 断言 (audio 一见 g_sd_ready=false 即会关闭, 不依赖 UI) */
+    bool locked = false;
+    for (int i = 0; i < 300; i++) {          /* 最多 ~3s */
+        sd_fs_lock();
+        if (!atomic_load_bool(&g_audio_decoder_open)) { locked = true; break; }
+        sd_fs_unlock();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!locked) sd_fs_lock();               /* 兜底: 仍阻塞取锁, 保证卸载时无在途调用 */
+
     esp_err_t ret = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
+    sd_fs_unlock();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_SDMMC, "卸载失败 (%s)", esp_err_to_name(ret));
     }
@@ -294,6 +312,27 @@ void sdmmc_disk_deinit(void)
     ESP_LOGI(TAG_SDMMC, "SD 卡已卸载");
 
     if (s_event_cb) s_event_cb("unmounted", s_event_ctx);
+}
+
+/* 获取/释放 SD/FATFS 互斥锁 (跨任务文件操作与卸载互斥) */
+void sd_fs_lock(void)
+{
+    if (s_sd_fs_mutex) xSemaphoreTake(s_sd_fs_mutex, portMAX_DELAY);
+}
+
+void sd_fs_unlock(void)
+{
+    if (s_sd_fs_mutex) xSemaphoreGive(s_sd_fs_mutex);
+}
+
+/* 回收已下线的旧缓存. 必须由 UI 任务调用: UI 是 g_fs_cache 的唯一遍历者,
+ * 在 UI 上下文中释放可保证没有读者正在使用旧指针 (见 fs_cache_reap 声明) */
+void fs_cache_reap(void)
+{
+    if (s_fs_cache_retire) {
+        heap_caps_free(s_fs_cache_retire);
+        s_fs_cache_retire = NULL;
+    }
 }
 
 bool sdmmc_disk_is_mounted(void)
@@ -322,17 +361,20 @@ static void sample_sensors(void)
 {
     float temp_sum = 0.0f;
     float vbat_sum = 0.0f;
+    int   vbat_valid = 0;
 
     for (int i = 0; i < SAMPLE_COUNT; i++) {
         temp_sum += read_cpu_temp();
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
 
-        vbat_sum += power_mgr_vbat_read_once();
+        float v = power_mgr_vbat_read_once();
+        if (v >= 0.0f) { vbat_sum += v; vbat_valid++; }   /* 只累加有效采样 */
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
     }
 
     float temp_avg = temp_sum / (float)SAMPLE_COUNT;   /* 温度平均 */
-    float vbat_avg = vbat_sum / (float)SAMPLE_COUNT;   /* 电压平均 */
+    /* 无有效电压采样则发布负值 (下游据此跳过低压判断) */
+    float vbat_avg = vbat_valid ? (vbat_sum / (float)vbat_valid) : -1.0f;
 
     atomic_store_float(&g_cpu_temp, temp_avg);   /* 原子发布, 供 UI/控制台读取 */
     atomic_store_float(&g_vbat, vbat_avg);
@@ -394,18 +436,20 @@ static void sys_monitor_task(void *arg)
             tick = 0;
             sample_sensors();
 
-            /* 周期低压检测: 低于临界值 → 无动画直接深睡 (深度睡眠即重启系统, 无需善后) */
-            if (g_vbat < VBAT_CRITICAL_LOW_V) {
+            /* 周期低压检测: 低于临界值 → 无动画直接深睡 (深度睡眠即重启系统, 无需善后).
+             * g_vbat<0 表示 ADC 不可用, 必须排除, 否则会被误判为低压 */
+            if (g_vbat > 0.0f && g_vbat < VBAT_CRITICAL_LOW_V) {
                 power_mgr_critical_shutdown();
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));   /* 轮询周期 100ms */
+        vTaskDelay(pdMS_TO_TICKS(50));   /* 轮询周期 50ms (提高拔卡检测响应) */
     }
 }
 
 /* 启动系统监视任务 (固定 core 1) */
 void sys_monitor_init(void)
 {
+    if (!s_sd_fs_mutex) s_sd_fs_mutex = xSemaphoreCreateMutex();   /* SD/FATFS 互斥 (须在任务及各 IO 之前建好) */
     xTaskCreatePinnedToCore(sys_monitor_task, "sys_monitor", 8192, NULL, 1, NULL, 1);
 }

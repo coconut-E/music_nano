@@ -34,11 +34,14 @@
 #define VOL_SET_DELAY_MS  500      /* 音量发送延迟 */
 #define VOL_WAIT_FALLBACK_MS  3000 /* AVRC 兜底超时 */
 
+#define CONNECT_TIMEOUT_US  (20LL * 1000 * 1000)   /* 连接流程总超时 20s: 防止协议栈无回调时永久卡 CONNECTING */
+
 /* 内部事件分发类型: 区分协议栈回调来源 */
 typedef enum {
     BT_DISPATCH_A2DP,     /* A2DP 回调 */
     BT_DISPATCH_AVRC,     /* AVRCP 控制器回调 */
     BT_DISPATCH_AVRC_TG,  /* AVRCP 目标端回调 (耳机发来的命令) */
+    BT_DISPATCH_GAP,      /* GAP 回调 (扫描/连接状态变化, 编组到任务上下文处理) */
 } bt_dispatch_type_t;
 
 /* 分发消息: 协议栈回调参数原样拷贝后投递到任务上下文处理 */
@@ -48,11 +51,18 @@ typedef struct {
     void              *param;  /* 参数副本 (malloc, 处理后 free) */
 } bt_dispatch_msg_t;
 
+/* GAP 发现结果编组载荷: 回调里只读解析出 bda/name, 不携带协议栈指针,
+ * 状态变更与 esp_* 调用一律交给任务上下文, 消除跨上下文竞态 */
+typedef struct {
+    esp_bd_addr_t bda;       /* 设备地址 */
+    char          name[32];  /* 设备名 (EIR 解析结果) */
+} gap_disc_t;
+
 static bt_a2dp_iface_t s_iface;         /* 对外接口 (队列/流) */
-static bool s_bt_ready = false;         /* 协议栈是否就绪 */
-static bool s_connected = false;        /* A2DP 已连接 */
+static volatile bool s_bt_ready = false;         /* 协议栈是否就绪 */
+static volatile bool s_connected = false;        /* A2DP 已连接 */
 static bool s_scanning = false;         /* 正在扫描 */
-static bool s_connecting = false;       /* 正在连接 */
+static volatile bool s_connecting = false;       /* 正在连接 */
 static bool s_stream_started = false;   /* 媒体流是否已启动 (START/SUSPEND 状态) */
 static volatile bool s_start_retry = false;  /* START 被 BUSY 拒绝, 待前一条命令完成后重发 */
 static esp_bd_addr_t s_peer_bda;        /* 对端(耳机)蓝牙地址 */
@@ -62,6 +72,7 @@ static volatile bool s_pending_vol = false;  /* 是否处于"待发音量"窗口
 static bool          s_avrc_connected = false;  /* AVRC 是否已连接 */
 static int64_t       s_avrc_at_us  = 0;   /* AVRC 连接时刻 (us) */
 static int64_t       s_connect_at_us = 0; /* A2DP 连接时刻 (us) */
+static int64_t       s_connect_req_us = 0; /* 发起连接请求的时刻 (0=无连接流程), 用于超时保护 */
 
 
 /* 扫描结果缓存: 本次扫描发现的设备 (名称→地址) */
@@ -399,8 +410,9 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT: {   /* A2DP 连接状态 */
         if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            s_connected = true;
+            atomic_store_bool(&s_connected, true);
             s_connecting = false;
+            s_connect_req_us = 0;   /* 连接成功, 清除超时计时 */
             s_stream_started = false;
             s_start_retry = false;
             memcpy(s_peer_bda, a2d->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
@@ -417,8 +429,9 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             send_evt(BT_EVT_CONNECTED, s_connected_name, 0);
         } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             /* 断开: 清所有连接状态 */
-            s_connected = false;
+            atomic_store_bool(&s_connected, false);
             s_connecting = false;
+            s_connect_req_us = 0;   /* 断开, 清除超时计时 */
             s_stream_started = false;
             s_start_retry = false;
             s_pending_vol = false;
@@ -462,60 +475,36 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
     }
 }
 
-/* ── GAP callback (called from BT context, keep it fast) ── */
-static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+/* ── GAP 事件处理 (在 BT 任务上下文执行): 状态变更与协议栈调用集中于此, 消除竞态 ── */
+static void bt_a2dp_hdl_gap_evt(uint16_t event, void *p_param)
 {
     char bda_str[18];
 
     switch (event) {
-    case ESP_BT_GAP_DISC_RES_EVT: {   /* 扫描发现一个设备 */
-        if (!s_scanning) break;
+    case ESP_BT_GAP_DISC_RES_EVT: {   /* 扫描发现一个设备 (回调已解析出 bda/name) */
+        gap_disc_t *d = (gap_disc_t *)p_param;
+        if (!s_scanning || !d) break;
 
-        uint32_t cod = 0;
-        uint8_t *eir = NULL;
+        bda2str(d->bda, bda_str, sizeof(bda_str));
+        ESP_LOGI(BT_TAG, "扫描到设备: %s, 名称 %s", bda_str, d->name);
 
-        /* 提取设备属性 (类别/扩展信息) */
-        for (int i = 0; i < param->disc_res.num_prop; i++) {
-            esp_bt_gap_dev_prop_t *p = param->disc_res.prop + i;
-            switch (p->type) {
-            case ESP_BT_GAP_DEV_PROP_COD:   /* 服务类别 */
-                cod = *(uint32_t *)(p->val);
-                break;
-            case ESP_BT_GAP_DEV_PROP_EIR:   /* 扩展信息 (含名字) */
-                eir = (uint8_t *)(p->val);
-                break;
-            default:
-                break;
+        if (s_connect_target[0] != '\0') {   /* 连接模式: 匹配目标名 */
+            if (strcmp(d->name, s_connect_target) == 0) {
+                s_connect_found = true;
+                memcpy(s_connect_bda, d->bda, ESP_BD_ADDR_LEN);
+                esp_bt_gap_cancel_discovery();   /* 找到了, 停止扫描 */
             }
-        }
-
-        /* 只收渲染类设备 (音箱/耳机), 过滤掉手机等 */
-        if (!esp_bt_gap_is_valid_cod(cod) ||
-            !(esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING)) {
-            break;
-        }
-
-        char device_name[32] = {0};
-        if (eir && get_name_from_eir(eir, device_name, sizeof(device_name))) {
-            bda2str(param->disc_res.bda, bda_str, sizeof(bda_str));
-            ESP_LOGI(BT_TAG, "扫描到设备: %s, 名称 %s", bda_str, device_name);
-
-            if (s_connect_target[0] != '\0') {   /* 连接模式: 匹配目标名 */
-                if (strcmp(device_name, s_connect_target) == 0) {
-                    s_connect_found = true;
-                    memcpy(s_connect_bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
-                    esp_bt_gap_cancel_discovery();   /* 找到了, 停止扫描 */
-                }
-            } else {   /* 浏览模式: 加入缓存并上报 */
-                if (cache_add(param->disc_res.bda, device_name)) {
-                    send_evt(BT_EVT_DEVICE_FOUND, device_name, 0);
-                }
+        } else {   /* 浏览模式: 加入缓存并上报 */
+            if (cache_add(d->bda, d->name)) {
+                send_evt(BT_EVT_DEVICE_FOUND, d->name, 0);
             }
         }
         break;
     }
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {   /* 扫描状态变化 */
-        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+        if (!p_param) break;
+        uint32_t state = *(uint32_t *)p_param;
+        if (state == ESP_BT_GAP_DISCOVERY_STOPPED) {
             s_scanning = false;
 
             if (s_connect_target[0] != '\0') {   /* 连接扫描结束 */
@@ -540,6 +529,7 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
                 } else {   /* 彻底失败 */
                     ESP_LOGW(BT_TAG, "未找到设备 %s，连接失败", s_connect_target);
                     s_connecting = false;
+                    s_connect_req_us = 0;
                     memset(s_connecting_name, 0, sizeof(s_connecting_name));
                     send_evt(BT_EVT_CONNECT_FAILED, s_connect_target, -1);
                     memset(s_connect_target, 0, sizeof(s_connect_target));
@@ -548,20 +538,66 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
                 ESP_LOGI(BT_TAG, "设备搜索已停止。");
                 send_evt(BT_EVT_SCAN_DONE, NULL, 0);
             }
-        } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
+        } else if (state == ESP_BT_GAP_DISCOVERY_STARTED) {
             s_scanning = true;
             ESP_LOGI(BT_TAG, "设备搜索已开始。");
         }
         break;
     }
-    case ESP_BT_GAP_AUTH_CMPL_EVT: {   /* 认证完成 */
+    default:
+        break;
+    }
+}
+
+/* ── GAP callback (called from BT context, keep it fast):
+ * 只做只读解析/配对应答; 扫描结果与状态变化编组到任务上下文, 不在此改动共享状态 ── */
+static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_BT_GAP_DISC_RES_EVT: {   /* 解析设备属性 → 投递 */
+        uint32_t cod = 0;
+        uint8_t *eir = NULL;
+
+        for (int i = 0; i < param->disc_res.num_prop; i++) {
+            esp_bt_gap_dev_prop_t *p = param->disc_res.prop + i;
+            switch (p->type) {
+            case ESP_BT_GAP_DEV_PROP_COD:   /* 服务类别 */
+                cod = *(uint32_t *)(p->val);
+                break;
+            case ESP_BT_GAP_DEV_PROP_EIR:   /* 扩展信息 (含名字) */
+                eir = (uint8_t *)(p->val);
+                break;
+            default:
+                break;
+            }
+        }
+
+        /* 只收渲染类设备 (音箱/耳机), 过滤掉手机等 */
+        if (!esp_bt_gap_is_valid_cod(cod) ||
+            !(esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING)) {
+            break;
+        }
+
+        gap_disc_t d;
+        memcpy(d.bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
+        d.name[0] = '\0';
+        if (eir && get_name_from_eir(eir, d.name, sizeof(d.name))) {
+            bt_a2dp_send_dispatch(BT_DISPATCH_GAP, event, &d, sizeof(d));
+        }
+        break;
+    }
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {   /* 编组扫描状态变化 */
+        uint32_t state = (uint32_t)param->disc_st_chg.state;
+        bt_a2dp_send_dispatch(BT_DISPATCH_GAP, event, &state, sizeof(state));
+        break;
+    }
+    case ESP_BT_GAP_AUTH_CMPL_EVT:   /* 认证完成 (仅日志, 无共享状态) */
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             ESP_LOGI(BT_TAG, "认证成功: %s", param->auth_cmpl.device_name);
         } else {
             ESP_LOGE(BT_TAG, "认证失败, 状态: %d", param->auth_cmpl.stat);
         }
         break;
-    }
     case ESP_BT_GAP_PIN_REQ_EVT: {   /* 旧式 PIN 配对请求: 自动应答 */
         if (param->pin_req.min_16_digit) {   /* 16 位 PIN */
             esp_bt_pin_code_t pin_code = {0};
@@ -646,7 +682,7 @@ static void bt_a2dp_hdl_stack_up(void)
 
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);   /* 初始不可被发现 */
 
-    s_bt_ready = true;
+    atomic_store_bool(&s_bt_ready, true);
     ESP_LOGI(BT_TAG, "蓝牙初始化完成"); 
 }
 
@@ -745,6 +781,21 @@ static void bt_a2dp_task(void *arg)
     QueueHandle_t     active;
 
     while (1) {
+        /* 连接超时保护: 发起连接后长时间既未连上也无失败回调 → 主动中断, 避免永久 CONNECTING */
+        if (s_connecting && s_connect_req_us && !s_connected &&
+            (esp_timer_get_time() - s_connect_req_us) > CONNECT_TIMEOUT_US) {
+            ESP_LOGW(BT_TAG, "连接超时, 放弃 %s", s_connecting_name);
+            if (s_scanning) esp_bt_gap_cancel_discovery();
+            memset(s_connect_target, 0, sizeof(s_connect_target));
+            s_pending_connect_scan = false;
+            s_connect_found = false;
+            s_connect_retry = 0;
+            s_connecting = false;
+            s_connect_req_us = 0;
+            send_evt(BT_EVT_CONNECT_FAILED, s_connecting_name, -1);
+            memset(s_connecting_name, 0, sizeof(s_connecting_name));
+        }
+
         if (s_connected) {
             /* 已连接: 200ms 超时轮询, 期间处理音量同步/流启停 */
             active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(200));
@@ -833,6 +884,7 @@ static void bt_a2dp_task(void *arg)
                     memset(s_connect_target, 0, sizeof(s_connect_target));
                     s_pending_connect_scan = false;
                     s_connecting = false;
+                    s_connect_req_us = 0;
                     memset(s_connecting_name, 0, sizeof(s_connecting_name));
                     send_evt(BT_EVT_CONNECT_FAILED, NULL, -1);
                 }
@@ -858,6 +910,7 @@ static void bt_a2dp_task(void *arg)
                 s_connect_retry = 0;
                 s_connect_found = false;
                 s_connecting = true;
+                s_connect_req_us = esp_timer_get_time();   /* 记录发起时刻, 用于超时保护 */
 
                 if (s_scanning) {   /* 正在空闲扫描 → 取消后转连接扫描 */
                     s_pending_connect_scan = true;
@@ -897,6 +950,9 @@ static void bt_a2dp_task(void *arg)
             case BT_DISPATCH_AVRC_TG:
                 bt_a2dp_hdl_avrc_tg_evt(disp.event, disp.param);
                 break;
+            case BT_DISPATCH_GAP:
+                bt_a2dp_hdl_gap_evt(disp.event, disp.param);
+                break;
             }
 
             if (disp.param) {
@@ -918,8 +974,8 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
         return NULL;
     }
 
-    s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));   /* 内部事件分发 */
-    s_queue_set      = xQueueCreateSet(8);                            /* 队列集 */
+    s_dispatch_queue = xQueueCreate(32, sizeof(bt_dispatch_msg_t));  /* 内部事件分发 (扫描期 DISC_RES 较多, 留足深度) */
+    s_queue_set      = xQueueCreateSet(16);                          /* 队列集 */
     if (!s_dispatch_queue || !s_queue_set) {
         return NULL;
     }
@@ -933,16 +989,16 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
     return &s_iface;
 }
 
-/* 查询连接状态 */
+/* 查询连接状态 (跨任务调用: 用原子读保证可见性) */
 bt_state_t bt_a2dp_get_state(void)
 {
-    if (!s_bt_ready) return BT_STATE_DISCONNECTED;   /* 协议栈未就绪视为未连接 */
-    if (s_connected) return BT_STATE_CONNECTED;
-    if (s_connecting) return BT_STATE_CONNECTING;
+    if (!atomic_load_bool(&s_bt_ready)) return BT_STATE_DISCONNECTED;   /* 协议栈未就绪视为未连接 */
+    if (atomic_load_bool(&s_connected)) return BT_STATE_CONNECTED;
+    if (atomic_load_bool(&s_connecting)) return BT_STATE_CONNECTING;
     return BT_STATE_DISCONNECTED;
 }
 
 bool bt_a2dp_is_connected(void)
 {
-    return s_connected && s_bt_ready;
+    return atomic_load_bool(&s_connected) && atomic_load_bool(&s_bt_ready);
 }
