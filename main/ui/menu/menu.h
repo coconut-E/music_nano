@@ -33,6 +33,7 @@ void panel_anim_close(const panel_anim_cfg_t *cfg);  /* 关闭面板动画 */
 
 /* ── 文件浏览器 (menu_browser.c) ── */
 void fs_list_set_play_cb(void (*cb)(const char *group, const char *name));   /* 注册点击播放回调 */
+bool fs_browser_precreate_step(int budget_us);        /* 分步预建面板 (true=未完成, budget_us<=0 一次做完) */
 void fs_menu_click_cb(lv_event_t *e);                 /* 文件菜单入口点击事件 */
 void fs_browser_on_sd_ready(void);                    /* SD 就绪 → 加载列表 */
 void fs_browser_on_sd_remove(void);                   /* SD 拔出 → 清列表 */

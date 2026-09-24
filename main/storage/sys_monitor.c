@@ -1,6 +1,8 @@
 #include <string.h>
+#include <stdint.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -45,8 +47,6 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 
 #define CPU_TEMP_OFFSET_C  20.0f     /* CPU 内部温度传感器校准偏移 */
 #define VBAT_CRITICAL_LOW_V  3.25f   /* 运行中临界电压 (低于此值直接深睡关机) */
-#define MUSIC_CACHE        "/sdcard/.music_cache"   /* 音乐缓存目录 */
-#define FS_CACHE_MAGIC     0x4D555349              /* 文件缓存魔数 "MUSI" */
 
 /* 跨模块共享状态 */
 volatile bool  g_sd_ready = false;      /* SD 卡就绪标志 */
@@ -63,192 +63,93 @@ static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的缓存指�
 static sd_event_cb_t  s_event_cb  = NULL;   /* 磁盘事件回调 */
 static void          *s_event_ctx = NULL;   /* 回调用户数据 */
 
-/* 由 group/name 拼出真实路径:
+/* 由 group/name 拼出真实路径 (group 用真实 '/' 分隔):
  * group="sdcard"        → /sdcard/name
- * group="sdcard_sub"    → /sdcard/sub/name  ('%' 还原为 '/') */
+ * group="sdcard/a/b"    → /sdcard/a/b/name */
 void fs_build_real_path(const char *group, const char *name,
                         char *out, size_t out_size)
 {
     const char *rel = group;
     if (strncmp(rel, "sdcard", 6) == 0) {   /* 去掉 "sdcard" 前缀 */
         rel += 6;
-        if (*rel == '_') rel++;             /* 去掉分组分隔符 '_' */
+        if (*rel == '/') rel++;             /* 去掉分组分隔符 '/' */
     }
     if (*rel == '\0') {
         snprintf(out, out_size, "/sdcard/%s", name);   /* 根目录文件 */
-    } else {
-        snprintf(out, out_size, "/sdcard/%s/%s", rel, name);   /* 子目录文件 */
-        for (char *p = out; *p; p++) {
-            if (*p == '%') *p = '/';   /* 缓存文件名的 '%' 还原为路径分隔符 */
-        }
+        return;
     }
+    snprintf(out, out_size, "/sdcard/%s/%s", rel, name);   /* 子目录文件 */
 }
 
-/* 把 SD 卡上的音乐缓存文件读入 PSRAM 构建文件索引.
- * 三遍扫描: ①数条目数②登记子目录③登记文件; 返回 fs_cache_t 或 NULL. */
-static fs_cache_t *sd_load_cache_to_psram(void)
+/* 从 .music_cache/index.bin 读取文件索引到 PSRAM.
+ * index.bin 是 fs_cache_t 的序列化镜像: entries 的 name/group 字段在磁盘上存
+ * "字符串池内偏移"; 一次读入后修正为绝对指针即可直接用, 无需逐文件解析.
+ * 返回 fs_cache_t 或 NULL. */
+static fs_cache_t *sd_load_cache_bin(void)
 {
-    DIR *dir = opendir(MUSIC_CACHE);
-    if (!dir) {
-        ESP_LOGW(TAG_SDMMC, "无法打开缓存目录");
+    int fd = open(FS_CACHE_BIN_PATH, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGW(TAG_SDMMC, "无法打开索引文件: %s", FS_CACHE_BIN_PATH);
         return NULL;
     }
 
-    /* 第一遍: 统计总条目数, 以便一次性分配内存 */
-    int total = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
-        const char *name = entry->d_name;
-        const char *ext = strrchr(name, '.');
-        if (!ext || strcmp(ext, ".txt") != 0) continue;   /* 只要 .txt 缓存文件 */
-        if (strcmp(name, "space.dat") == 0) continue;     /* 跳过空间快照文件 */
-
-        if (strcmp(name, "sdcard.txt") == 0) {   /* 根目录缓存: 逐行统计文件数 */
-            char path[512];
-            snprintf(path, sizeof(path), "%s/sdcard.txt", MUSIC_CACHE);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                char line[FS_NAME_MAX];
-                while (fgets(line, sizeof(line), f)) {
-                    size_t len = strlen(line);
-                    while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
-                        line[--len] = '\0';   /* 去掉行尾换行 */
-                    if (len > 0) total++;
-                }
-                fclose(f);
-            }
-        }
-
-        if (strncmp(name, "sdcard_", 7) == 0) {   /* 子目录缓存: 1 目录 + 其文件数 */
-            total++;  // directory entry
-
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s", MUSIC_CACHE, name);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                char line[FS_NAME_MAX];
-                while (fgets(line, sizeof(line), f)) {
-                    size_t len = strlen(line);
-                    while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
-                        line[--len] = '\0';
-                    if (len > 0) total++;
-                }
-                fclose(f);
-            }
-        }
-    }
-    closedir(dir);
-
-    if (total == 0) {
-        ESP_LOGW(TAG_SDMMC, "缓存无条目");
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(fs_cache_t)) {
+        ESP_LOGW(TAG_SDMMC, "索引文件无效");
+        close(fd);
         return NULL;
     }
+    size_t size = (size_t)st.st_size;
 
-    /* 一次性分配: 表头 + total 个条目, 放 PSRAM 省内部 RAM */
-    size_t alloc_size = sizeof(fs_cache_t) + (size_t)total * sizeof(fs_entry_t);
-    fs_cache_t *cache = heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
+    fs_cache_t *cache = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
     if (!cache) {
-        ESP_LOGE(TAG_SDMMC, "PSRAM 分配失败: %zu 字节", alloc_size);
+        ESP_LOGE(TAG_SDMMC, "PSRAM 分配失败: %zu 字节", size);
+        close(fd);
         return NULL;
     }
 
-    cache->magic = FS_CACHE_MAGIC;
-    cache->count = 0;
+    /* 一次顺序读入整块 */
+    size_t got = 0;
+    while (got < size) {
+        ssize_t r = read(fd, (char *)cache + got, size - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
 
-    /* 第二遍: 登记所有子目录 (sdcard_xxx.txt → 目录条目) */
-    dir = opendir(MUSIC_CACHE);
-    if (!dir) {
+    if (got != size || cache->magic != FS_CACHE_MAGIC ||
+        cache->count < 0 || cache->pool_size > size) {
+        ESP_LOGW(TAG_SDMMC, "索引校验失败 (magic=%08x count=%d)",
+                 (unsigned)cache->magic, cache->count);
         heap_caps_free(cache);
         return NULL;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
-        const char *name = entry->d_name;
-        const char *ext = strrchr(name, '.');
-        if (!ext || strcmp(ext, ".txt") != 0) continue;
-        if (strcmp(name, "space.dat") == 0) continue;
-
-        if (strncmp(name, "sdcard_", 7) == 0) {
-            char group[FS_GROUP_MAX];
-            buf_copy(group, FS_GROUP_MAX, name);
-            char *dot = strrchr(group, '.');
-            if (dot) *dot = '\0';   /* 去掉 .txt 后缀, 得到 "sdcard_sub" */
-
-            buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, group + 7);   /* 子目录名 (去前缀) */
-            buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");  /* 分组=根 */
-            cache->entries[cache->count].is_dir = true;
-            cache->count++;
-        }
-    }
-    closedir(dir);
-
-    /* 第三遍: 登记文件条目 */
-    dir = opendir(MUSIC_CACHE);
-    if (!dir) {
+    size_t expect = sizeof(fs_cache_t) + (size_t)cache->count * sizeof(fs_entry_t)
+                    + cache->pool_size;
+    if (expect != size) {
+        ESP_LOGW(TAG_SDMMC, "索引大小不符 (expect=%zu size=%zu)", expect, size);
         heap_caps_free(cache);
         return NULL;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
-        const char *name = entry->d_name;
-        const char *ext = strrchr(name, '.');
-        if (!ext || strcmp(ext, ".txt") != 0) continue;
-        if (strcmp(name, "space.dat") == 0) continue;
-
-        if (strcmp(name, "sdcard.txt") == 0) {   /* 根目录文件 */
-            char path[512];
-            snprintf(path, sizeof(path), "%s/sdcard.txt", MUSIC_CACHE);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                char line[FS_NAME_MAX];
-                while (fgets(line, sizeof(line), f)) {
-                    size_t len = strlen(line);
-                    while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
-                        line[--len] = '\0';
-                    if (len > 0) {
-                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);   /* 文件名 */
-                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard"); /* 根分组 */
-                        cache->entries[cache->count].is_dir = false;
-                        cache->count++;
-                    }
-                }
-                fclose(f);
-            }
+    /* 池内偏移 → 绝对指针 (单遍修正) */
+    char *pool = (char *)(cache->entries + cache->count);
+    for (int i = 0; i < cache->count; i++) {
+        fs_entry_t *e = &cache->entries[i];
+        uintptr_t noff = (uintptr_t)e->name;
+        uintptr_t goff = (uintptr_t)e->group;
+        if (noff >= cache->pool_size || goff >= cache->pool_size) {
+            ESP_LOGW(TAG_SDMMC, "索引偏移越界 (i=%d)", i);
+            heap_caps_free(cache);
+            return NULL;
         }
-
-        if (strncmp(name, "sdcard_", 7) == 0) {   /* 子目录文件 */
-            char group[FS_GROUP_MAX];
-            buf_copy(group, FS_GROUP_MAX, name);
-            char *dot = strrchr(group, '.');
-            if (dot) *dot = '\0';   /* "sdcard_sub" */
-
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s", MUSIC_CACHE, name);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                char line[FS_NAME_MAX];
-                while (fgets(line, sizeof(line), f)) {
-                    size_t len = strlen(line);
-                    while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
-                        line[--len] = '\0';
-                    if (len > 0) {
-                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);   /* 文件名 */
-                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, group); /* 子目录分组 */
-                        cache->entries[cache->count].is_dir = false;
-                        cache->count++;
-                    }
-                }
-                fclose(f);
-            }
-        }
+        e->name  = pool + noff;
+        e->group = pool + goff;
     }
-    closedir(dir);
 
-    ESP_LOGI(TAG_SDMMC, "PSRAM 缓存已加载: %d 条目, %zu 字节",
-             cache->count, alloc_size);
+    ESP_LOGI(TAG_SDMMC, "PSRAM 缓存已加载: %d 条目, %zu 字节 (池 %zu)",
+             cache->count, size, cache->pool_size);
     return cache;
 }
 
@@ -345,7 +246,7 @@ void sdmmc_disk_init(void)
     sd_scan_files();           /* 诊断: 根目录文件数/容量 */
     music_scan_init();         /* 扫描/加载音乐缓存 */
 
-    s_fs_cache_owned = sd_load_cache_to_psram();   /* 把缓存读入 PSRAM 建索引 */
+    s_fs_cache_owned = sd_load_cache_bin();   /* 从 index.bin 读入 PSRAM 建索引 */
     g_fs_cache = s_fs_cache_owned;
     atomic_store_bool(&g_sd_ready, true);
 
@@ -421,6 +322,7 @@ static void sample_sensors(void)
 
 static void sys_monitor_task(void *arg)
 {
+    vTaskDelay(pdMS_TO_TICKS(150));
     gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);   /* SD 检测脚设为输入 */
 
     bool last = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 初始检测电平 (true=未插入) */

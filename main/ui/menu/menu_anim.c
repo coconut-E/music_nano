@@ -343,6 +343,7 @@ static void fs_anim_timer_cb(lv_timer_t *tmr)
     if (h > pth) h = pth;
 
     int64_t c0 = esp_timer_get_time();
+    bool first = s_anim_first_frame;
     if (s_anim_first_frame) {
         fs_anim_compose(w, h);   /* 首帧: 全量填充 (buf 未初始化) */
         s_anim_first_frame = false;
@@ -363,6 +364,12 @@ static void fs_anim_timer_cb(lv_timer_t *tmr)
     int64_t r0 = esp_timer_get_time();
     lv_refr_now(lv_disp_get_default());
     s_anim_refr_us = esp_timer_get_time() - r0;
+
+    if (first) {
+        printf("[ANIM] first frame at %.2fms compose=%.2fms refr=%.2fms\n",
+               elaps / 1000.0f, s_anim_compose_us / 1000.0f,
+               s_anim_refr_us / 1000.0f);
+    }
 
     if (v >= dur_ms) {
         lv_timer_del(tmr);
@@ -442,6 +449,7 @@ void panel_anim_open(const panel_anim_cfg_t *cfg)
 {
     s_anim_cfg = cfg;
     int pw = cfg->w, ph = cfg->h;
+    int64_t t0 = esp_timer_get_time();
 
     /* 1. 主界面截图 (面板未创建, 画面干净) */
     s_anim_buf_main = fs_anim_alloc(172 * 320 * 2);
@@ -453,9 +461,11 @@ void panel_anim_open(const panel_anim_cfg_t *cfg)
         cfg->open_real();
         return;
     }
+    int64_t t1 = esp_timer_get_time();
 
     /* 2. 创建真实面板 */
     cfg->open_real();
+    int64_t t2 = esp_timer_get_time();
 
     /* 3. 面板截图 */
     s_anim_buf_fs = fs_anim_alloc(pw * ph * 2);
@@ -476,6 +486,10 @@ void panel_anim_open(const panel_anim_cfg_t *cfg)
         lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    int64_t t3 = esp_timer_get_time();
+    printf("[ANIM] open main_snap=%.2fms open_real=%.2fms panel_snap=%.2fms total=%.2fms\n",
+           (t1 - t0) / 1000.0f, (t2 - t1) / 1000.0f, (t3 - t2) / 1000.0f,
+           (t3 - t0) / 1000.0f);
 
     /* 4. 隐藏主界面 + 面板 (一个 flag, 隐藏即不绘制子树) */
     lv_obj_add_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);

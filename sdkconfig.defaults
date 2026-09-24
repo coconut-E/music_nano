@@ -32,5 +32,11 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # 启动加速: 仅深睡唤醒跳过镜像校验(其他启动全量校验), 关闭PSRAM开机内存自检
 CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
 CONFIG_SPIRAM_MEMTEST=n
+# 启动加速: 控制台波特率 115200→921600 (bootloader 与 app 共用同一位宽).
+# 注意: ESP_CONSOLE_UART_BAUDRATE 的 Kconfig prompt 带 "if ESP_CONSOLE_UART_CUSTOM",
+# 控制台选 "Default: UART0" 时该符号不可见, kconfiglib 会忽略用户值回落到 115200;
+# 因此必须同时选 Custom UART(UART0+默认引脚, 行为与 Default 等价)才能让波特率生效.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 # 省 IRAM: psram 缓存规避不再把 libc 时间函数放进 IRAM (5.5.5 后 .iram0.text 超限 512B)
 CONFIG_SPIRAM_CACHE_LIBTIME_IN_IRAM=n

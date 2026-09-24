@@ -12,7 +12,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
 #include "drv_display.h"
-#include "touch_task.h"
 #include "settings.h"
 #include "bt_a2dp.h"
 #include "ui_core.h"
@@ -157,7 +156,6 @@ static void screen_off(void)
     screen_fade(0, NULL);                    /* 背光淡出到 0 */
     set_lvgl_slow_refresh(true);             /* 刷新降频省电 */
     ui_touch_set_enabled(false);             /* LVGL 触摸开关置 off */
-    touch_task_set_enabled(false);           /* 触摸任务也停读 I2C */
     ESP_LOGI(TAG, "息屏 (BT 保持连接)");
 }
 
@@ -167,7 +165,6 @@ static void screen_on(void)
     s_state = PWR_ACTIVE;
     set_lvgl_slow_refresh(false);            /* 恢复刷新频率 */
     ui_touch_set_enabled(true);              /* 恢复触摸 */
-    touch_task_set_enabled(true);
     screen_fade(brightness_get(), NULL);     /* 淡入到保存的亮度 */
     ESP_LOGI(TAG, "亮屏");
 }

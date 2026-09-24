@@ -21,6 +21,7 @@ static QueueHandle_t s_audio_rsp_queue = NULL;  /* 音频应答队列: 音频任
  * 所有任务由子系统 init 内部创建, 本函数最后把自己挂起, 只保留各任务在跑. */
 void app_main(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(80));//I (53) HOOK: RST released (GPIO25)->I (92) main_task: Calling app_main() only 39ms but The LCD needs at least 120ms stabilization time after power-on or reset, hence an 80ms delay here.
     /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝.
      * 这样把 LCD 上电时序 "藏" 进后续初始化时间里, 减少用户可见的启动延迟. */
     power_mgr_early_init();
@@ -71,7 +72,7 @@ void app_main(void)
     /* 封面解码任务: 解析内嵌专辑封面 (经 app 命令队列通知) */
     cover_init(s_app_cmd_queue);
 
-    printf("\n系统就绪 | 输入命令: stats | ram | psram | vbat | temp | scan | conn <名称> | disconn | play | stop | pause | info\n");
+    printf("系统就绪\n");
 
-    vTaskSuspend(NULL);   /* 入口任务不再需要, 永久挂起释放 CPU */
+    vTaskSuspend(NULL);   /* 入口任务不再需要, 永久挂起*/
 }

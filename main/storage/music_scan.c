@@ -1,5 +1,6 @@
 ﻿#include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -8,28 +9,16 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
+#include "esp_heap_caps.h"
 #include "ff.h"
-
-/* 安全拷贝: 把 src 复制到 dst (目标大小 dst_sz), 保证结尾 '\0'.
- * 相比 strncpy 语义清晰: 始终以 dst_sz 为上限, 不填充多余 '\0'. */
-static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
-{
-    if (dst_sz == 0) {
-        return;
-    }
-    size_t n = strnlen(src, dst_sz - 1);   /* 计算不超过缓冲大小的源串长度 */
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
+#include "sys_monitor.h"
 
 #define TAG_MUSIC_SCAN   "MUSIC_SCAN"
 
 #define MOUNT_POINT       "/sdcard"              /* SD 卡挂载点 */
-#define MUSIC_CACHE_DIR   "/sdcard/.music_cache" /* 缓存目录 (隐藏在 SD 卡上) */
-#define SPACE_FILE        "/sdcard/.music_cache/space.dat"  /* 空间快照文件 */
+#define MUSIC_CACHE_DIR   FS_CACHE_DIR           /* 缓存目录 (隐藏在 SD 卡上) */
+#define SPACE_FILE        FS_CACHE_DIR "/space.dat"  /* 空间快照文件 */
 #define SPACE_THRESHOLD_KB 10                   /* 空间变化超过此值才重扫 */
-#define PATH_BUF_SIZE     384                    /* 每条路径缓冲 */
-#define SUBDIR_INIT       8                      /* 子目录列表初始容量 */
 
 volatile bool g_music_scan_force = false;   /* 强制全量扫描标志 (外部置位, 用完自动清除) */
 
@@ -40,58 +29,159 @@ static const char *MUSIC_EXTENSIONS[] = {
 };
 static const int NUM_EXTENSIONS = sizeof(MUSIC_EXTENSIONS) / sizeof(MUSIC_EXTENSIONS[0]);
 
-/* 定长路径列表: 所有路径等宽存储 (PATH_BUF_SIZE), 便于按索引寻址 */
+/* 目录工作栈 (变长 LIFO, 全部在 PSRAM):
+ * 记录格式 = [路径字节]['\0'][uint16 长度], 只存实际路径长度.
+ * 用显式栈替代递归, 且弹出即回收, 峰值只跟"待处理前沿"有关. */
 typedef struct {
-    char *buf;       /* 连续缓冲 */
-    int   count;     /* 已用条目数 */
-    int   capacity;  /* 可容纳条目数 */
-} path_list_t;
+    char  *buf;    /* 字节池 (PSRAM) */
+    size_t used;   /* 已用字节 */
+    size_t cap;    /* 容量 */
+} dir_stack_t;
 
-/* 初始化路径列表, 分配 SUBDIR_INIT 条空间 */
-static bool path_list_init(path_list_t *list)
+/* 初始化工作栈 (PSRAM) */
+static bool dir_stack_init(dir_stack_t *s)
 {
-    list->capacity = SUBDIR_INIT;
-    list->count = 0;
-    list->buf = malloc(PATH_BUF_SIZE * list->capacity);
-    if (!list->buf) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "内存分配失败");
+    s->cap  = 4096;
+    s->used = 0;
+    s->buf  = heap_caps_malloc(s->cap, MALLOC_CAP_SPIRAM);
+    if (!s->buf) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "工作栈分配失败");
         return false;
     }
     return true;
 }
 
-/* 追加一条路径; 容量不足时倍增扩容 */
-static bool path_list_add(path_list_t *list, const char *path)
+/* 确保剩余空间可容纳 extra 字节, 不足则倍增扩容 */
+static bool dir_stack_reserve(dir_stack_t *s, size_t extra)
 {
-    if (list->count >= list->capacity) {
-        int new_cap = list->capacity * 2;
-        char *new_buf = realloc(list->buf, PATH_BUF_SIZE * new_cap);
-        if (!new_buf) {
-            ESP_LOGE(TAG_MUSIC_SCAN, "内存扩展失败");
-            return false;
-        }
-        list->buf = new_buf;
-        list->capacity = new_cap;
+    if (s->used + extra <= s->cap) {
+        return true;
     }
-    char *dst = list->buf + (size_t)list->count * PATH_BUF_SIZE;   /* 定位第 count 条 */
-    buf_copy(dst, PATH_BUF_SIZE, path);
-    list->count++;
+    size_t ncap = s->cap ? s->cap : 4096;
+    while (ncap < s->used + extra) {
+        ncap *= 2;
+    }
+    char *nb = heap_caps_realloc(s->buf, ncap, MALLOC_CAP_SPIRAM);
+    if (!nb) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "工作栈扩容失败");
+        return false;
+    }
+    s->buf = nb;
+    s->cap = ncap;
     return true;
 }
 
-/* 按索引取路径 */
-static inline const char *path_list_get(path_list_t *list, int idx)
+/* 入栈一条路径: 写入 [路径][\0][uint16 长度] */
+static bool dir_stack_push(dir_stack_t *s, const char *path)
 {
-    return list->buf + (size_t)idx * PATH_BUF_SIZE;
+    size_t len = strlen(path);
+    if (len > 0xFFFF) {
+        ESP_LOGW(TAG_MUSIC_SCAN, "路径过长, 跳过: %s", path);
+        return false;
+    }
+    size_t need = len + 1 + sizeof(uint16_t);
+    if (!dir_stack_reserve(s, need)) {
+        return false;
+    }
+    char *p = s->buf + s->used;
+    memcpy(p, path, len);
+    p[len] = '\0';
+    uint16_t l16 = (uint16_t)len;
+    memcpy(p + len + 1, &l16, sizeof(l16));
+    s->used += need;
+    return true;
 }
 
-/* 释放列表内存 */
-static void path_list_free(path_list_t *list)
+/* 入栈 "a/b" (直接拼接, 省去中间缓冲) */
+static bool dir_stack_push2(dir_stack_t *s, const char *a, const char *b)
 {
-    free(list->buf);
-    list->buf = NULL;
-    list->count = 0;
-    list->capacity = 0;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    size_t len = la + 1 + lb;
+    if (len > 0xFFFF) {
+        ESP_LOGW(TAG_MUSIC_SCAN, "路径过长, 跳过: %s/%s", a, b);
+        return false;
+    }
+    size_t need = len + 1 + sizeof(uint16_t);
+    if (!dir_stack_reserve(s, need)) {
+        return false;
+    }
+    char *p = s->buf + s->used;
+    memcpy(p, a, la);
+    p[la] = '/';
+    memcpy(p + la + 1, b, lb);
+    p[len] = '\0';
+    uint16_t l16 = (uint16_t)len;
+    memcpy(p + len + 1, &l16, sizeof(l16));
+    s->used += need;
+    return true;
+}
+
+/* 取栈顶路径 (从记录末尾读长度定位); 空栈返回 NULL */
+static const char *dir_stack_top(const dir_stack_t *s)
+{
+    if (s->used == 0) {
+        return NULL;
+    }
+    uint16_t len;
+    memcpy(&len, s->buf + s->used - sizeof(uint16_t), sizeof(len));
+    return s->buf + s->used - (len + 1 + sizeof(uint16_t));
+}
+
+/* 弹出栈顶 (LIFO, 立即回收该记录空间) */
+static void dir_stack_pop(dir_stack_t *s)
+{
+    if (s->used == 0) {
+        return;
+    }
+    uint16_t len;
+    memcpy(&len, s->buf + s->used - sizeof(uint16_t), sizeof(len));
+    s->used -= (len + 1 + sizeof(uint16_t));
+}
+
+/* 释放工作栈 */
+static void dir_stack_free(dir_stack_t *s)
+{
+    heap_caps_free(s->buf);
+    s->buf  = NULL;
+    s->used = 0;
+    s->cap  = 0;
+}
+
+/* 索引构建器: 扫描期间在 PSRAM 累积条目与字符串池.
+ * 条目里的 name/group 字段暂存"池内偏移"(与最终磁盘格式一致), 扫描结束一次性写出. */
+typedef struct {
+    fs_entry_t *dirs;   int n_dirs;   int cap_dirs;    /* 目录条目 */
+    fs_entry_t *files;  int n_files;  int cap_files;   /* 文件条目 */
+    char       *pool;   size_t pool_used; size_t pool_cap;  /* 字符串池 */
+} cache_builder_t;
+
+/* 扫描用 scratch 缓冲 (PSRAM): 按需增长, 只保留一份复用 */
+typedef struct {
+    dir_stack_t stack;          /* 目录工作栈 */
+    char *cur_dir;    size_t cur_dir_cap;    /* 当前目录稳定副本 */
+    char *full;       size_t full_cap;       /* 文件完整路径 */
+    cache_builder_t b;          /* 索引构建器 */
+} scan_ctx_t;
+
+/* 确保 *p 至少有 need 字节容量 (PSRAM), 返回缓冲指针 (失败返回 NULL) */
+static char *ensure_cap(char **p, size_t *cap, size_t need)
+{
+    if (*cap >= need) {
+        return *p;
+    }
+    size_t ncap = *cap ? *cap : 256;
+    while (ncap < need) {
+        ncap *= 2;
+    }
+    char *np = heap_caps_realloc(*p, ncap, MALLOC_CAP_SPIRAM);
+    if (!np) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "缓冲扩容失败");
+        return NULL;
+    }
+    *p = np;
+    *cap = ncap;
+    return np;
 }
 
 /* 判断文件名是否为音乐文件 (按扩展名匹配) */
@@ -108,10 +198,10 @@ static bool is_music_file(const char *name)
     return false;
 }
 
-/* 把目录路径映射到缓存文件路径:
- * /sdcard          → .music_cache/sdcard.txt
- * /sdcard/sub/dir  → .music_cache/sdcard_sub%d_dir.txt   ('/' 换成 '%', 保持单一文件名) */
-static void build_cache_path(const char *dir_path, char *out, size_t out_size)
+/* 把目录绝对路径映射为分组串 (用真实 '/'):
+ * /sdcard        → "sdcard"
+ * /sdcard/a/b    → "sdcard/a/b" */
+static void build_group(const char *dir_path, char *out, size_t out_size)
 {
     const char *rel = dir_path;
     size_t mount_len = strlen(MOUNT_POINT);
@@ -122,15 +212,56 @@ static void build_cache_path(const char *dir_path, char *out, size_t out_size)
     }
 
     if (*rel == '\0') {
-        snprintf(out, out_size, "%s/sdcard.txt", MUSIC_CACHE_DIR);
+        snprintf(out, out_size, "sdcard");
     } else {
-        snprintf(out, out_size, "%s/sdcard_%s.txt", MUSIC_CACHE_DIR, rel);
-        char *p = out + strlen(MUSIC_CACHE_DIR) + 1;   /* 定位到 "sdcard_" 之后 */
-        while (*p) {
-            if (*p == '/') *p = '%';   /* 目录分隔符替换为 %, 避免路径层级 */
-            p++;
-        }
+        snprintf(out, out_size, "sdcard/%s", rel);
     }
+}
+
+/* 追加字符串到池, 返回池内偏移 (失败返回 UINT32_MAX) */
+static uint32_t pool_append(cache_builder_t *b, const char *s)
+{
+    size_t len = strlen(s) + 1;
+    if (b->pool_used + len > b->pool_cap) {
+        size_t ncap = b->pool_cap ? b->pool_cap : 4096;
+        while (ncap < b->pool_used + len) {
+            ncap *= 2;
+        }
+        char *np = heap_caps_realloc(b->pool, ncap, MALLOC_CAP_SPIRAM);
+        if (!np) {
+            ESP_LOGE(TAG_MUSIC_SCAN, "字符串池扩容失败");
+            return UINT32_MAX;
+        }
+        b->pool = np;
+        b->pool_cap = ncap;
+    }
+    uint32_t off = (uint32_t)b->pool_used;
+    memcpy(b->pool + off, s, len);
+    b->pool_used += len;
+    return off;
+}
+
+/* 追加一个条目 (偏移暂存在指针字段, 与磁盘格式一致) */
+static bool entry_append(fs_entry_t **arr, int *n, int *cap,
+                         uint32_t name_off, uint32_t group_off, bool is_dir)
+{
+    if (*n == *cap) {
+        int ncap = *cap ? *cap * 2 : 64;
+        fs_entry_t *na = heap_caps_realloc(*arr, (size_t)ncap * sizeof(fs_entry_t),
+                                           MALLOC_CAP_SPIRAM);
+        if (!na) {
+            ESP_LOGE(TAG_MUSIC_SCAN, "条目数组扩容失败");
+            return false;
+        }
+        *arr = na;
+        *cap = ncap;
+    }
+    fs_entry_t *e = &(*arr)[*n];
+    e->name  = (const char *)(uintptr_t)name_off;
+    e->group = (const char *)(uintptr_t)group_off;
+    e->is_dir = is_dir;
+    (*n)++;
+    return true;
 }
 
 /* 获取 SD 卡已用空间 (KB), 用 FatFs 直接查 */
@@ -150,7 +281,7 @@ static uint64_t get_used_space_kb(void)
     return total_kb - free_kb;
 }
 
-#define SPACE_MAGIC  "MUSICACHE1\n"   /* 空间缓存文件魔数 */
+#define SPACE_MAGIC  "MUSICACHE2\n"   /* 空间缓存文件魔数 (只存已用空间 KB) */
 
 /* 读取上次扫描时记录的已用空间 (KB); 无/损坏返回 0 */
 static uint64_t read_space_cache(void)
@@ -184,7 +315,7 @@ static void write_space_cache(uint64_t used_kb)
     close(fd);
 }
 
-/* 删除 .music_cache 下所有 sdcard*.txt 旧缓存文件 */
+/* 清理 .music_cache 下旧缓存: legacy sdcard*.txt 与旧索引文件 */
 static void clean_cache_files(void)
 {
     DIR *dir = opendir(MUSIC_CACHE_DIR);
@@ -193,18 +324,81 @@ static void clean_cache_files(void)
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type != DT_REG) continue;                /* 只处理普通文件 */
-        if (strncmp(entry->d_name, "sdcard", 6) == 0) {      /* 前缀 sdcard 的都是本模块缓存 */
+        const char *n = entry->d_name;
+        if (strncmp(n, "sdcard", 6) == 0 ||                  /* legacy 缓存文件 */
+            strcmp(n, "index.bin") == 0 ||
+            strcmp(n, "index.bin.tmp") == 0) {
             char full_path[512];
-            snprintf(full_path, sizeof(full_path), "%s/%s",
-                     MUSIC_CACHE_DIR, entry->d_name);
+            snprintf(full_path, sizeof(full_path), "%s/%s", MUSIC_CACHE_DIR, n);
             remove(full_path);
         }
     }
     closedir(dir);
 }
 
-/* 递归扫描目录 dir_path: 音乐文件名写入对应缓存文件, 子目录收集后递归 */
-static void scan_dir(const char *dir_path)
+/* 把构建器序列化为 index.bin (先写临时文件再改名, 防掉电半写) */
+static void write_index_bin(cache_builder_t *b)
+{
+    char tmp_path[128];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/index.bin.tmp", FS_CACHE_DIR);
+
+    int fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0);
+    if (fd < 0) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "无法创建索引文件: %s", tmp_path);
+        return;
+    }
+
+    fs_cache_t hdr;
+    hdr.magic     = FS_CACHE_MAGIC;
+    hdr.count     = b->n_dirs + b->n_files;
+    hdr.pool_size = b->pool_used;
+
+    bool ok = true;
+    if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) ok = false;
+    if (ok && b->n_dirs) {
+        size_t sz = (size_t)b->n_dirs * sizeof(fs_entry_t);
+        if (write(fd, b->dirs, sz) != (ssize_t)sz) ok = false;
+    }
+    if (ok && b->n_files) {
+        size_t sz = (size_t)b->n_files * sizeof(fs_entry_t);
+        if (write(fd, b->files, sz) != (ssize_t)sz) ok = false;
+    }
+    if (ok && b->pool_used) {
+        if (write(fd, b->pool, b->pool_used) != (ssize_t)b->pool_used) ok = false;
+    }
+    close(fd);
+
+    if (!ok) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "索引写入失败");
+        remove(tmp_path);
+        return;
+    }
+
+    remove(FS_CACHE_BIN_PATH);   /* FatFs rename 目标已存在时可能失败 */
+    if (rename(tmp_path, FS_CACHE_BIN_PATH) != 0) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "索引改名失败: %s", strerror(errno));
+        remove(tmp_path);
+        return;
+    }
+    ESP_LOGI(TAG_MUSIC_SCAN, "索引已写入: %d 条目, 池 %zu 字节",
+             hdr.count, hdr.pool_size);
+}
+
+/* 校验 index.bin 是否存在且头部有效 */
+static bool index_bin_valid(void)
+{
+    int fd = open(FS_CACHE_BIN_PATH, O_RDONLY);
+    if (fd < 0) return false;
+
+    fs_cache_t hdr;
+    ssize_t n = read(fd, &hdr, sizeof(hdr));
+    close(fd);
+    return n == (ssize_t)sizeof(hdr) && hdr.magic == FS_CACHE_MAGIC && hdr.count >= 0;
+}
+
+/* 扫描单个目录: 目录/文件条目写入构建器, 子目录入栈 (不递归).
+ * dir_path 为调用方提供的稳定副本, 避免入栈 realloc 使其失效. */
+static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
 {
     DIR *dir = opendir(dir_path);
     if (!dir) {
@@ -212,22 +406,12 @@ static void scan_dir(const char *dir_path)
         return;
     }
 
-    char cache_path[512];
-    build_cache_path(dir_path, cache_path, sizeof(cache_path));   /* 本目录的缓存文件路径 */
+    size_t dl = strlen(dir_path);
 
-    int fd = open(cache_path, O_RDWR | O_CREAT | O_TRUNC, 0);     /* 覆盖写 */
-    if (fd < 0) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "无法创建缓存文件: %s", cache_path);
-        closedir(dir);
-        return;
-    }
-
-    path_list_t subdirs;
-    if (!path_list_init(&subdirs)) {
-        close(fd);
-        closedir(dir);
-        return;
-    }
+    /* 本目录分组串 (其下子目录与文件共用同一份) */
+    char group[FS_GROUP_MAX];
+    build_group(dir_path, group, sizeof(group));
+    uint32_t group_off = pool_append(&ctx->b, group);
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -247,35 +431,34 @@ static void scan_dir(const char *dir_path)
         if (entry->d_type == DT_REG) {
             if (is_music_file(entry->d_name)) {
                 /* 跳过 0 字节的损坏/残留文件 */
-                char full[512];
-                snprintf(full, sizeof(full), "%s/%s", dir_path, entry->d_name);
+                char *full = ensure_cap(&ctx->full, &ctx->full_cap,
+                                        dl + 1 + strlen(entry->d_name) + 1);
+                if (!full) {
+                    continue;
+                }
+                snprintf(full, ctx->full_cap, "%s/%s", dir_path, entry->d_name);
                 struct stat st;
                 if (stat(full, &st) == 0 && st.st_size > 0) {
-                    write(fd, entry->d_name, strlen(entry->d_name));   /* 一行一个文件名 */
-                    write(fd, "\n", 1);
+                    uint32_t noff = pool_append(&ctx->b, entry->d_name);
+                    entry_append(&ctx->b.files, &ctx->b.n_files, &ctx->b.cap_files,
+                                 noff, group_off, false);
                 } else {
                     ESP_LOGW(TAG_MUSIC_SCAN, "跳过空文件: %s", full);
                 }
             }
         } else if (entry->d_type == DT_DIR) {
-            char sub_path[384];
-            snprintf(sub_path, sizeof(sub_path), "%s/%s",
-                     dir_path, entry->d_name);
-            path_list_add(&subdirs, sub_path);   /* 记录子目录待递归 */
+            /* 目录条目: name=本级目录名, group=父目录 (本目录) */
+            uint32_t noff = pool_append(&ctx->b, entry->d_name);
+            entry_append(&ctx->b.dirs, &ctx->b.n_dirs, &ctx->b.cap_dirs,
+                         noff, group_off, true);
+            dir_stack_push2(&ctx->stack, dir_path, entry->d_name);   /* 子目录入栈待处理 */
         }
     }
 
-    close(fd);
     closedir(dir);
-
-    for (int i = 0; i < subdirs.count; i++) {   /* 递归处理所有子目录 */
-        scan_dir(path_list_get(&subdirs, i));
-    }
-
-    path_list_free(&subdirs);
 }
 
-/* 执行一次全量扫描: 清缓存 → 扫目录 → 记录空间快照 */
+/* 执行一次全量扫描: 清缓存 → 迭代扫目录 → 写索引 + 空间快照 */
 static void music_scan_run(void)
 {
     ESP_LOGI(TAG_MUSIC_SCAN, "开始扫描音乐文件...");
@@ -283,7 +466,42 @@ static void music_scan_run(void)
     int64_t t0 = esp_timer_get_time();
 
     clean_cache_files();
-    scan_dir(MOUNT_POINT);
+
+    scan_ctx_t ctx = {0};
+    if (!dir_stack_init(&ctx.stack)) {
+        return;
+    }
+    /* 字符串池 (PSRAM) */
+    ctx.b.pool_cap = 4096;
+    ctx.b.pool = heap_caps_malloc(ctx.b.pool_cap, MALLOC_CAP_SPIRAM);
+    if (!ctx.b.pool) {
+        ESP_LOGE(TAG_MUSIC_SCAN, "字符串池分配失败");
+        dir_stack_free(&ctx.stack);
+        return;
+    }
+
+    dir_stack_push(&ctx.stack, MOUNT_POINT);
+
+    while (ctx.stack.used > 0) {
+        const char *top = dir_stack_top(&ctx.stack);   /* 栈顶路径 */
+        size_t tl = strlen(top);
+        char *cur = ensure_cap(&ctx.cur_dir, &ctx.cur_dir_cap, tl + 1);
+        if (!cur) {
+            break;
+        }
+        memcpy(cur, top, tl + 1);   /* 先拷出稳定副本 (入栈会 realloc 栈池) */
+        dir_stack_pop(&ctx.stack);  /* 再弹出 */
+        scan_one_dir(&ctx, cur);
+    }
+
+    write_index_bin(&ctx.b);
+
+    dir_stack_free(&ctx.stack);
+    heap_caps_free(ctx.cur_dir);
+    heap_caps_free(ctx.full);
+    heap_caps_free(ctx.b.dirs);
+    heap_caps_free(ctx.b.files);
+    heap_caps_free(ctx.b.pool);
 
     uint64_t used_kb = get_used_space_kb();
     write_space_cache(used_kb);
@@ -323,12 +541,15 @@ void music_scan_init(void)
         return;
     }
 
-    /* 比较当前与记录的空间, 超过阈值才重扫 */
+    /* 比较当前与记录的空间, 超过阈值才重扫; 索引文件缺失/损坏也重扫 */
     int64_t diff = (int64_t)current_used - (int64_t)cached_used;
     if (diff < 0) diff = -diff;
     if (diff > SPACE_THRESHOLD_KB) {
         ESP_LOGI(TAG_MUSIC_SCAN, "空间变化 %lld KB 超过阈值 %d KB，重新扫描",
                  diff, SPACE_THRESHOLD_KB);
+        music_scan_run();
+    } else if (!index_bin_valid()) {
+        ESP_LOGI(TAG_MUSIC_SCAN, "索引缺失或无效，重新扫描");
         music_scan_run();
     } else {
         ESP_LOGI(TAG_MUSIC_SCAN, "空间变化在阈值内，使用缓存");

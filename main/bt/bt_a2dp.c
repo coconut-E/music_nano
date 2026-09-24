@@ -26,7 +26,7 @@
 #define APP_RC_CT_TL_RN_VOLUME_CHANGE  (1)   /* AVRCP 事务标签: 音量变化通知 */
 
 #define CACHE_MAX 16        /* 扫描缓存设备数上限 */
-#define VOL_STEP  8   /* 耳机音量±键一次步进 */
+#define VOL_STEP  4   /* 耳机音量±键一次步进 */
 
 /* 连接后音量设置时序: 等 AVRC 连上 → 再等 VOL_SET_DELAY_MS → 发音量 → 放行 A2DP 流启动.
  * 静音机制已删除: 窗口期流不启动, 到点先发音量再启流.

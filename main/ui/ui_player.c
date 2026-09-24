@@ -7,7 +7,6 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_random.h"
 #include "lvgl.h"
 #include "drv_display.h"
 #include "audio_task.h"
@@ -19,6 +18,7 @@
 #include "ui_player.h"
 #include "menu.h"
 #include "power_mgr.h"
+#include "played_bits.h"
 
 extern const lv_font_t lv_font_global_16;
 
@@ -26,9 +26,10 @@ extern const lv_font_t lv_font_global_16;
 #define PIN_VOL_UP     36
 #define PIN_VOL_DOWN   38
 #define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
-#define VOLUME_STEP    8
+#define VOLUME_STEP    4                  /* 单步步进 */
 #define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
-#define VOL_KEY_MIN_MS 100                /* 两次触发最小间隔 */
+#define VOL_LONGPRESS_MS 600              /* 长按判定: 超过此值进入重复模式 */
+#define VOL_REPEAT_MS  150                /* 长按重复步进间隔 */
 
 /* 音量弹窗: (140,45) 30x110, 变化时滑入显示, 2秒无变化滑出隐藏 */
 #define VOL_POP_X       140
@@ -253,6 +254,9 @@ static void player_play_index(int idx)
     s_was_playing = true;
     printf("[LVGL] PLAY: %s\n", path);
 
+    /* 随机模式: 切到该曲即标记为已播放 (即使只切不播) */
+    if (s_play_mode == PLAY_MODE_RANDOM) played_bits_mark(s_pl_group, idx);
+
     player_update_label();
 
     /* 记录播放路径到 flash, 供下次插入 SD 卡时恢复 */
@@ -275,8 +279,9 @@ void player_advance(void)
         if (s_pl_count <= 1) {
             next = 0;
         } else {
-            next = (int)(esp_random() % (uint32_t)s_pl_count);
-            if (next == s_pl_index) next = (next + 1) % s_pl_count;
+            /* 只在未播放 (位为 0) 的曲目中随机 */
+            int p = played_bits_pick(s_pl_group);
+            next = (p >= 0) ? p : 0;
         }
         break;
     case PLAY_MODE_SEQUENTIAL:
@@ -303,6 +308,9 @@ void player_advance(void)
     s_auto_advancing = true;
     s_was_playing = true;
     printf("[LVGL] AUTO PLAY: %s (mode %d)\n", path, s_play_mode);
+
+    /* 随机模式: 切到该曲即标记为已播放 */
+    if (s_play_mode == PLAY_MODE_RANDOM) played_bits_mark(s_pl_group, next);
 
     player_update_label();
 
@@ -608,10 +616,12 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
         cover_clear();
 
         fs_browser_on_sd_remove();   /* 通知浏览器清空 */
+        played_bits_on_sd_remove();  /* 释放随机去重位图 */
     }
 
     if (sd_ready && !last_ready) {   /* 刚插入 */
         fs_browser_on_sd_ready();
+        played_bits_on_sd_ready();   /* 全量校验并载入各文件夹随机去重位图 */
 
         /* 恢复上次歌曲: 读 flash 路径 → 在缓存中查找 → 找到则加载到解码器但不自动播放,
          * 紧随其后发一个暂停; 主UI跳到该曲, 浏览器同步高亮 */
@@ -751,27 +761,50 @@ static void volume_monitor_cb(lv_timer_t *timer)
     volume_save_to_nvs();
 }
 
+/* 音量键状态: 上升沿单步 + 长按(>600ms)后每 150ms 重复 */
+typedef struct {
+    bool    prev;       /* 上次采样电平 (上升沿检测) */
+    bool    repeating;  /* 是否已进入长按重复模式 */
+    int64_t next_us;    /* 下次允许步进的时刻 (us) */
+} vol_key_state_t;
+static vol_key_state_t s_vol_up, s_vol_down;
+
+/* 单个音量键状态机: pin=引脚, dir=+1/-1, st=该键状态 */
+static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
+{
+    bool    level = (gpio_get_level(pin) == 1);   /* 高=按下 (外部下拉) */
+    int64_t now   = esp_timer_get_time();
+
+    if (level) {
+        if (!st->prev) {                          /* 上升沿: 立即 ±4 一次 */
+            volume_inc(dir * VOLUME_STEP);
+            st->repeating = false;
+            st->next_us   = now + VOL_LONGPRESS_MS * 1000LL;
+        } else if (!st->repeating) {
+            if (now >= st->next_us) {             /* 按住超过 600ms: 进入长按, 补一步 */
+                st->repeating = true;
+                volume_inc(dir * VOLUME_STEP);
+                st->next_us = now + VOL_REPEAT_MS * 1000LL;
+            }
+        } else if (now >= st->next_us) {          /* 长按中: 每 150ms ±4 */
+            volume_inc(dir * VOLUME_STEP);
+            st->next_us = now + VOL_REPEAT_MS * 1000LL;
+        }
+    } else {
+        st->repeating = false;                    /* 松开: 退出重复 */
+    }
+    st->prev = level;
+}
+
 /* 按键轮询 (10ms): 息屏/唤醒键(上升沿) + 音量键增减.
  * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询.
- * 息屏键采样放最前(不受音量 100ms 节流影响), 由 power_mgr 做上升沿检测 */
+ * 息屏键采样放最前(不受音量节流影响), 由 power_mgr 做上升沿检测 */
 static void btn_key_poll_cb(lv_timer_t *timer)
 {
     power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 1);
 
-    static int64_t s_vol_key_last_us = 0;
-
-    int64_t now = esp_timer_get_time();
-    if ((now - s_vol_key_last_us) < VOL_KEY_MIN_MS * 1000LL) {
-        return;   /* 防连发 */
-    }
-
-    if (gpio_get_level(PIN_VOL_UP) == 1) {
-        volume_inc(VOLUME_STEP);
-        s_vol_key_last_us = now;
-    } else if (gpio_get_level(PIN_VOL_DOWN) == 1) {
-        volume_inc(-VOLUME_STEP);
-        s_vol_key_last_us = now;
-    }
+    vol_key_poll_one(PIN_VOL_UP,   +1, &s_vol_up);
+    vol_key_poll_one(PIN_VOL_DOWN, -1, &s_vol_down);
 }
 
 /* 初始化音量按键: 配输入引脚 + 创建 10ms 轮询定时器 */
@@ -1154,10 +1187,10 @@ void ui_player_init(void)
     lv_obj_center(s_play_icon);
     lv_obj_add_event_cb(play_btn, play_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 上一首 */
+    /* 上一首 (透明点击区放大到 60x64, 符号位置不变) */
     lv_obj_t *prev_btn = lv_btn_create(scr);
-    lv_obj_set_pos(prev_btn, 25, 220);
-    lv_obj_set_size(prev_btn, 36, 36);
+    lv_obj_set_pos(prev_btn, 0, 206);
+    lv_obj_set_size(prev_btn, 60, 64);
     lv_obj_set_style_radius(prev_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(prev_btn, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(prev_btn, LV_OPA_0, 0);
@@ -1168,13 +1201,13 @@ void ui_player_init(void)
     lv_label_set_text(prev_icon, LV_SYMBOL_PREV);
     lv_obj_set_style_text_color(prev_icon, COLOR_MUTED, 0);
     lv_obj_set_style_text_font(prev_icon, &lv_font_montserrat_20, 0);
-    lv_obj_center(prev_icon);
+    lv_obj_align(prev_icon, LV_ALIGN_CENTER, 13, 0);   /* 偏移补偿放大: 符号仍在 (43,238) */
     lv_obj_add_event_cb(prev_btn, player_prev_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 下一首 */
+    /* 下一首 (透明点击区放大到 60x64, 符号位置不变) */
     lv_obj_t *next_btn = lv_btn_create(scr);
-    lv_obj_set_pos(next_btn, 111, 220);
-    lv_obj_set_size(next_btn, 36, 36);
+    lv_obj_set_pos(next_btn, 112, 206);
+    lv_obj_set_size(next_btn, 60, 64);
     lv_obj_set_style_radius(next_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(next_btn, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(next_btn, LV_OPA_0, 0);
@@ -1185,7 +1218,7 @@ void ui_player_init(void)
     lv_label_set_text(next_icon, LV_SYMBOL_NEXT);
     lv_obj_set_style_text_color(next_icon, COLOR_MUTED, 0);
     lv_obj_set_style_text_font(next_icon, &lv_font_montserrat_20, 0);
-    lv_obj_center(next_icon);
+    lv_obj_align(next_icon, LV_ALIGN_CENTER, -13, 0);  /* 偏移补偿放大: 符号仍在 (129,238) */
     lv_obj_add_event_cb(next_btn, player_next_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* ── 底部面板 ── */

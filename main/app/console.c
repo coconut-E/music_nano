@@ -185,7 +185,7 @@ static void console_task(void *arg)
     printf("\n=== 音乐播放器 ===\n");
     printf("系统命令: stats | ram | psram | vbat | temp | bt [任务名]\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
-    printf("命令> ");
+    //printf("命令> ");
 
     char line[LINE_BUF_SIZE];   /* 当前行缓冲 */
     int  line_pos = 0;          /* 已输入字符数 */
@@ -240,7 +240,7 @@ static void console_task(void *arg)
                         } else {
                             printf("未知命令: %s\n", line);
                             line_pos = 0;
-                            printf("命令> ");
+                            //printf("命令> ");
                             continue;
                         }
 
@@ -248,7 +248,7 @@ static void console_task(void *arg)
                     }
 
                     line_pos = 0;
-                    printf("命令> ");
+                    //printf("命令> ");
                 }
             } else if (ch == '\b' || ch == 127) {   /* 退格: 回退一个字符 */
                 if (line_pos > 0) line_pos--;

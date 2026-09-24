@@ -41,6 +41,9 @@ void ui_loop_task(void *arg)
     lcd_init_finish();
     lv_timer_handler();   /* 跑一帧, 让界面先画出来 */
     power_mgr_init();     /* 电源管理 (背光渐入/按键) */
+    /* 文件浏览器不再一次性阻塞创建 (~100ms), 改为下面的主循环里按时间预算分片完成:
+     * 背光渐入动画约 300ms, 每轮只占用一小片, 卡顿被渐入掩盖 */
+    //ESP_LOGI("LVGL", "预建文件浏览器 (分步)"); 
 
     app_cmd_t   app_cmd;      /* 应用命令 */
     bt_evt_t    bt_evt;       /* 蓝牙事件 */
@@ -48,8 +51,14 @@ void ui_loop_task(void *arg)
     audio_cmd_t audio_cmd;    /* 音频命令 (转发用) */
     bt_cmd_t    bt_cmd;       /* 蓝牙命令 (转发用) */
 
+    ESP_LOGI("LVGL", "LVGL is OK"); 
+
     while (1) {
         lv_timer_handler();   /* LVGL 渲染/动画/定时器 */
+
+        /* 分步预建文件浏览器: 每轮最多 10ms, 建完返回 false 后调用几乎零开销.
+         * 放在渲染之后, 让背光渐入动画每轮都先推进一帧, 再吃掉这一小片 CPU */
+        fs_browser_precreate_step(10000);
 
         QueueHandle_t active = xQueueSelectFromSet(s_queue_set, 0);   /* 查是否有事件 */
 

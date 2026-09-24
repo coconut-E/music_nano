@@ -22,7 +22,8 @@ static void lcd_backlight_init(void);
 #define PIN_LCD_MOSI  23   /* SPI 数据输出 (写命令/像素) */
 #define PIN_LCD_CS     5   /* 片选 (低有效) */
 #define PIN_LCD_DC    32   /* 数据/命令选择: 高=数据, 低=命令 */
-#define PIN_LCD_RST   33   /* 复位 (低有效, 实际由 bootloader 操作) */
+#define PIN_LCD_RST_HW 25  /* 复位实际引脚 (低有效, 脉冲由 bootloader 钩子完成并保持高) */
+#define PIN_LCD_RST   -1   /* 传给面板驱动: -1 = 驱动不接管该脚, 否则会把 GPIO25 配成输出低而把面板按在复位 */
 #define PIN_LCD_BL     4   /* 背光 PWM 引脚 */
 
 #define LCD_H_RES  172   /* 屏水平分辨率 (像素) */
@@ -107,12 +108,23 @@ esp_lcd_panel_handle_t lcd_init_early(spi_host_device_t host)
         .init_cmds_size = sizeof(init_cmds) / sizeof(jd9853_lcd_init_cmd_t),
     };
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_LCD_RST,          /* 复位引脚 (bootloader 已释放, 仅声明) */
+        .reset_gpio_num = PIN_LCD_RST,          /* -1: 驱动不接管复位脚 (脉冲由 bootloader 在 GPIO25 完成) */
         .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,   /* 像素通道顺序 RGB */
         .bits_per_pixel = 16,                   /* RGB565 */
         .vendor_config  = &vendor_cfg,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_jd9853(s_panel_io, &panel_config, &s_panel));
+
+    /* 兜底: 复位脉冲已由 bootloader 钩子在 GPIO25 上完成并保持高;
+     * 这里再显式把该脚配为输出高, 防止复位线悬空/被意外拉低导致面板不亮. */
+    {
+        gpio_config_t rst_cfg = {
+            .mode         = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = 1ULL << PIN_LCD_RST_HW,
+        };
+        gpio_config(&rst_cfg);
+        gpio_set_level(PIN_LCD_RST_HW, 1);
+    }
 
     /* SLPOUT: 退出休眠 (bootloader 复位后默认进休眠). 记录发送时刻. */
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(s_panel_io, 0x11, NULL, 0));

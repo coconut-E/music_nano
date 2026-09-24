@@ -8,21 +8,31 @@
 extern "C" {
 #endif
 
-#define FS_NAME_MAX   128    /* 文件名最大长度 */
-#define FS_GROUP_MAX  256    /* 分组(目录)名最大长度 */
+#define FS_NAME_MAX   128    /* 文件名最大长度 (UI 侧栈缓冲用) */
+#define FS_GROUP_MAX  256    /* 分组(目录)名最大长度 (UI 侧栈缓冲用) */
 
-/* 文件系统缓存条目: 一个文件或目录 */
+/* 音乐索引缓存: .music_cache/index.bin = 序列化的 fs_cache_t,
+ * entries 里的 name/group 字段在磁盘上存"字符串池内偏移", 加载后修正为指针.
+ * 分组串使用真实 '/' (如 "sdcard/子目录"), 不再有文件名不能含 '/' 的限制. */
+#define FS_CACHE_DIR       "/sdcard/.music_cache"           /* 缓存目录 */
+#define FS_CACHE_BIN_PATH  "/sdcard/.music_cache/index.bin" /* 索引文件 */
+#define FS_CACHE_MAGIC     0x4D555349                       /* 索引魔数 "MUSI" */
+
+/* 文件系统缓存条目: 只读视图, name/group 指向条目数组之后的共享字符串池.
+ * 同一目录下所有文件的 group 共享同一段, 不再每条各存一份. */
 typedef struct {
-    char name[FS_NAME_MAX];    /* 文件名 */
-    char group[FS_GROUP_MAX];  /* 所属分组 (如 "sdcard" 或子目录名) */
-    bool is_dir;               /* 是否目录 */
+    const char *name;    /* 文件名 (指向字符串池) */
+    const char *group;   /* 所属分组 (指向字符串池, 如 "sdcard" 或 "sdcard_xxx") */
+    bool        is_dir;  /* 是否目录 */
 } fs_entry_t;
 
-/* 文件系统缓存 (存 PSRAM, 变长数组): magic=有效性标记, count=条目数 */
+/* 文件系统缓存 (存 PSRAM): entries 数组之后紧跟字符串池.
+ * magic=有效性标记, count=条目数, pool_size=字符串池字节数 */
 typedef struct {
     uint32_t   magic;
     int        count;
-    fs_entry_t entries[];   /* 变长数组 */
+    size_t     pool_size;
+    fs_entry_t entries[];   /* 变长数组, 其后为字符串池 */
 } fs_cache_t;
 
 void sdmmc_disk_init(void);             /* 初始化 SD 卡 (探测+挂载) */

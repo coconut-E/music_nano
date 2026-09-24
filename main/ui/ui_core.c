@@ -7,7 +7,7 @@
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "drv_display.h"
-#include "touch_task.h"
+#include "touch.h"
 #include "ui_core.h"
 #include "settings.h"
 
@@ -50,37 +50,17 @@ void ui_touch_set_enabled(bool enable)
     s_touch_enabled = enable;
 }
 
-/* 触摸任务心跳监视: 停摆超时只打日志告警 (不碰 I2C, 不重装驱动) */
-static void touch_heartbeat_watch(void)
-{
-    static uint32_t s_last_hb = 0;      /* 上次心跳值 */
-    static int64_t  s_last_hb_us = 0;   /* 上次心跳时刻 */
-    static bool     s_warned = false;   /* 是否已告警 (只告警一次) */
-
-    uint32_t hb = touch_get_heartbeat();
-    if (hb != s_last_hb) {              /* 心跳在走, 一切正常 */
-        s_last_hb = hb;
-        s_last_hb_us = esp_timer_get_time();
-        s_warned = false;
-    } else if (!s_warned && esp_timer_get_time() - s_last_hb_us > 2000000LL) {
-        s_warned = true;                /* 心跳 2 秒未变 → 任务停摆 */
-        printf("[ui] 触摸任务心跳停止, 触摸失效\n");
-    }
-}
-
-/* LVGL 触摸读取回调: 从触摸任务读原子坐标并映射到屏幕 */
+/* LVGL 触摸读取回调 (50Hz): 有中断/按下时才读 I2C, 映射到屏幕坐标 */
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
-    touch_heartbeat_watch();
-
-    if (!s_touch_enabled) {   /* 息屏: 强制抬起 */
+    if (!s_touch_enabled) {   /* 息屏: 清状态并强制抬起 */
+        touch_reset();
         data->state = LV_INDEV_STATE_REL;
         return;
     }
 
-    if (touch_is_present()) {
-        int32_t tx, ty;
-        touch_get_point(&tx, &ty);
+    int32_t tx, ty;
+    if (touch_poll(&tx, &ty)) {
         /* 原始 Y 映射到屏幕坐标 */
         ty = (int32_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
                        / (TOUCH_Y_MAX - TOUCH_Y_MIN));
@@ -125,7 +105,7 @@ void ui_core_display_init(void)
     lv_init();   /* LVGL 库初始化 */
 
     s_panel = lcd_get_panel();
-    touch_task_start();   /* 启动触摸采样任务 */
+    touch_init();   /* 触摸: I2C 总线 + GPIO INT 中断 */
 
     /* 双缓冲显示驱动 */
     lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, s_draw_buf2, LVGL_BUF_SIZE);
