@@ -33,9 +33,14 @@ void power_mgr_critical_shutdown(void);
  * v=新的当前亮度 (0~255) */
 void power_mgr_set_cur_bri(uint8_t v);
 
-/* 按键电平上报 (上升沿触发, 调用方每 10ms 上报一次当前电平).
+/* 按键电平上报 (调用方每 10ms 上报一次当前电平).
+ * 短按(松手时): 息屏/亮屏或深睡 (原逻辑); 长按(>=800ms): 切换音乐/小说模式.
  * level=按键当前电平 (true=按下) */
 void power_mgr_poll_key(bool level);
+
+/* 模式切换黑屏过渡: 淡出到纯黑 → 调用 work() (清理+构建) → 淡入.
+ * work 在 LVGL 任务上下文执行; 过渡期间屏蔽按键与蓝牙轮询 */
+void power_mgr_mode_transition(void (*work)(void));
 
 #ifdef __cplusplus
 }

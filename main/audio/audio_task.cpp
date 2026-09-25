@@ -46,6 +46,8 @@ static QueueHandle_t        s_cmd_queue   = NULL;   /* 命令队列 (UI→音频
 static QueueHandle_t        s_rsp_queue   = NULL;   /* 应答队列 (音频→UI) */
 static StreamBufferHandle_t s_pcm_stream  = NULL;   /* 蓝牙 PCM 流缓冲 */
 static audio_state_t        s_state       = STATE_IDLE;   /* 当前状态 */
+static TaskHandle_t         s_task        = NULL;   /* 音频任务句柄 (模式切换挂起用) */
+static volatile bool        s_task_ready  = false;  /* 音频任务已进入主循环 (可安全挂起) */
 
 static audio_decoder_t     *s_decoder     = NULL;   /* 当前解码器对象 */
 static char                 s_current_path[256];    /* 当前播放文件路径 */
@@ -260,6 +262,8 @@ static void start_play(const char *path)
 static void audio_task(void *arg)
 {
     audio_cmd_t cmd;
+
+    s_task_ready = true;   /* 已进入主循环: 允许模式切换时安全挂起 */
 
     while (1) {
         atomic_store_bool(&g_pcm_active, (s_state == STATE_PLAYING));   /* 更新全局播放标志 */
@@ -526,5 +530,23 @@ extern "C" void audio_task_init(const audio_task_params_t *params)
         printf("[音频] FATAL: PCM/OUT 缓冲分配失败\n");
         return;
     }
-    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 1, &s_task, 0);
+}
+
+/* 挂起音频任务 (模式切到小说): 等任务就绪后再挂, 避免挂到未初始化的任务上.
+ * 调用前须确保解码器已关闭 (g_audio_decoder_open==false), 否则会把持 SD 的任务挂死. */
+extern "C" void audio_task_pause(void)
+{
+    if (!s_task) return;
+    for (int i = 0; i < 200 && !s_task_ready; i++) {   /* 最多等 ~1s */
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (!s_task_ready) return;
+    vTaskSuspend(s_task);
+}
+
+/* 恢复音频任务 (模式切回音乐) */
+extern "C" void audio_task_resume(void)
+{
+    if (s_task) vTaskResume(s_task);
 }

@@ -26,25 +26,6 @@
 
 extern const lv_font_t lv_font_global_16;
 
-/* 音量按键: 高电平(外部下拉)即增减, 由 LVGL 独立定时器(10ms)轮询 */
-#define PIN_VOL_UP     36
-#define PIN_VOL_DOWN   38
-#define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
-#define VOLUME_STEP    4                  /* 单步步进 */
-#define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
-#define VOL_LONGPRESS_MS 600              /* 长按判定: 超过此值进入重复模式 */
-#define VOL_REPEAT_MS  150                /* 长按重复步进间隔 */
-
-/* 音量弹窗: (140,45) 30x110, 变化时滑入显示, 2秒无变化滑出隐藏 */
-#define VOL_POP_X       140
-#define VOL_POP_Y       45
-#define VOL_POP_W       30
-#define VOL_POP_H       110
-#define VOL_POP_BAR_H   90
-#define VOL_POP_HIDE_MS 2000
-#define VOL_POP_ANIM_IN_MS   150   /* 滑入: overshoot 过冲(q弹), 从屏外冲到目标位再回落 */
-#define VOL_POP_ANIM_OUT_MS  100   /* 滑出: 线性匀速 */
-
 /* 用户命令发送: 与上一条间隔 < 500ms 则丢弃 */
 #define CMD_MIN_INTERVAL_US  500000
 
@@ -91,6 +72,10 @@ static bool      s_bri_expanded = false; /* 抽屉是否已展开 */
 static void bri_open(void);
 static void bri_close(void);
 
+/* 音乐组根容器 (全屏, 模式切换时整体显示/销毁) */
+static lv_obj_t *s_music_root = NULL;
+static lv_timer_t *s_info_timer = NULL;   /* 歌曲信息刷新定时器 (随组销毁) */
+
 /* 播放器主界面控件句柄 */
 static lv_obj_t *s_status_label;    /* 顶部状态标签 (如 "3/20") */
 static lv_obj_t *s_bat_fill;        /* 电池图标填充条 */
@@ -109,19 +94,6 @@ static lv_obj_t *s_album_icon;      /* 无封面时的默认图标 */
 static lv_img_dsc_t s_cover_dsc;    /* 封面图像描述符 */
 static lv_obj_t *s_play_icon;       /* 播放/暂停图标 */
 static lv_obj_t *s_mode_icon;       /* 播放模式图标 */
-
-/* 音量弹窗 */
-static lv_obj_t *s_vol_cont = NULL;   /* 音量弹窗容器 */
-static lv_obj_t *s_vol_bar  = NULL;   /* 音量条 */
-static lv_obj_t *s_vol_val  = NULL;   /* 音量数值标签 */
-static int32_t   s_vol_last_ui = -1;  /* 上次显示的音量 */
-static int       s_vol_idle = 0;      /* 无变化计时 (ms) */
-typedef enum {
-    VOL_STATE_HIDDEN,   /* 隐藏 */
-    VOL_STATE_SHOWING,  /* 滑入中 */
-    VOL_STATE_HIDING,   /* 滑出中 */
-} vol_state_t;
-static vol_state_t s_vol_state = VOL_STATE_HIDDEN;
 
 /* 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) */
 static char s_pl_group[FS_GROUP_MAX];   /* 当前播放列表所在分组 */
@@ -793,232 +765,44 @@ static void song_info_monitor_cb(lv_timer_t *timer)
     }
 }
 
-/* SD 卡状态监视 (轮询定时器): 插卡加载/拔卡清理 */
-static void fs_sd_monitor_cb(lv_timer_t *timer)
+/* SD 拔出: 停音频/复位播放列表/清封面 (由 ui_shell 的 SD 监视调用) */
+void player_on_sd_remove(void)
 {
-    static bool last_ready = false;
-    bool sd_ready = atomic_load_bool(&g_sd_ready);
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_STOP;
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
+    s_was_playing = false;
 
-    /* 回收 sys_monitor 移交的旧缓存 (本任务即所有 g_fs_cache 读者, 此刻必无并发遍历) */
-    fs_cache_reap();
+    /* 播放器状态复位: 残留的 SONG_FINISHED→advance 全部 no-op */
+    s_pl_count = 0;
+    s_pl_index = 0;
+    if (s_status_label) player_update_label();   /* 仅音乐 UI 已构建时更新 */
 
-    if (!sd_ready && last_ready) {   /* 刚拔出 */
-        /* 音频立即停止, 干净 close_decoder */
-        audio_cmd_t cmd;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.type = AUDIO_CMD_STOP;
-        xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
-        s_was_playing = false;
-
-        /* 播放器状态复位: 残留的 SONG_FINISHED→advance 全部 no-op */
-        s_pl_count = 0;
-        s_pl_index = 0;
-        player_update_label();
-
-        /* 置空缓存指针: 浏览器/播放器立即 inert, 重开文件管理器也是空列表.
-         * deinit 里还会再置一次并 free(s_fs_cache_owned), 重复置空无害. */
-        g_fs_cache = NULL;
-
-        cover_clear();
-
-        fs_browser_on_sd_remove();   /* 通知浏览器清空 */
-        played_bits_on_sd_remove();  /* 释放随机去重位图 */
-    }
-
-    if (sd_ready && !last_ready) {   /* 刚插入 */
-        fs_browser_on_sd_ready();
-        played_bits_on_sd_ready();   /* 全量校验并载入各文件夹随机去重位图 */
-
-        /* 恢复上次歌曲: 读 flash 路径 → 在缓存中查找 → 找到则加载到解码器但不自动播放,
-         * 紧随其后发一个暂停; 主UI跳到该曲, 浏览器同步高亮 */
-        char saved[512];
-        if (last_song_load(saved, sizeof(saved))) {
-            char group[FS_GROUP_MAX];
-            char name[FS_NAME_MAX];
-            if (fs_cache_find_by_path(saved, group, sizeof(group), name, sizeof(name))) {
-                player_play_file(group, name);
-
-                /* 只加载不播放: 直接发暂停 (不用 audio_user_send, 避免被节流丢弃) */
-                audio_cmd_t cmd;
-                memset(&cmd, 0, sizeof(cmd));
-                cmd.type = AUDIO_CMD_PAUSE;
-                xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
-
-                fs_browser_jump();   /* 浏览器定位到该曲 */
-            }
-        }
-    }
-
-    last_ready = sd_ready;
+    cover_clear();
 }
 
-/* 创建音量弹窗(初始隐藏), 值变化时由定时器显示更新 */
-static void vol_popup_create(void)
+/* SD 插入: 音乐模式下恢复上次歌曲 (只加载不自动播放) */
+void player_on_sd_ready(void)
 {
-    s_vol_cont = lv_obj_create(lv_scr_act());
-    lv_obj_set_pos(s_vol_cont, TFT_HOR_RES, VOL_POP_Y);  /* 初始在屏外, 由动画滑入 */
-    lv_obj_set_size(s_vol_cont, VOL_POP_W, VOL_POP_H);
-    lv_obj_set_style_bg_color(s_vol_cont, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_vol_cont, 6, 0);
-    lv_obj_set_style_border_width(s_vol_cont, 0, 0);
-    lv_obj_set_style_shadow_width(s_vol_cont, 0, 0);
-    lv_obj_set_style_pad_all(s_vol_cont, 0, 0);
-    lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(s_vol_cont, LV_SCROLLBAR_MODE_OFF);
-    /* 兜底: 滚动条透明(内容溢出时也不可见), 邪修方案 */
-    lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_TRANSP, LV_PART_SCROLLBAR | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_TRANSP, LV_PART_SCROLLBAR | LV_STATE_SCROLLED);
+    if (!s_music_root) return;   /* 非音乐模式: 不恢复 */
 
-    s_vol_bar = lv_bar_create(s_vol_cont);
-    lv_obj_set_pos(s_vol_bar, (VOL_POP_W - 22) / 2, 4);
-    lv_obj_set_size(s_vol_bar, 22, VOL_POP_BAR_H);
-    lv_obj_set_style_bg_color(s_vol_bar, lv_color_hex(0xE0E0E0), 0);
-    lv_obj_set_style_bg_opa(s_vol_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_vol_bar, 3, 0);
-    lv_obj_set_style_radius(s_vol_bar, 3, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_vol_bar, COLOR_ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(s_vol_bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_bar_set_range(s_vol_bar, 0, VOLUME_MAX);
-    lv_bar_set_value(s_vol_bar, volume_get(), LV_ANIM_OFF);
+    /* 读 flash 路径 → 在缓存中查找 → 加载到解码器但不自动播放, 紧随发暂停 */
+    char saved[512];
+    if (!last_song_load(saved, sizeof(saved))) return;
 
-    s_vol_val = lv_label_create(s_vol_cont);
-    lv_obj_set_pos(s_vol_val, 0, 4 + VOL_POP_BAR_H + 2);
-    lv_obj_set_size(s_vol_val, VOL_POP_W, 18);
-    lv_obj_set_style_text_align(s_vol_val, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_vol_val, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_vol_val, lv_color_black(), 0);
-    lv_label_set_text_fmt(s_vol_val, "%" PRId32, volume_get());
+    char group[FS_GROUP_MAX];
+    char name[FS_NAME_MAX];
+    if (!fs_cache_find_by_path(saved, group, sizeof(group), name, sizeof(name))) return;
 
-    lv_obj_add_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
-    s_vol_last_ui = volume_get();
-}
+    player_play_file(group, name);
 
-/* 动画 exec 适配器: 直接把动画值设为弹窗 x 坐标 */
-static void vol_popup_set_x(void *obj, int32_t x)
-{
-    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)x);
-}
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_PAUSE;
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
-/* 音量弹窗: 从屏外滑入, overshoot 过冲(q弹)后回落目标位 */
-static void vol_popup_slide_in(void)
-{
-    lv_anim_del(s_vol_cont, NULL);   /* 中断可能进行中的滑出 */
-    lv_obj_move_foreground(s_vol_cont);
-    lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_vol_cont);
-    lv_anim_set_exec_cb(&a, vol_popup_set_x);
-    lv_anim_set_values(&a, TFT_HOR_RES, VOL_POP_X);
-    lv_anim_set_time(&a, VOL_POP_ANIM_IN_MS);
-    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
-    lv_anim_start(&a);
-    s_vol_state = VOL_STATE_SHOWING;
-}
-
-/* 滑出动画完成: 移出屏外后隐藏 */
-static void vol_popup_slide_out_end(lv_anim_t *a)
-{
-    lv_obj_add_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
-    s_vol_state = VOL_STATE_HIDDEN;
-}
-
-/* 音量弹窗: 匀速滑出屏外 */
-static void vol_popup_slide_out(void)
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_vol_cont);
-    lv_anim_set_exec_cb(&a, vol_popup_set_x);
-    lv_anim_set_values(&a, lv_obj_get_x(s_vol_cont), TFT_HOR_RES);
-    lv_anim_set_time(&a, VOL_POP_ANIM_OUT_MS);
-    lv_anim_set_path_cb(&a, lv_anim_path_linear);
-    lv_anim_set_ready_cb(&a, vol_popup_slide_out_end);
-    lv_anim_start(&a);
-    s_vol_state = VOL_STATE_HIDING;
-}
-
-/* 音量轮询 (5Hz): 值变化则滑入弹窗并写入 NVS, 2秒无变化滑出隐藏 */
-static void volume_monitor_cb(lv_timer_t *timer)
-{
-    int32_t v = volume_get();
-
-    if (v != s_vol_last_ui) {
-        s_vol_last_ui = v;
-        s_vol_idle = 0;
-        lv_bar_set_value(s_vol_bar, v, LV_ANIM_OFF);
-        lv_label_set_text_fmt(s_vol_val, "%" PRId32, v);
-        if (s_vol_state == VOL_STATE_HIDDEN) {
-            vol_popup_slide_in();
-        } else if (s_vol_state == VOL_STATE_HIDING) {
-            vol_popup_slide_in();   /* 滑出中被调回, 重新滑入 */
-        }
-        /* SHOWING 状态: 已显示, 仅刷新数值 */
-    } else {
-        s_vol_idle++;
-        if (s_vol_state == VOL_STATE_SHOWING &&
-            s_vol_idle >= VOL_POP_HIDE_MS / 200) {
-            vol_popup_slide_out();
-        }
-    }
-
-    volume_save_to_nvs();
-}
-
-/* 音量键状态: 上升沿单步 + 长按(>600ms)后每 150ms 重复 */
-typedef struct {
-    bool    prev;       /* 上次采样电平 (上升沿检测) */
-    bool    repeating;  /* 是否已进入长按重复模式 */
-    int64_t next_us;    /* 下次允许步进的时刻 (us) */
-} vol_key_state_t;
-static vol_key_state_t s_vol_up, s_vol_down;   /* 音量+ / 音量- 各自的状态机 */
-
-/* 单个音量键状态机: pin=引脚, dir=+1/-1, st=该键状态 */
-static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
-{
-    bool    level = (gpio_get_level(pin) == 1);   /* 高=按下 (外部下拉) */
-    int64_t now   = esp_timer_get_time();
-
-    if (level) {
-        if (!st->prev) {                          /* 上升沿: 立即 ±4 一次 */
-            volume_inc(dir * VOLUME_STEP);
-            st->repeating = false;
-            st->next_us   = now + VOL_LONGPRESS_MS * 1000LL;
-        } else if (!st->repeating) {
-            if (now >= st->next_us) {             /* 按住超过 600ms: 进入长按, 补一步 */
-                st->repeating = true;
-                volume_inc(dir * VOLUME_STEP);
-                st->next_us = now + VOL_REPEAT_MS * 1000LL;
-            }
-        } else if (now >= st->next_us) {          /* 长按中: 每 150ms ±4 */
-            volume_inc(dir * VOLUME_STEP);
-            st->next_us = now + VOL_REPEAT_MS * 1000LL;
-        }
-    } else {
-        st->repeating = false;                    /* 松开: 退出重复 */
-    }
-    st->prev = level;
-}
-
-/* 按键轮询 (10ms): 息屏/唤醒键(上升沿) + 音量键增减.
- * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询.
- * 息屏键采样放最前(不受音量节流影响), 由 power_mgr 做上升沿检测 */
-static void btn_key_poll_cb(lv_timer_t *timer)
-{
-    power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 1);
-
-    vol_key_poll_one(PIN_VOL_UP,   +1, &s_vol_up);
-    vol_key_poll_one(PIN_VOL_DOWN, -1, &s_vol_down);
-}
-
-/* 初始化音量按键: 配输入引脚 + 创建 10ms 轮询定时器 */
-static void vol_key_init(void)
-{
-    gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
-    gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
-    lv_timer_create(btn_key_poll_cb, VOL_KEY_POLL_MS, NULL);
+    fs_browser_jump();   /* 浏览器定位到该曲 */
 }
 
 /* ── 亮度抽屉 ── */
@@ -1124,7 +908,7 @@ static void bri_btn_click_cb(lv_event_t *e)
 /* 创建亮度抽屉 (常驻, 初始收拢: 容器 x=-BRI_PANEL_W, 只露灰条在屏幕左缘 x=0..5) */
 static void bri_draw_create(void)
 {
-    s_bri_draw = lv_obj_create(lv_scr_act());
+    s_bri_draw = lv_obj_create(s_music_root ? s_music_root : lv_scr_act());
     lv_obj_set_pos(s_bri_draw, -BRI_PANEL_W, 0);
     lv_obj_set_size(s_bri_draw, BRI_DRAW_W, BRI_DRAW_H);
     lv_obj_set_style_bg_opa(s_bri_draw, LV_OPA_TRANSP, 0);
@@ -1205,8 +989,8 @@ static void bri_draw_create(void)
 }
 
 /* ── 主界面构建 ── */
-/* 初始化播放器界面: 恢复设置, 建控件, 建各定时器 (SD/歌曲信息/音量/按键) */
-void ui_player_init(void)
+/* 构建音乐组界面 (仅当未构建时调用): 恢复设置, 建控件, 建信息定时器 */
+static void player_build(void)
 {
     play_mode_t m;
     if (settings_mode_load(&m)) s_play_mode = m;
@@ -1221,6 +1005,20 @@ void ui_player_init(void)
     /* 关闭屏幕自身滚动条: 弹窗滑到屏外会撑大屏幕内容触发, 文件浏览器滚动条在各自 list 内部不受影响 */
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* ── 音乐组根容器 (全屏): 后续所有音乐控件挂其下, 便于整体销毁 ── */
+    s_music_root = lv_obj_create(scr);
+    lv_obj_set_pos(s_music_root, 0, 0);
+    lv_obj_set_size(s_music_root, TFT_HOR_RES, TFT_VER_RES);
+    lv_obj_set_style_bg_color(s_music_root, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(s_music_root, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_music_root, 0, 0);
+    lv_obj_set_style_radius(s_music_root, 0, 0);
+    lv_obj_set_style_pad_all(s_music_root, 0, 0);
+    lv_obj_clear_flag(s_music_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_music_root, LV_SCROLLBAR_MODE_OFF);
+
+    scr = s_music_root;   /* 后续控件全部挂到音乐组根下 */
 
     /* ── TOP BAR ── */
     /* 菜单按钮 */
@@ -1492,11 +1290,58 @@ void ui_player_init(void)
     lv_obj_set_style_text_color(s_bit_val, COLOR_FG, 0);
     lv_label_set_text(s_bit_val, "");
 
-    lv_timer_create(fs_sd_monitor_cb, 50, NULL);
-    lv_timer_create(song_info_monitor_cb, 500, NULL);
-    lv_timer_create(volume_monitor_cb, 200, NULL);
-    vol_key_init();
-
-    vol_popup_create();
+    s_info_timer = lv_timer_create(song_info_monitor_cb, 500, NULL);
     bri_draw_create();
+}
+
+/* 显示音乐组: 未构建则构建, 已构建则恢复显示与信息刷新 */
+void player_show(void)
+{
+    if (!s_music_root) {
+        player_build();
+    } else {
+        lv_obj_clear_flag(s_music_root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_music_root);
+        if (s_info_timer) lv_timer_resume(s_info_timer);
+    }
+}
+
+/* 销毁音乐组: 删控件 + 重置所有静态变量, 避免遗留 */
+void player_destroy(void)
+{
+    if (s_info_timer) { lv_timer_del(s_info_timer); s_info_timer = NULL; }
+
+    /* 亮度抽屉的透明遮罩挂在屏幕上, 需单独删除 */
+    if (s_bri_overlay) { lv_obj_del(s_bri_overlay); s_bri_overlay = NULL; }
+    s_bri_expanded = false;
+    s_bri_draw = s_bri_slider = s_bri_val = NULL;
+
+    /* 文件不存在对话框 (音乐专属) */
+    if (s_dialog) { lv_obj_del(s_dialog); s_dialog = NULL; }
+
+    if (s_music_root) { lv_obj_del(s_music_root); s_music_root = NULL; }
+
+    /* 控件句柄全部置空 */
+    s_status_label = s_bat_fill = s_title_label = s_artist_label = NULL;
+    s_progress_slider = s_time_current = s_time_total = NULL;
+    s_fmt_val = s_sr_val = s_ch_val = s_bit_val = NULL;
+    s_album_art = s_album_img = s_album_icon = NULL;
+    s_play_icon = s_mode_icon = NULL;
+
+    /* 播放运行时状态复位 (切模式已断蓝牙, 保留无意义) */
+    s_pl_count = 0;
+    s_pl_index = 0;
+    s_cur_plays = 1;
+    s_auto_advancing = false;
+    s_was_playing = false;
+}
+
+/* 停止播放 (模式切换用): 只发停止命令, 不销毁 UI */
+void player_stop_playback(void)
+{
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_STOP;
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
+    s_was_playing = false;
 }

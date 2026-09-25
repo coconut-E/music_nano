@@ -70,7 +70,29 @@ static lv_img_dsc_t s_fs_icon_dir;    /* 文件夹图标 */
 static lv_img_dsc_t s_fs_icon_music;  /* 音乐文件图标 */
 static lv_img_dsc_t s_fs_icon_heart;  /* 已喜欢文件图标 (粉色爱心) */
 
-static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 点击播放回调 */
+static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 音乐: 点击播放回调 */
+static void (*s_novel_cb)(const char *group, const char *name) = NULL;  /* 小说: 点击打开回调 */
+
+/* 当前浏览来源: 0=音乐库, 1=小说库 (决定使用的缓存/根分组/点击行为) */
+static int s_fs_src = 0;
+
+/* 当前来源对应的文件缓存 */
+static fs_cache_t *fs_cache_active(void)
+{
+    return (s_fs_src == 1) ? g_novel_cache : g_fs_cache;
+}
+
+/* 当前来源的根分组 (用真实 '/', 与扫描器一致) */
+static const char *fs_root_group(void)
+{
+    return (s_fs_src == 1) ? "sdcard/小说" : "sdcard/音乐";
+}
+
+/* 当前来源的根标题 */
+static const char *fs_root_title(void)
+{
+    return (s_fs_src == 1) ? "Novel Files" : "Music Files";
+}
 
 static void fs_browser_create(void);
 static void fs_browser_open(void);
@@ -105,18 +127,38 @@ static void fs_child_group(const char *parent, const char *name,
     snprintf(out, out_size, "%s/%s", parent, name);
 }
 
-/* group 的显示名 (最后一段); 根或无返回 "Music Files" */
+/* group 的显示名 (最后一段); 根或无返回当前来源标题 */
 static const char *fs_group_display_name(const char *group)
 {
-    if (!group) return "Music Files";
+    if (!group) return fs_root_title();
     const char *last = strrchr(group, '/');
-    return last ? last + 1 : "Music Files";
+    return last ? last + 1 : fs_root_title();
 }
 
 /* 注册点击播放回调: cb=播放函数 */
 void fs_list_set_play_cb(void (*cb)(const char *group, const char *name))
 {
     s_play_cb = cb;
+}
+
+/* 注册小说打开回调: cb=打开函数 */
+void fs_list_set_novel_cb(void (*cb)(const char *group, const char *name))
+{
+    s_novel_cb = cb;
+}
+
+/* 切换浏览来源 (音乐/小说); 使已构建状态失效, 下次打开按新来源重建 */
+void fs_browser_set_source(int src)
+{
+    if (s_fs_src == src) return;
+    s_fs_src = src;
+    s_fs_built_valid = false;
+}
+
+/* 关闭浏览器面板 (模式切换时调用, 不走动画) */
+void fs_browser_close_panel(void)
+{
+    fs_browser_close();
 }
 
 /* 列表项点击: 目录→进入, 文件→播放 */
@@ -128,6 +170,20 @@ static void fs_item_click_cb(lv_event_t *e)
 
     if (entry->is_dir) {
         fs_browser_enter_dir(entry->group, entry->name);   /* 进入子目录 */
+    } else if (s_fs_src == 1) {
+        /* 小说: 关闭面板后打开阅读界面 */
+        if (s_novel_cb && s_fs_group) {
+            char group[FS_GROUP_MAX];
+            size_t gl = strnlen(s_fs_group, sizeof(group) - 1);
+            memcpy(group, s_fs_group, gl);
+            group[gl] = '\0';
+            char name[FS_NAME_MAX];
+            size_t nl = strnlen(entry->name, sizeof(name) - 1);
+            memcpy(name, entry->name, nl);
+            name[nl] = '\0';
+            fs_browser_close();
+            s_novel_cb(group, name);
+        }
     } else if (s_play_cb) {
         /* 播放切换后由 fs_browser_refresh() 统一重绘, 让绿色高亮跟随新播放的歌曲 */
         s_play_cb(s_fs_group, entry->name);
@@ -137,6 +193,7 @@ static void fs_item_click_cb(lv_event_t *e)
 /* 该列表项是否对应主界面当前正在播放的歌曲 */
 static bool fs_entry_is_current(fs_entry_t *entry)
 {
+    if (s_fs_src == 1) return false;   /* 小说库不做当前播放高亮 */
     const char *group = s_cur_group;   /* show_page 开始时的快照, 避免每行 O(N) */
     const char *name  = s_cur_name;
     if (!group || !name || !entry || !s_fs_group) return false;
@@ -180,7 +237,7 @@ static void fs_row_set(lv_obj_t *btn, fs_entry_t *entry)
 
     if (!entry) {   /* 空目录提示: 隐藏图标, 点击无效 */
         lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(label, "无音乐文件");
+        lv_label_set_text(label, (s_fs_src == 1) ? "无小说文件" : "无音乐文件");
         lv_obj_set_user_data(btn, NULL);
         lv_obj_remove_local_style_prop(btn, LV_STYLE_BG_COLOR, 0);
         lv_obj_remove_local_style_prop(btn, LV_STYLE_BG_OPA, 0);
@@ -191,10 +248,13 @@ static void fs_row_set(lv_obj_t *btn, fs_entry_t *entry)
     if (entry->is_dir) {
         lv_img_set_src(icon, &s_fs_icon_dir);
     } else {
-        /* 已喜欢的文件显示粉色爱心, 否则显示 music 图标 */
-        char key[160];
-        song_hash_name_key(entry->name, key, sizeof(key));
-        bool liked = likes_contains(song_hash32(key, strlen(key)));
+        /* 音乐库: 已喜欢的文件显示粉色爱心; 小说库: 统一文件图标 */
+        bool liked = false;
+        if (s_fs_src == 0) {
+            char key[160];
+            song_hash_name_key(entry->name, key, sizeof(key));
+            liked = likes_contains(song_hash32(key, strlen(key)));
+        }
         lv_img_set_src(icon, liked ? &s_fs_icon_heart : &s_fs_icon_music);
     }
     lv_label_set_text(label, entry->name);
@@ -240,9 +300,14 @@ static void fs_browser_show_page(int page)
     s_fs_page = page;
     s_fs_current_btn = NULL;
 
-    /* 缓存当前播放信息快照 (供 fs_entry_is_current 使用, 避免每行 O(N) 查询) */
-    s_cur_group = player_current_group();
-    s_cur_name  = player_current_name();
+    /* 缓存当前播放信息快照 (供 fs_entry_is_current 使用, 避免每行 O(N) 查询); 小说库无高亮 */
+    if (s_fs_src == 1) {
+        s_cur_group = NULL;
+        s_cur_name  = NULL;
+    } else {
+        s_cur_group = player_current_group();
+        s_cur_name  = player_current_name();
+    }
 
     int64_t t0 = esp_timer_get_time();
 
@@ -253,9 +318,10 @@ static void fs_browser_show_page(int page)
     fs_entry_t *page_entries[FS_ITEMS];
     int page_n = 0;
 
-    if (g_fs_cache && s_fs_group) {
-        for (int i = 0; i < g_fs_cache->count; i++) {
-            fs_entry_t *e = &g_fs_cache->entries[i];
+    fs_cache_t *cache = fs_cache_active();
+    if (cache && s_fs_group) {
+        for (int i = 0; i < cache->count; i++) {
+            fs_entry_t *e = &cache->entries[i];
             if (strcmp(e->group, s_fs_group) != 0) continue;
             if (total >= start && total < end) page_entries[page_n++] = e;
             total++;
@@ -371,15 +437,18 @@ static void fs_browser_go_back(void)
     memcpy(parent, s_fs_group, n);
     parent[n] = '\0';
 
+    const char *root = fs_root_group();
     char *last = strrchr(parent, '/');
-    if (last) {
-        *last = '\0';
-        fs_set_group(parent);
+    if (last) *last = '\0';
+
+    /* 截出的父分组必须仍在根之下, 否则钳到根 */
+    if (strncmp(parent, root, strlen(root)) != 0 || strlen(parent) < strlen(root)) {
+        fs_set_group(root);
     } else {
-        fs_set_group("sdcard");   /* 已在根 */
+        fs_set_group(parent);
     }
 
-    s_fs_inside = (strcmp(s_fs_group, "sdcard") != 0);
+    s_fs_inside = (strcmp(s_fs_group, root) != 0);
     lv_label_set_text(s_fs_title, fs_group_display_name(s_fs_group));
     fs_browser_show_page(0);
 }
@@ -463,7 +532,7 @@ bool fs_browser_precreate_step(int budget_us)
             lv_obj_set_style_text_font(s_fs_title, &lv_font_global_16, 0);
             lv_obj_set_style_text_color(s_fs_title, lv_color_black(), 0);
             lv_label_set_long_mode(s_fs_title, LV_LABEL_LONG_DOT);
-            lv_label_set_text(s_fs_title, "Music Files");
+            lv_label_set_text(s_fs_title, fs_root_title());
 
             /* 返回(上一级)按钮 */
             lv_obj_t *back_btn = lv_btn_create(s_fs_cont);
@@ -585,7 +654,7 @@ static void fs_browser_create(void)
 static void fs_browser_rebuild(const char *group, int page)
 {
     fs_set_group(group);
-    s_fs_inside = (strcmp(group, "sdcard") != 0);
+    s_fs_inside = (strcmp(group, fs_root_group()) != 0);
     lv_label_set_text(s_fs_title, fs_group_display_name(group));
     fs_browser_show_page(page);
 
@@ -625,24 +694,32 @@ static void fs_browser_move_highlight(const char *name)
  *  (c) 其余 (换目录/换页/首次) → 重建。 */
 static void fs_browser_update(void)
 {
-    const char *group = player_current_group();
-    const char *name  = player_current_name();
+    const char *group;
+    const char *name = NULL;
     int  page = 0;
 
-    if (group && name && g_fs_cache) {
-        /* 在组内找到当前歌曲序号 → 页码 (含目录项, 与列表顺序一致) */
-        int pos = -1, seen = 0;
-        for (int i = 0; i < g_fs_cache->count; i++) {
-            fs_entry_t *e = &g_fs_cache->entries[i];
-            if (strcmp(e->group, group) != 0) continue;
-            if (strcmp(e->name, name) == 0) { pos = seen; break; }
-            seen++;
+    if (s_fs_src == 1) {
+        /* 小说库: 每次打开都从根目录开始 */
+        group = fs_root_group();
+    } else {
+        group = player_current_group();
+        name  = player_current_name();
+        fs_cache_t *cache = fs_cache_active();
+        if (group && name && cache) {
+            /* 在组内找到当前歌曲序号 → 页码 (含目录项, 与列表顺序一致) */
+            int pos = -1, seen = 0;
+            for (int i = 0; i < cache->count; i++) {
+                fs_entry_t *e = &cache->entries[i];
+                if (strcmp(e->group, group) != 0) continue;
+                if (strcmp(e->name, name) == 0) { pos = seen; break; }
+                seen++;
+            }
+            page = (pos >= 0) ? (pos / FS_ITEMS) : 0;   /* 未找到也停在该组首页 */
+        } else {   /* 无当前歌曲: 根目录 */
+            group = fs_root_group();
+            name  = NULL;
+            page  = 0;
         }
-        page = (pos >= 0) ? (pos / FS_ITEMS) : 0;   /* 未找到也停在该组首页 */
-    } else {   /* 无当前歌曲: 根目录 */
-        group = "sdcard";
-        name  = NULL;
-        page  = 0;
     }
 
     const char *bn = name ? name : "";
@@ -675,12 +752,15 @@ static void fs_browser_open(void)
     fs_browser_update();
     int64_t t2 = esp_timer_get_time();
 
+    /* 置顶: 保证盖在音乐/小说根容器之上 */
+    lv_obj_move_foreground(s_fs_overlay);
     lv_obj_clear_flag(s_fs_overlay, LV_OBJ_FLAG_HIDDEN);
     s_fs_visible = true;
 
+    fs_cache_t *cache = fs_cache_active();
     printf("[FS] open create=%.2fms update=%.2fms cache_count=%d\n",
            (t1 - t0) / 1000.0f, (t2 - t1) / 1000.0f,
-           g_fs_cache ? g_fs_cache->count : 0);
+           cache ? cache->count : 0);
 }
 
 /* 两向同步: 播放歌曲变化时刷新绿色高亮。
@@ -688,8 +768,9 @@ static void fs_browser_open(void)
  * 打开状态: 当前分组是播放歌曲所在目录的祖先 (或相等) 时重绘, 保留滚动位置。 */
 void fs_browser_refresh(void)
 {
+    if (s_fs_src == 1) return;   /* 小说库无当前播放高亮 */
     if (!s_fs_visible) return;   /* 关闭中: 交给打开时的比对 */
-    if (!g_fs_cache || !s_fs_group) return;
+    if (!fs_cache_active() || !s_fs_group) return;
 
     const char *group = player_current_group();
     const char *name  = player_current_name();
@@ -717,6 +798,7 @@ void fs_browser_likes_changed(void)
 /* 导航到当前播放歌曲所在目录并高亮 (SD 恢复时使用) */
 void fs_browser_jump(void)
 {
+    if (s_fs_src == 1) return;   /* 小说库无当前播放定位 */
     if (!s_fs_visible) return;   /* 关闭中: 交给下次打开时的比对 */
     fs_browser_update();
 }
@@ -745,9 +827,9 @@ void fs_browser_on_sd_ready(void)
 {
     s_fs_built_valid = false;   /* 缓存重载, 已构建行内容失效 */
     if (s_fs_visible) {
-        fs_set_group("sdcard");
+        fs_set_group(fs_root_group());
         s_fs_inside = false;
-        lv_label_set_text(s_fs_title, "Music Files");
+        lv_label_set_text(s_fs_title, fs_root_title());
         fs_browser_show_page(0);
     }
 }

@@ -56,6 +56,13 @@ void settings_mode_save(play_mode_t mode);      /* 保存播放模式到 NVS */
 int  settings_loop_count_load(void);            /* 读循环次数, 无记录/越界返回 1 */
 void settings_loop_count_save(int n);           /* 保存循环次数到 NVS (钳制 1~9) */
 
+/* ── 应用模式 (音乐 / 小说): 取值约定与 app_mode.h 的 app_mode_t 一致 ── */
+#define SETTINGS_APP_MODE_MUSIC  0   /* 音乐模式 */
+#define SETTINGS_APP_MODE_NOVEL  1   /* 小说阅读模式 */
+
+int  settings_app_mode_load(void);              /* 读上次模式, 无记录/越界返回 0 (音乐) */
+void settings_app_mode_save(int mode);          /* 保存当前模式到 NVS */
+
 #ifdef __cplusplus
 }
 #endif

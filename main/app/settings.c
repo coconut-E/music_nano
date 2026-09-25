@@ -256,3 +256,33 @@ void settings_loop_count_save(int n)
         nvs_close(h);
     }
 }
+
+/* ──────────────────────────── 应用模式 ──────────────────────────── */
+#define APP_MODE_KEY   "app_mode"
+
+/* 读上次应用模式: 无记录/越界返回 SETTINGS_APP_MODE_MUSIC */
+int settings_app_mode_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return SETTINGS_APP_MODE_MUSIC;
+
+    int32_t m = SETTINGS_APP_MODE_MUSIC;
+    esp_err_t ret = nvs_get_i32(h, APP_MODE_KEY, &m);
+    nvs_close(h);
+
+    if (ret == ESP_OK && (m == SETTINGS_APP_MODE_MUSIC || m == SETTINGS_APP_MODE_NOVEL)) return (int)m;
+    return SETTINGS_APP_MODE_MUSIC;
+}
+
+/* 保存当前应用模式到 NVS */
+void settings_app_mode_save(int mode)
+{
+    if (mode != SETTINGS_APP_MODE_MUSIC && mode != SETTINGS_APP_MODE_NOVEL) mode = SETTINGS_APP_MODE_MUSIC;
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, APP_MODE_KEY, (int32_t)mode);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}

@@ -14,8 +14,9 @@ extern "C" {
 /* 音乐索引缓存: .music_cache/index.bin = 序列化的 fs_cache_t,
  * entries 里的 name/group 字段在磁盘上存"字符串池内偏移", 加载后修正为指针.
  * 分组串使用真实 '/' (如 "sdcard/子目录"), 不再有文件名不能含 '/' 的限制. */
-#define FS_CACHE_DIR       "/sdcard/.music_cache"           /* 缓存目录 */
-#define FS_CACHE_BIN_PATH  "/sdcard/.music_cache/index.bin" /* 索引文件 */
+#define FS_CACHE_DIR       "/sdcard/.music_cache"           /* 缓存目录 (音乐/小说共用) */
+#define FS_CACHE_BIN_PATH  "/sdcard/.music_cache/index.bin" /* 音乐索引文件 */
+#define NOVEL_CACHE_BIN_PATH "/sdcard/.music_cache/novel.bin" /* 小说索引文件 */
 #define FS_CACHE_MAGIC     0x4D555349                       /* 索引魔数 "MUSI" */
 
 /* 文件系统缓存条目: 只读视图, name/group 指向条目数组之后的共享字符串池.
@@ -48,11 +49,13 @@ void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data);   /* 注�
 
 void sys_monitor_init(void);    /* 启动系统监视任务 (电池/温度采样 + SD 管理) */
 
-/* 音乐文件扫描 (storage/music_scan.c): 生成缓存文件列表 */
-void music_scan_init(void);
+/* 媒体文件扫描 (storage/media_scan.c): 生成缓存文件列表 */
+void music_scan_init(void);   /* 扫描 /sdcard/音乐 */
+void novel_scan_init(void);   /* 扫描 /sdcard/小说 */
 
-/* 强制全量扫描标志: 置位后 music_scan_init 忽略空间阈值, 用完自动清除 */
+/* 强制全量扫描标志: 置位后对应 scan_init 忽略空间阈值, 用完自动清除 */
 extern volatile bool g_music_scan_force;
+extern volatile bool g_novel_scan_force;
 
 /* ── 删除文件请求 (UI→sys_monitor 任务) ──
  * UI 调 sd_request_delete_file() 发请求; sys_monitor 任务执行 remove 并把结果写进
@@ -72,7 +75,8 @@ bool sd_request_delete_file(const char *group, const char *name, int idx);
 extern volatile bool   g_sd_ready;    /* SD 卡就绪标志 */
 extern volatile float  g_vbat;        /* 电池电压 (V) */
 extern volatile float  g_cpu_temp;    /* CPU 温度 (C) */
-extern fs_cache_t     *g_fs_cache;    /* 文件缓存 (PSRAM) */
+extern fs_cache_t     *g_fs_cache;    /* 音乐文件缓存 (PSRAM) */
+extern fs_cache_t     *g_novel_cache; /* 小说文件缓存 (PSRAM) */
 
 /* 回收已下线的旧文件缓存 (仅 UI 任务调用, 见实现说明) */
 void fs_cache_reap(void);

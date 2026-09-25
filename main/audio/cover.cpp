@@ -41,6 +41,7 @@ static const char *jpeg_err_str(int err)
 
 static QueueHandle_t     s_app_cmd_queue = NULL;   /* 完成通知队列 (发 APP_CMD_COVER_READY) */
 static TaskHandle_t      s_task = NULL;            /* 解码任务句柄 */
+static volatile bool     s_task_ready = false;     /* 解码任务已进入主循环 (可安全挂起) */
 static StaticTask_t     *s_tcb = NULL;             /* 静态任务 TCB (必须放内部 RAM) */
 static StackType_t      *s_stack = NULL;           /* 静态任务栈 (PSRAM) */
 static SemaphoreHandle_t s_job_sem = NULL;         /* 作业信号量 (计数=待处理作业数) */
@@ -277,6 +278,8 @@ static void cover_decode_job(const uint8_t *data, size_t size)
 /* 封面解码任务: 等作业信号量, 取数据解码后释放 */
 static void cover_task(void *arg)
 {
+    s_task_ready = true;   /* 已进入主循环: 允许模式切换时安全挂起 */
+
     for (;;) {
         if (!xSemaphoreTake(s_job_sem, portMAX_DELAY)) continue;   /* 阻塞等作业 */
 
@@ -346,4 +349,21 @@ bool cover_submit_job(const uint8_t *jpg, size_t size)
 void cover_notify_no_cover(void)
 {
     cover_send_result(false);
+}
+
+/* 挂起封面解码任务 (模式切到小说): 等任务就绪后再挂 */
+extern "C" void cover_task_pause(void)
+{
+    if (!s_task) return;
+    for (int i = 0; i < 200 && !s_task_ready; i++) {   /* 最多等 ~1s */
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (!s_task_ready) return;
+    vTaskSuspend(s_task);
+}
+
+/* 恢复封面解码任务 (模式切回音乐) */
+extern "C" void cover_task_resume(void)
+{
+    if (s_task) vTaskResume(s_task);
 }

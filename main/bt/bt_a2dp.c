@@ -96,6 +96,8 @@ static int32_t s_last_sent_vol = -1; /* 已同步到耳机的音量, -1 表示�
 
 static QueueHandle_t    s_dispatch_queue = NULL;  /* 协议栈事件分发队列 */
 static QueueSetHandle_t s_queue_set      = NULL;  /* 队列集 (命令+分发) */
+static TaskHandle_t     s_task           = NULL;  /* 蓝牙任务句柄 (模式切换挂起用) */
+static volatile bool    s_paused         = false; /* 是否处于挂起态 (小说模式) */
 
 /* 蓝牙地址 → 可读字符串 "xx:xx:xx:xx:xx:xx". 返回 str 或 NULL */
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
@@ -983,7 +985,7 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
     xQueueAddToSet(s_iface.cmd_queue, s_queue_set);
     xQueueAddToSet(s_dispatch_queue, s_queue_set);
 
-    if (xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, &s_task, 0) != pdPASS) {
         return NULL;
     }
 
@@ -993,6 +995,7 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
 /* 查询连接状态 (跨任务调用: 用原子读保证可见性) */
 bt_state_t bt_a2dp_get_state(void)
 {
+    if (s_paused) return BT_STATE_DISCONNECTED;   /* 挂起态视为未连接 */
     if (!atomic_load_bool(&s_bt_ready)) return BT_STATE_DISCONNECTED;   /* 协议栈未就绪视为未连接 */
     if (atomic_load_bool(&s_connected)) return BT_STATE_CONNECTED;
     if (atomic_load_bool(&s_connecting)) return BT_STATE_CONNECTING;
@@ -1002,5 +1005,28 @@ bt_state_t bt_a2dp_get_state(void)
 /* 是否已连接 (A2DP 已连 且 协议栈就绪), 原子读供 UI/电源跨任务判断 */
 bool bt_a2dp_is_connected(void)
 {
+    if (s_paused) return false;
     return atomic_load_bool(&s_connected) && atomic_load_bool(&s_bt_ready);
+}
+
+/* 挂起蓝牙任务 (模式切到小说): 停止扫描/断开连接后挂起, 省 CPU0.
+ * 直接调用协议栈 API (跨任务安全), 不走命令队列, 避免挂起后残留命令在恢复时误执行 */
+void bt_a2dp_pause(void)
+{
+    s_paused = true;
+    if (atomic_load_bool(&s_bt_ready)) {
+        if (s_scanning) esp_bt_gap_cancel_discovery();     /* 停止扫描 (CPU 大户) */
+        if (atomic_load_bool(&s_connected) || atomic_load_bool(&s_connecting)) {
+            esp_a2d_source_disconnect(s_peer_bda);         /* 主动断开 (完成事件留待恢复后处理) */
+        }
+        s_connecting = false;
+    }
+    if (s_task) vTaskSuspend(s_task);
+}
+
+/* 恢复蓝牙任务 (模式切回音乐) */
+void bt_a2dp_resume(void)
+{
+    s_paused = false;
+    if (s_task) vTaskResume(s_task);
 }

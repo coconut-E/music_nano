@@ -16,6 +16,7 @@
 #include "bt_a2dp.h"
 #include "ui_core.h"
 #include "sys_monitor.h"
+#include "app_mode.h"
 #include "battery_low_img.h"
 #include "atomic_utils.h"
 #include "power_mgr.h"
@@ -53,6 +54,8 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 
 /* 按键冷却: 吞机械抖动产生的二次上升沿 */
 #define PWR_KEY_COOLDOWN_MS  200
+/* 长按判定: 按住超过此值切换到另一模式 */
+#define PWR_KEY_LONG_US      (800 * 1000)
 
 /* 电源状态机 */
 typedef enum {
@@ -62,10 +65,17 @@ typedef enum {
 } pwr_state_t;
 
 static pwr_state_t s_state = PWR_ACTIVE;   /* 当前电源状态 */
-static bool        s_key_prev = false;     /* 上次按键电平 (用于检测上升沿) */
+static bool        s_key_prev = false;     /* 上次按键电平 (用于检测沿) */
 static int64_t     s_key_last_us = 0;      /* 上次按键沿的时刻 (us), 用于冷却 */
+static int64_t     s_key_press_us = 0;     /* 本次按下的时刻 (us), 长按判定用 */
+static bool        s_key_pending = false;  /* 已按下且尚未判定 (短按待松手触发) */
+static bool        s_key_long_fired = false; /* 本次长按已处理 */
 static uint8_t     s_cur_bri = 0;          /* 当前实际背光亮度 */
 static int         s_fade_dummy = 0;       /* 动画变量占位 (值由 bri_fade_exec 使用) */
+
+/* 模式切换状态 */
+static bool  s_mode_switching = false;     /* 切换过渡中: 屏蔽按键/蓝牙轮询 */
+static void (*s_switch_work)(void) = NULL; /* 切换时黑屏窗口内执行的工作 */
 
 /* 淡出/淡入执行: 直接写 LEDC 背光.
  * var=动画变量地址(未用), v=动画当前值 (目标亮度) */
@@ -170,28 +180,16 @@ static void screen_on(void)
     ESP_LOGI(TAG, "亮屏");
 }
 
-/* 按键电平上报 (复用 vol_key 10ms 定时器): 只测上升沿, 按住不重复触发.
- * level=当前按键电平 */
-void power_mgr_poll_key(bool level)
+/* 执行与之前相同的短按动作 (息屏/亮屏/深睡) */
+static void power_short_press_action(void)
 {
-    bool rising = level && !s_key_prev;   /* 上升沿: 之前低现在高 */
-    s_key_prev = level;
-    if (!rising) return;
-
-    /* 冷却窗口: 两次沿间隔 <200ms 视为抖动, 丢弃 */
-    int64_t now = esp_timer_get_time();
-    if (s_key_last_us != 0 && (now - s_key_last_us) < PWR_KEY_COOLDOWN_MS * 1000LL) {
-        return;   /* 冷却: 吞机械抖动二次沿 */
-    }
-    s_key_last_us = now;
-
     switch (s_state) {
     case PWR_ACTIVE:
         if (bt_a2dp_get_state() != BT_STATE_DISCONNECTED) {
             /* 已连接/连接中 → 手动息屏 */
             screen_off();
         } else {
-            /* 蓝牙未连接 → 淡出后进深度睡眠 */
+            /* 蓝牙未连接 → 淡出后进深度睡眠 (小说模式无蓝牙, 直接深睡) */
             s_state = PWR_FAKE_OFF;
             ESP_LOGI(TAG, "BT 未连接, 淡出后深睡");
             screen_fade(0, enter_deep_sleep);
@@ -205,10 +203,80 @@ void power_mgr_poll_key(bool level)
     }
 }
 
+/* 按键电平上报 (复用 vol_key 10ms 定时器).
+ * 上升沿只记时; 按住 >=800ms 在亮屏态触发模式切换; 松手未触发长按则执行短按动作. */
+void power_mgr_poll_key(bool level)
+{
+    if (s_mode_switching) return;   /* 切换过渡中: 忽略 */
+
+    int64_t now = esp_timer_get_time();
+    bool rising  = level && !s_key_prev;
+    bool falling = !level && s_key_prev;
+    s_key_prev = level;
+
+    if (rising) {
+        s_key_press_us   = now;
+        s_key_long_fired = false;
+        s_key_pending    = true;
+        return;
+    }
+
+    /* 按住判定长按: 仅亮屏态且尚未处理 */
+    if (level && s_key_pending && !s_key_long_fired && s_state == PWR_ACTIVE) {
+        if (now - s_key_press_us >= PWR_KEY_LONG_US) {
+            s_key_long_fired = true;
+            s_key_pending    = false;
+            ESP_LOGI(TAG, "长按睡眠键: 切换模式");
+            app_mode_toggle();
+        }
+        return;
+    }
+
+    if (falling && s_key_pending) {
+        s_key_pending = false;
+        if (s_key_long_fired) return;   /* 长按已处理, 松手不再触发短按 */
+
+        /* 冷却窗口: 两次沿间隔 <200ms 视为抖动, 丢弃 */
+        if (s_key_last_us != 0 && (now - s_key_last_us) < PWR_KEY_COOLDOWN_MS * 1000LL) {
+            return;
+        }
+        s_key_last_us = now;
+        power_short_press_action();
+    }
+}
+
+static void mode_switch_light_done(lv_anim_t *a);
+
+/* 淡出完成 (已纯黑): 执行切换工作, 再淡入 */
+static void mode_switch_dark_done(lv_anim_t *a)
+{
+    (void)a;
+    if (s_switch_work) s_switch_work();
+    screen_fade(brightness_get(), mode_switch_light_done);
+}
+
+/* 淡入完成: 解除切换屏蔽, 恢复触摸 */
+static void mode_switch_light_done(lv_anim_t *a)
+{
+    (void)a;
+    s_mode_switching = false;
+    ui_touch_set_enabled(true);
+}
+
+/* 模式切换黑屏过渡入口 */
+void power_mgr_mode_transition(void (*work)(void))
+{
+    s_mode_switching = true;
+    s_switch_work    = work;
+    ui_touch_set_enabled(false);   /* 黑屏期间关触摸, 避免误触 */
+    screen_fade(0, mode_switch_dark_done);
+}
+
 /* 息屏期 BT 状态轮询 (1s): 从已连/连接中变为未连接 → 深睡 */
 static void bt_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (s_mode_switching) return;            /* 模式切换过渡中不处理 */
     if (s_state != PWR_SCREEN_OFF) return;   /* 非息屏态不处理 */
     if (bt_a2dp_get_state() == BT_STATE_DISCONNECTED) {
         ESP_LOGI(TAG, "息屏期间蓝牙断开, 进入深度睡眠");

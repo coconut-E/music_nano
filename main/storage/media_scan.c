@@ -13,21 +13,57 @@
 #include "ff.h"
 #include "sys_monitor.h"
 
-#define TAG_MUSIC_SCAN   "MUSIC_SCAN"
+#define TAG_MEDIA_SCAN   "MEDIA_SCAN"
 
 #define MOUNT_POINT       "/sdcard"              /* SD 卡挂载点 */
-#define MUSIC_CACHE_DIR   FS_CACHE_DIR           /* 缓存目录 (隐藏在 SD 卡上) */
-#define SPACE_FILE        FS_CACHE_DIR "/space.dat"  /* 空间快照文件 */
-#define SPACE_THRESHOLD_KB 10                   /* 空间变化超过此值才重扫 */
+#define MUSIC_CACHE_DIR   FS_CACHE_DIR           /* 缓存目录 (隐藏在 SD 卡上, 音乐/小说共用) */
+#define SPACE_THRESHOLD_KB 10                    /* 空间变化超过此值才重扫 */
 
-volatile bool g_music_scan_force = false;   /* 强制全量扫描标志 (外部置位, 用完自动清除) */
+#define MUSIC_DIR         "/sdcard/音乐"          /* 音乐扫描根目录 */
+#define NOVEL_DIR         "/sdcard/小说"          /* 小说扫描根目录 */
 
-/* 识别为音乐文件的扩展名 (含大小写) */
+volatile bool g_music_scan_force = false;   /* 音乐强制全量扫描标志 (外部置位, 用完自动清除) */
+volatile bool g_novel_scan_force = false;   /* 小说强制全量扫描标志 (外部置位, 用完自动清除) */
+
+/* 媒体库扫描配置: 音乐/小说各一份, 扫描逻辑完全共用 */
+typedef struct {
+    const char          *root;        /* 扫描根目录 (绝对路径) */
+    const char          *cache_bin;   /* 索引输出路径 */
+    const char          *space_file;  /* 空间快照文件路径 */
+    const char *const   *exts;        /* 识别的扩展名 (含大小写) */
+    int                  ext_count;   /* 扩展名条目数 */
+    volatile bool       *force;       /* 强制全量扫描标志 */
+} media_scan_cfg_t;
+
+/* 音乐扩展名 (含大小写) */
 static const char *MUSIC_EXTENSIONS[] = {
     ".mp3", ".flac", ".wav", ".aac",
     ".MP3", ".FLAC", ".WAV", ".AAC",
 };
-static const int NUM_EXTENSIONS = sizeof(MUSIC_EXTENSIONS) / sizeof(MUSIC_EXTENSIONS[0]);   /* 扩展名条目数 */
+/* 小说扩展名 (含大小写) */
+static const char *NOVEL_EXTENSIONS[] = {
+    ".txt", ".TXT",
+};
+
+static const media_scan_cfg_t s_music_cfg = {
+    .root      = MUSIC_DIR,
+    .cache_bin = FS_CACHE_BIN_PATH,
+    .space_file = FS_CACHE_DIR "/space.dat",
+    .exts      = MUSIC_EXTENSIONS,
+    .ext_count = sizeof(MUSIC_EXTENSIONS) / sizeof(MUSIC_EXTENSIONS[0]),
+    .force     = &g_music_scan_force,
+};
+static const media_scan_cfg_t s_novel_cfg = {
+    .root      = NOVEL_DIR,
+    .cache_bin = NOVEL_CACHE_BIN_PATH,
+    .space_file = FS_CACHE_DIR "/novel_space.dat",
+    .exts      = NOVEL_EXTENSIONS,
+    .ext_count = sizeof(NOVEL_EXTENSIONS) / sizeof(NOVEL_EXTENSIONS[0]),
+    .force     = &g_novel_scan_force,
+};
+
+/* 当前扫描配置 (sys_monitor 任务串行扫描, 单份即可) */
+static const media_scan_cfg_t *s_cfg = NULL;
 
 /* 目录工作栈 (变长 LIFO, 全部在 PSRAM):
  * 记录格式 = [路径字节]['\0'][uint16 长度], 只存实际路径长度.
@@ -45,7 +81,7 @@ static bool dir_stack_init(dir_stack_t *s)
     s->used = 0;
     s->buf  = heap_caps_malloc(s->cap, MALLOC_CAP_SPIRAM);
     if (!s->buf) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "工作栈分配失败");
+        ESP_LOGE(TAG_MEDIA_SCAN, "工作栈分配失败");
         return false;
     }
     return true;
@@ -63,7 +99,7 @@ static bool dir_stack_reserve(dir_stack_t *s, size_t extra)
     }
     char *nb = heap_caps_realloc(s->buf, ncap, MALLOC_CAP_SPIRAM);
     if (!nb) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "工作栈扩容失败");
+        ESP_LOGE(TAG_MEDIA_SCAN, "工作栈扩容失败");
         return false;
     }
     s->buf = nb;
@@ -76,7 +112,7 @@ static bool dir_stack_push(dir_stack_t *s, const char *path)
 {
     size_t len = strlen(path);
     if (len > 0xFFFF) {
-        ESP_LOGW(TAG_MUSIC_SCAN, "路径过长, 跳过: %s", path);
+        ESP_LOGW(TAG_MEDIA_SCAN, "路径过长, 跳过: %s", path);
         return false;
     }
     size_t need = len + 1 + sizeof(uint16_t);
@@ -99,7 +135,7 @@ static bool dir_stack_push2(dir_stack_t *s, const char *a, const char *b)
     size_t lb = strlen(b);
     size_t len = la + 1 + lb;
     if (len > 0xFFFF) {
-        ESP_LOGW(TAG_MUSIC_SCAN, "路径过长, 跳过: %s/%s", a, b);
+        ESP_LOGW(TAG_MEDIA_SCAN, "路径过长, 跳过: %s/%s", a, b);
         return false;
     }
     size_t need = len + 1 + sizeof(uint16_t);
@@ -176,7 +212,7 @@ static char *ensure_cap(char **p, size_t *cap, size_t need)
     }
     char *np = heap_caps_realloc(*p, ncap, MALLOC_CAP_SPIRAM);
     if (!np) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "缓冲扩容失败");
+        ESP_LOGE(TAG_MEDIA_SCAN, "缓冲扩容失败");
         return NULL;
     }
     *p = np;
@@ -184,14 +220,14 @@ static char *ensure_cap(char **p, size_t *cap, size_t need)
     return np;
 }
 
-/* 判断文件名是否为音乐文件 (按扩展名匹配) */
-static bool is_music_file(const char *name)
+/* 判断文件名是否属于当前媒体库 (按扩展名匹配) */
+static bool is_media_file(const char *name)
 {
     const char *dot = strrchr(name, '.');   /* 最后一个点作为扩展名起点 */
     if (!dot) return false;
 
-    for (int i = 0; i < NUM_EXTENSIONS; i++) {
-        if (strcmp(dot, MUSIC_EXTENSIONS[i]) == 0) {
+    for (int i = 0; i < s_cfg->ext_count; i++) {
+        if (strcmp(dot, s_cfg->exts[i]) == 0) {
             return true;
         }
     }
@@ -199,8 +235,8 @@ static bool is_music_file(const char *name)
 }
 
 /* 把目录绝对路径映射为分组串 (用真实 '/'):
- * /sdcard        → "sdcard"
- * /sdcard/a/b    → "sdcard/a/b" */
+ * /sdcard/音乐      → "sdcard/音乐"
+ * /sdcard/音乐/a    → "sdcard/音乐/a" */
 static void build_group(const char *dir_path, char *out, size_t out_size)
 {
     const char *rel = dir_path;
@@ -229,7 +265,7 @@ static uint32_t pool_append(cache_builder_t *b, const char *s)
         }
         char *np = heap_caps_realloc(b->pool, ncap, MALLOC_CAP_SPIRAM);
         if (!np) {
-            ESP_LOGE(TAG_MUSIC_SCAN, "字符串池扩容失败");
+            ESP_LOGE(TAG_MEDIA_SCAN, "字符串池扩容失败");
             return UINT32_MAX;
         }
         b->pool = np;
@@ -250,7 +286,7 @@ static bool entry_append(fs_entry_t **arr, int *n, int *cap,
         fs_entry_t *na = heap_caps_realloc(*arr, (size_t)ncap * sizeof(fs_entry_t),
                                            MALLOC_CAP_SPIRAM);
         if (!na) {
-            ESP_LOGE(TAG_MUSIC_SCAN, "条目数组扩容失败");
+            ESP_LOGE(TAG_MEDIA_SCAN, "条目数组扩容失败");
             return false;
         }
         *arr = na;
@@ -271,7 +307,7 @@ static uint64_t get_used_space_kb(void)
     DWORD free_clst;
     FRESULT fr = f_getfree(MOUNT_POINT, &free_clst, &fs);
     if (fr != FR_OK) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "获取空间信息失败 (%d)", fr);
+        ESP_LOGE(TAG_MEDIA_SCAN, "获取空间信息失败 (%d)", fr);
         return 0;
     }
 
@@ -281,12 +317,14 @@ static uint64_t get_used_space_kb(void)
     return total_kb - free_kb;
 }
 
-#define SPACE_MAGIC  "MUSICACHE2\n"   /* 空间缓存文件魔数 (只存已用空间 KB) */
+/* 空间缓存文件魔数 (只存已用空间 KB).
+ * 版本号提升可强制一次全量重扫 (音乐库迁入 /音乐 后需重建分组路径) */
+#define SPACE_MAGIC  "MUSICACHE3\n"
 
 /* 读取上次扫描时记录的已用空间 (KB); 无/损坏返回 0 */
 static uint64_t read_space_cache(void)
 {
-    int fd = open(SPACE_FILE, O_RDONLY);
+    int fd = open(s_cfg->space_file, O_RDONLY);
     if (fd < 0) {
         return 0;
     }
@@ -303,9 +341,9 @@ static uint64_t read_space_cache(void)
 /* 把本次扫描的已用空间写入缓存文件 */
 static void write_space_cache(uint64_t used_kb)
 {
-    int fd = open(SPACE_FILE, O_RDWR | O_CREAT | O_TRUNC, 0);
+    int fd = open(s_cfg->space_file, O_RDWR | O_CREAT | O_TRUNC, 0);
     if (fd < 0) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "无法创建空间缓存文件: %s", strerror(errno));
+        ESP_LOGE(TAG_MEDIA_SCAN, "无法创建空间缓存文件: %s", strerror(errno));
         return;
     }
 
@@ -315,7 +353,7 @@ static void write_space_cache(uint64_t used_kb)
     close(fd);
 }
 
-/* 清理 .music_cache 下旧缓存: 文件名以 "sdcard" 开头的 legacy 文件, 及旧索引 index.bin/.tmp */
+/* 清理缓存目录下旧格式 legacy 文件 (文件名以 "sdcard" 开头) */
 static void clean_cache_files(void)
 {
     DIR *dir = opendir(MUSIC_CACHE_DIR);
@@ -325,9 +363,7 @@ static void clean_cache_files(void)
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type != DT_REG) continue;                /* 只处理普通文件 */
         const char *n = entry->d_name;
-        if (strncmp(n, "sdcard", 6) == 0 ||                  /* legacy 缓存文件 */
-            strcmp(n, "index.bin") == 0 ||
-            strcmp(n, "index.bin.tmp") == 0) {
+        if (strncmp(n, "sdcard", 6) == 0) {                   /* legacy 缓存文件 */
             char full_path[512];
             snprintf(full_path, sizeof(full_path), "%s/%s", MUSIC_CACHE_DIR, n);
             remove(full_path);
@@ -336,15 +372,15 @@ static void clean_cache_files(void)
     closedir(dir);
 }
 
-/* 把构建器序列化为 index.bin (先写临时文件再改名, 防掉电半写). 成功返回 true */
+/* 把构建器序列化为索引文件 (先写临时文件再改名, 防掉电半写). 成功返回 true */
 static bool write_index_bin(cache_builder_t *b)
 {
-    char tmp_path[128];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/index.bin.tmp", FS_CACHE_DIR);
+    char tmp_path[160];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_cfg->cache_bin);
 
     int fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0);
     if (fd < 0) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "无法创建索引文件: %s", tmp_path);
+        ESP_LOGE(TAG_MEDIA_SCAN, "无法创建索引文件: %s", tmp_path);
         return false;
     }
 
@@ -369,26 +405,26 @@ static bool write_index_bin(cache_builder_t *b)
     close(fd);
 
     if (!ok) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "索引写入失败");
+        ESP_LOGE(TAG_MEDIA_SCAN, "索引写入失败");
         remove(tmp_path);
         return false;
     }
 
-    remove(FS_CACHE_BIN_PATH);   /* FatFs rename 目标已存在时可能失败 */
-    if (rename(tmp_path, FS_CACHE_BIN_PATH) != 0) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "索引改名失败: %s", strerror(errno));
+    remove(s_cfg->cache_bin);   /* FatFs rename 目标已存在时可能失败 */
+    if (rename(tmp_path, s_cfg->cache_bin) != 0) {
+        ESP_LOGE(TAG_MEDIA_SCAN, "索引改名失败: %s", strerror(errno));
         remove(tmp_path);
         return false;
     }
-    ESP_LOGI(TAG_MUSIC_SCAN, "索引已写入: %d 条目, 池 %zu 字节",
-             hdr.count, hdr.pool_size);
+    ESP_LOGI(TAG_MEDIA_SCAN, "索引已写入: %s (%d 条目, 池 %zu 字节)",
+             s_cfg->cache_bin, hdr.count, hdr.pool_size);
     return true;
 }
 
-/* 校验 index.bin 是否存在且完整有效 (与 sd_load_cache_bin 的校验一致: 头部 + 精确长度) */
+/* 校验索引文件是否存在且完整有效 (与 sd_load_cache_bin 的校验一致: 头部 + 精确长度) */
 static bool index_bin_valid(void)
 {
-    int fd = open(FS_CACHE_BIN_PATH, O_RDONLY);
+    int fd = open(s_cfg->cache_bin, O_RDONLY);
     if (fd < 0) return false;
 
     fs_cache_t hdr;
@@ -415,7 +451,7 @@ static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
 {
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "无法打开目录: %s", dir_path);
+        ESP_LOGE(TAG_MEDIA_SCAN, "无法打开目录: %s", dir_path);
         return;
     }
 
@@ -442,7 +478,7 @@ static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
         }
 
         if (entry->d_type == DT_REG) {
-            if (is_music_file(entry->d_name)) {
+            if (is_media_file(entry->d_name)) {
                 /* 跳过 0 字节的损坏/残留文件 */
                 char *full = ensure_cap(&ctx->full, &ctx->full_cap,
                                         dl + 1 + strlen(entry->d_name) + 1);
@@ -456,7 +492,7 @@ static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
                     entry_append(&ctx->b.files, &ctx->b.n_files, &ctx->b.cap_files,
                                  noff, group_off, false);
                 } else {
-                    ESP_LOGW(TAG_MUSIC_SCAN, "跳过空文件: %s", full);
+                    ESP_LOGW(TAG_MEDIA_SCAN, "跳过空文件: %s", full);
                 }
             }
         } else if (entry->d_type == DT_DIR) {
@@ -472,9 +508,9 @@ static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
 }
 
 /* 执行一次全量扫描: 清缓存 → 迭代扫目录 → 写索引 + 空间快照 */
-static void music_scan_run(void)
+static void media_scan_run(void)
 {
-    ESP_LOGI(TAG_MUSIC_SCAN, "开始扫描音乐文件...");
+    ESP_LOGI(TAG_MEDIA_SCAN, "开始扫描: %s", s_cfg->root);
 
     int64_t t0 = esp_timer_get_time();
 
@@ -488,12 +524,12 @@ static void music_scan_run(void)
     ctx.b.pool_cap = 4096;
     ctx.b.pool = heap_caps_malloc(ctx.b.pool_cap, MALLOC_CAP_SPIRAM);
     if (!ctx.b.pool) {
-        ESP_LOGE(TAG_MUSIC_SCAN, "字符串池分配失败");
+        ESP_LOGE(TAG_MEDIA_SCAN, "字符串池分配失败");
         dir_stack_free(&ctx.stack);
         return;
     }
 
-    dir_stack_push(&ctx.stack, MOUNT_POINT);
+    dir_stack_push(&ctx.stack, s_cfg->root);
 
     bool scan_ok = true;
     while (ctx.stack.used > 0) {
@@ -513,7 +549,7 @@ static void music_scan_run(void)
     if (scan_ok) {
         wrote = write_index_bin(&ctx.b);
     } else {
-        ESP_LOGW(TAG_MUSIC_SCAN, "扫描未完成(内存不足), 跳过写索引, 下次开机重扫");
+        ESP_LOGW(TAG_MEDIA_SCAN, "扫描未完成(内存不足), 跳过写索引, 下次开机重扫");
     }
 
     dir_stack_free(&ctx.stack);
@@ -527,37 +563,37 @@ static void music_scan_run(void)
     if (wrote) write_space_cache(used_kb);   /* 仅索引成功写入才更新空间快照 */
 
     int64_t elapsed = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG_MUSIC_SCAN, "扫描完成, 耗时 %.2f ms", elapsed / 1000.0f);
+    ESP_LOGI(TAG_MEDIA_SCAN, "扫描完成 (%s), 耗时 %.2f ms", s_cfg->root, elapsed / 1000.0f);
 }
 
-/* 音乐扫描初始化: 根据空间变化决定是否重扫 (除非被强制).
- * 策略: SD 卡已用空间与上次记录偏差 >10KB → 说明曲目有增删, 重扫; 否则用缓存, 秒开. */
-void music_scan_init(void)
+/* 媒体库扫描初始化: 根据空间变化决定是否重扫 (除非被强制).
+ * 策略: SD 卡已用空间与上次记录偏差 >10KB → 说明文件有增删, 重扫; 否则用缓存, 秒开. */
+static void media_scan_init_common(void)
 {
-    ESP_LOGI(TAG_MUSIC_SCAN, "初始化音乐文件扫描器");
+    ESP_LOGI(TAG_MEDIA_SCAN, "初始化扫描器: %s", s_cfg->root);
 
     if (mkdir(MUSIC_CACHE_DIR, 0777) != 0 && errno != EEXIST) {   /* 确保缓存目录存在 */
-        ESP_LOGE(TAG_MUSIC_SCAN, "无法创建缓存目录 %s: %s", MUSIC_CACHE_DIR, strerror(errno));
+        ESP_LOGE(TAG_MEDIA_SCAN, "无法创建缓存目录 %s: %s", MUSIC_CACHE_DIR, strerror(errno));
         return;
     }
 
     uint64_t current_used = get_used_space_kb();   /* 当前已用空间 */
     uint64_t cached_used = read_space_cache();     /* 上次记录的已用空间 */
 
-    ESP_LOGI(TAG_MUSIC_SCAN, "当前已用空间: %llu KB, 缓存记录: %llu KB",
+    ESP_LOGI(TAG_MEDIA_SCAN, "当前已用空间: %llu KB, 缓存记录: %llu KB",
              current_used, cached_used);
 
-    bool force = g_music_scan_force;   /* 外部强制标志 (一次性) */
-    g_music_scan_force = false;
+    bool force = *s_cfg->force;   /* 外部强制标志 (一次性) */
+    *s_cfg->force = false;
     if (force) {
-        ESP_LOGI(TAG_MUSIC_SCAN, "手动触发重新扫描");
-        music_scan_run();
+        ESP_LOGI(TAG_MEDIA_SCAN, "手动触发重新扫描: %s", s_cfg->root);
+        media_scan_run();
         return;
     }
 
     if (cached_used == 0) {   /* 首次运行, 无缓存记录 */
-        ESP_LOGI(TAG_MUSIC_SCAN, "无缓存记录，开始全量扫描");
-        music_scan_run();
+        ESP_LOGI(TAG_MEDIA_SCAN, "无缓存记录，开始全量扫描: %s", s_cfg->root);
+        media_scan_run();
         return;
     }
 
@@ -565,13 +601,27 @@ void music_scan_init(void)
     int64_t diff = (int64_t)current_used - (int64_t)cached_used;
     if (diff < 0) diff = -diff;
     if (diff > SPACE_THRESHOLD_KB) {
-        ESP_LOGI(TAG_MUSIC_SCAN, "空间变化 %lld KB 超过阈值 %d KB，重新扫描",
-                 diff, SPACE_THRESHOLD_KB);
-        music_scan_run();
+        ESP_LOGI(TAG_MEDIA_SCAN, "空间变化 %lld KB 超过阈值 %d KB，重新扫描: %s",
+                 diff, SPACE_THRESHOLD_KB, s_cfg->root);
+        media_scan_run();
     } else if (!index_bin_valid()) {
-        ESP_LOGI(TAG_MUSIC_SCAN, "索引缺失或无效，重新扫描");
-        music_scan_run();
+        ESP_LOGI(TAG_MEDIA_SCAN, "索引缺失或无效，重新扫描: %s", s_cfg->root);
+        media_scan_run();
     } else {
-        ESP_LOGI(TAG_MUSIC_SCAN, "空间变化在阈值内，使用缓存");
+        ESP_LOGI(TAG_MEDIA_SCAN, "空间变化在阈值内，使用缓存: %s", s_cfg->root);
     }
+}
+
+/* 音乐扫描初始化 */
+void music_scan_init(void)
+{
+    s_cfg = &s_music_cfg;
+    media_scan_init_common();
+}
+
+/* 小说扫描初始化 */
+void novel_scan_init(void)
+{
+    s_cfg = &s_novel_cfg;
+    media_scan_init_common();
 }

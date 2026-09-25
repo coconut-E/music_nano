@@ -8,8 +8,20 @@
 extern "C" {
 #endif
 
-/* 创建播放器主界面 (ui_loop_task 内调用) */
-void ui_player_init(void);
+/* 音乐组生命周期 (由 app_mode 调度):
+ *  - player_show: 未构建则构建并显示, 已构建则恢复显示
+ *  - player_destroy: 删除全部音乐控件并重置模块静态变量 */
+void player_show(void);
+void player_destroy(void);
+
+/* 停止播放 (模式切到小说用): 只发停止命令, 不销毁 UI */
+void player_stop_playback(void);
+
+/* SD 事件 (由 ui_shell 的 SD 监视调用):
+ *  - player_on_sd_remove: 停音频/复位播放列表/清封面
+ *  - player_on_sd_ready: 音乐模式下恢复上次歌曲 (非音乐模式 no-op) */
+void player_on_sd_remove(void);
+void player_on_sd_ready(void);
 
 /* 播放控制: 文件浏览器选中 / 自动切歌 / 响应音频结果.
  * player_play_file: 播放指定文件 (group=分组, name=文件名) */

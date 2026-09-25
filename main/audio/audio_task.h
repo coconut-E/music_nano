@@ -50,6 +50,11 @@ typedef struct {
 
 void audio_task_init(const audio_task_params_t *params);   /* 创建音频任务 */
 
+/* 模式切换挂起/恢复: 切到小说时挂起 (省电/让出 CPU), 切回音乐时恢复.
+ * pause 会等任务进入主循环后再挂; 调用方须先停止播放并确认解码器已关闭. */
+void audio_task_pause(void);
+void audio_task_resume(void);
+
 #ifdef __cplusplus
 }
 #endif

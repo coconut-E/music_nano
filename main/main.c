@@ -12,6 +12,7 @@
 #include "sys_monitor.h"
 #include "cover.h"
 #include "likes.h"
+#include "app_mode.h"
 
 /* 系统级消息队列句柄 (跨模块共享) */
 static QueueHandle_t s_app_cmd_queue  = NULL;   /* 应用命令队列: console→app 层(扫描/连接/播放等) */
@@ -34,6 +35,10 @@ void app_main(void)
     power_mgr_boot_battery_check();
 
     nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
+
+    /* 读取上次睡眠时的应用模式, 供 UI 决定启动构建哪一组 (只建一组, 加快启动) */
+    app_mode_t boot_mode = app_mode_read_saved();
+    app_mode_set_boot_mode(boot_mode);
 
     likes_init();       /* 载入喜欢列表到 RAM (文件浏览器显示爱心图标用) */
 
@@ -74,6 +79,14 @@ void app_main(void)
 
     /* 封面解码任务: 解析内嵌专辑封面 (经 app 命令队列通知) */
     cover_init(s_app_cmd_queue);
+
+    /* 启动即小说模式: 等音频/封面任务初始化完成后挂起 (省电, 让出 core1).
+     * 切回音乐模式时由 app_mode 恢复; 不切回则一直挂起 */
+    if (boot_mode == APP_MODE_NOVEL) {
+        audio_task_pause();
+        cover_task_pause();
+        bt_a2dp_pause();
+    }
 
     printf("系统就绪\n");
 

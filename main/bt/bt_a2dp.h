@@ -65,6 +65,11 @@ bt_state_t bt_a2dp_get_state(void);     /* 查询当前连接状态 */
 
 bool bt_a2dp_is_connected(void);        /* 是否已连接 */
 
+/* 模式切换挂起/恢复: 小说模式挂起蓝牙任务 (停扫描/断连后 vTaskSuspend) 省 CPU0;
+ * 切回音乐恢复. 挂起期间 get_state/is_connected 均返回未连接 */
+void bt_a2dp_pause(void);
+void bt_a2dp_resume(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -56,7 +57,8 @@ volatile bool  g_sd_ready = false;      /* SD 卡就绪标志 */
 volatile float g_vbat     = 0.0f;       /* 电池电压 (V) */
 volatile float g_cpu_temp = 0.0f;       /* CPU 温度 (C) */
 volatile bool  g_sd_manual_rescan = false;  /* 手动重扫标志 */
-fs_cache_t     *g_fs_cache     = NULL;      /* 文件缓存指针 (PSRAM) */
+fs_cache_t     *g_fs_cache     = NULL;      /* 音乐文件缓存指针 (PSRAM) */
+fs_cache_t     *g_novel_cache  = NULL;      /* 小说文件缓存指针 (PSRAM) */
 
 /* 删除文件请求 (UI→本任务): 标志 + 参数, 结果写进 g_sd_delete_status */
 static volatile bool   s_del_req  = false;
@@ -79,8 +81,10 @@ bool sd_request_delete_file(const char *group, const char *name, int idx)
 static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
 static bool          s_mounted = false;  /* 是否已挂载 */
 
-static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的缓存指针 (用于释放) */
-static fs_cache_t   *s_fs_cache_retire = NULL;  /* 已下线待回收的旧缓存 (交由 UI 任务释放) */
+static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的音乐缓存指针 (用于释放) */
+static fs_cache_t   *s_fs_cache_retire = NULL;  /* 已下线待回收的旧音乐缓存 (交由 UI 任务释放) */
+static fs_cache_t   *s_novel_cache_owned = NULL;  /* 本模块持有的小说缓存指针 */
+static fs_cache_t   *s_novel_cache_retire = NULL; /* 已下线待回收的旧小说缓存 */
 static SemaphoreHandle_t s_sd_fs_mutex = NULL;  /* SD/FATFS 访问互斥 (卸载与解码器 IO 互斥) */
 
 static sd_event_cb_t  s_event_cb  = NULL;   /* 磁盘事件回调 */
@@ -104,15 +108,15 @@ void fs_build_real_path(const char *group, const char *name,
     snprintf(out, out_size, "/sdcard/%s/%s", rel, name);   /* 子目录文件 */
 }
 
-/* 从 .music_cache/index.bin 读取文件索引到 PSRAM.
- * index.bin 是 fs_cache_t 的序列化镜像: entries 的 name/group 字段在磁盘上存
+/* 从指定 .bin 读取文件索引到 PSRAM.
+ * 该文件是 fs_cache_t 的序列化镜像: entries 的 name/group 字段在磁盘上存
  * "字符串池内偏移"; 一次读入后修正为绝对指针即可直接用, 无需逐文件解析.
- * 返回 fs_cache_t 或 NULL. */
-static fs_cache_t *sd_load_cache_bin(void)
+ * path=索引文件路径; 返回 fs_cache_t 或 NULL. */
+static fs_cache_t *sd_load_cache_bin(const char *path)
 {
-    int fd = open(FS_CACHE_BIN_PATH, O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        ESP_LOGW(TAG_SDMMC, "无法打开索引文件: %s", FS_CACHE_BIN_PATH);
+        ESP_LOGW(TAG_SDMMC, "无法打开索引文件: %s", path);
         return NULL;
     }
 
@@ -267,11 +271,22 @@ void sdmmc_disk_init(void)
     s_mounted = true;
     ESP_LOGI(TAG_SDMMC, "SD 卡已挂载");
 
-    sd_scan_files();           /* 诊断: 根目录文件数/容量 */
-    music_scan_init();         /* 扫描/加载音乐缓存 */
+    /* 确保根目录下 "音乐" / "小说" 两个目录存在 (不存在则创建) */
+    if (mkdir("/sdcard/音乐", 0777) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG_SDMMC, "创建 /sdcard/音乐 失败: %s", strerror(errno));
+    }
+    if (mkdir("/sdcard/小说", 0777) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG_SDMMC, "创建 /sdcard/小说 失败: %s", strerror(errno));
+    }
 
-    s_fs_cache_owned = sd_load_cache_bin();   /* 从 index.bin 读入 PSRAM 建索引 */
-    g_fs_cache = s_fs_cache_owned;
+    sd_scan_files();           /* 诊断: 根目录文件数/容量 */
+    music_scan_init();         /* 扫描/加载音乐缓存 (/sdcard/音乐) */
+    novel_scan_init();         /* 扫描/加载小说缓存 (/sdcard/小说) */
+
+    s_fs_cache_owned    = sd_load_cache_bin(FS_CACHE_BIN_PATH);      /* 音乐 index.bin */
+    s_novel_cache_owned = sd_load_cache_bin(NOVEL_CACHE_BIN_PATH);   /* 小说 novel.bin */
+    g_fs_cache    = s_fs_cache_owned;
+    g_novel_cache = s_novel_cache_owned;
     atomic_store_bool(&g_sd_ready, true);
 
     if (s_event_cb) s_event_cb("mounted", s_event_ctx);
@@ -286,10 +301,15 @@ void sdmmc_disk_deinit(void)
 
     /* 先置空缓存指针; 实际内存移交 retire, 由 UI 任务在确认无读者时释放,
      * 避免本任务释放时 UI 已取得旧指针正在遍历导致 use-after-free */
-    g_fs_cache = NULL;
+    g_fs_cache    = NULL;
+    g_novel_cache = NULL;
     if (s_fs_cache_owned) {
         s_fs_cache_retire = s_fs_cache_owned;
         s_fs_cache_owned = NULL;
+    }
+    if (s_novel_cache_owned) {
+        s_novel_cache_retire = s_novel_cache_owned;
+        s_novel_cache_owned = NULL;
     }
 
     /* 等 audio 关闭解码器并释放打开的文件, 同时排空在途 FATFS 调用:
@@ -336,6 +356,10 @@ void fs_cache_reap(void)
     if (s_fs_cache_retire) {
         heap_caps_free(s_fs_cache_retire);
         s_fs_cache_retire = NULL;
+    }
+    if (s_novel_cache_retire) {
+        heap_caps_free(s_novel_cache_retire);
+        s_novel_cache_retire = NULL;
     }
 }
 
@@ -419,6 +443,7 @@ static void sys_monitor_task(void *arg)
             g_sd_manual_rescan = false;
             ESP_LOGI(TAG_DETECT, "手动触发重新扫描");
             g_music_scan_force = true;               /* 强制音乐全量重扫 */
+            g_novel_scan_force = true;               /* 强制小说全量重扫 */
             sdmmc_disk_deinit();
             vTaskDelay(pdMS_TO_TICKS(500));
             sdmmc_disk_init();

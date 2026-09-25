@@ -14,7 +14,10 @@
 #include "drv_display.h"
 #include "ui_core.h"
 #include "ui_player.h"
+#include "ui_novel.h"
+#include "ui_shell.h"
 #include "menu.h"
+#include "app_mode.h"
 #include "power_mgr.h"
 
 #define LVGL_TAG "LVGL"
@@ -27,9 +30,11 @@ void ui_loop_task(void *arg)
     /* 初始化显示/触摸驱动, 建 UI 各界面 */
     ui_core_display_init();
 
-    ui_player_init();                    /* 播放器主界面 */
+    ui_shell_init();                     /* 通用 UI 运行时 (弹窗/按键/SD监视) */
     bt_list_init(g_ui_bt_iface);         /* 蓝牙列表 */
-    fs_list_set_play_cb(player_play_file);   /* 文件列表点击 → 播放回调 */
+    fs_list_set_play_cb(player_play_file);    /* 文件列表(音乐)点击 → 播放回调 */
+    fs_list_set_novel_cb(ui_novel_open);      /* 文件列表(小说)点击 → 阅读回调 */
+    app_mode_init();                     /* 按启动模式只构建并显示对应组 UI */
 
     /* 三个事件源聚合到一个队列集, 统一非阻塞轮询 */
     s_queue_set = xQueueCreateSet(3);
@@ -65,6 +70,18 @@ void ui_loop_task(void *arg)
         /* ── 应用命令 (串口控制台) ── */
         if (active == g_ui_app_cmd_queue) {
             while (xQueueReceive(g_ui_app_cmd_queue, &app_cmd, 0) == pdTRUE) {
+                /* 小说模式: 禁止音乐/蓝牙相关命令, 串口提示后丢弃 */
+                if (app_mode_is_novel() &&
+                    (app_cmd.type == APP_CMD_BT_SCAN ||
+                     app_cmd.type == APP_CMD_BT_CONNECT ||
+                     app_cmd.type == APP_CMD_BT_DISCONNECT ||
+                     app_cmd.type == APP_CMD_PLAY ||
+                     app_cmd.type == APP_CMD_STOP ||
+                     app_cmd.type == APP_CMD_PAUSE)) {
+                    printf("[LVGL] 小说模式: 禁止命令 (type=%d)\n", app_cmd.type);
+                    continue;
+                }
+
                 switch (app_cmd.type) {
                 case APP_CMD_BT_SCAN:   /* 转发蓝牙扫描命令 */
                     memset(&bt_cmd, 0, sizeof(bt_cmd));
