@@ -3,6 +3,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <strings.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -17,6 +18,7 @@
 #include "atomic_utils.h"
 #include "cover.h"
 #include "sys_monitor.h"
+#include "settings.h"
 
 #define AUDIO_TAG "AUDIO"
 
@@ -52,6 +54,171 @@ static volatile bool        s_task_ready  = false;  /* 音频任务已进入主�
 static audio_decoder_t     *s_decoder     = NULL;   /* 当前解码器对象 */
 static char                 s_current_path[256];    /* 当前播放文件路径 */
 
+/* ── SD 预读流: 音频任务持文件句柄 + PSRAM 预读缓冲 (解码器不再直接碰 FILE*) ──
+ * 单次 SD 读失败只是"这一轮没填上", 解码器仍从缓冲继续消费, 不会立刻误判播放结束;
+ * 仅当文件真正到尾, 或缓冲排空后持续读失败超过 ASTREAM_RETRY_MS 才返回 0. */
+#define ASTREAM_CAP        (20 * 1024)   /* 预读缓冲大小 (PSRAM) */
+#define ASTREAM_PUMP_FREE  (5 * 1024)    /* 空余 >= 此值就补读, 保持预读领先 */
+#define ASTREAM_READ_CHUNK (16 * 1024)   /* 单次 SD 读取上限 */
+#define ASTREAM_RETRY_MS   500          /* 缓冲排空后持续重试上限 (ms) */
+
+typedef struct {
+    audio_stream_t iface;
+    FILE          *f;
+    uint8_t       *buf;       /* PSRAM 线性缓冲 (任务启动时分配一次, 跨歌复用) */
+    size_t         cap;
+    size_t         start;     /* 有效数据起始下标 */
+    size_t         fill;      /* 有效字节数 */
+    uint32_t       logical;   /* 逻辑读位置 (已交付给解码器的下一字节的文件偏移) */
+    uint32_t       fsize;     /* 文件总大小 */
+    bool           feof_file; /* 底层文件已到尾 */
+} astream_t;
+
+static astream_t s_astream;
+
+/* 从 SD 读一块进缓冲; 有进展返回 true */
+static bool astream_pump(void)
+{
+    astream_t *s = &s_astream;
+    if (!s->f || s->feof_file) return false;
+
+    /* 尾部空间不够就把有效数据压缩到头部 */
+    if (s->cap - s->start - s->fill < 512 && s->start > 0) {
+        if (s->fill) memmove(s->buf, s->buf + s->start, s->fill);
+        s->start = 0;
+    }
+    size_t free_sp = s->cap - s->start - s->fill;
+    if (free_sp < 512) return false;
+    size_t want = free_sp < ASTREAM_READ_CHUNK ? free_sp : ASTREAM_READ_CHUNK;
+
+    size_t rd = 0;
+    sd_fs_lock();
+    if (s->f) rd = fread(s->buf + s->start + s->fill, 1, want, s->f);
+    sd_fs_unlock();
+
+    if (rd > 0) { s->fill += rd; return true; }
+    if (s->f && feof(s->f)) s->feof_file = true;   /* 真到文件尾 */
+    return false;
+}
+
+/* 顺序读: 尽量读满 len; 仅真到尾/持续失败才短读或返回 0 */
+static size_t astream_read(struct audio_stream_s *self, void *dst, size_t len)
+{
+    astream_t *s = (astream_t *)self;
+    uint8_t *out = (uint8_t *)dst;
+    size_t done = 0;
+    int64_t t0 = esp_timer_get_time();
+
+    while (done < len) {
+        if (s->fill == 0) {
+            if (astream_pump()) continue;
+            if (s->feof_file) break;                                        /* 真到尾 */
+            if (esp_timer_get_time() - t0 > (int64_t)ASTREAM_RETRY_MS * 1000)
+                break;                                                      /* 持续失败, 放弃 */
+            vTaskDelay(pdMS_TO_TICKS(5));                                   /* 稍后重试 */
+            continue;
+        }
+        size_t n = len - done;
+        if (n > s->fill) n = s->fill;
+        memcpy(out + done, s->buf + s->start, n);
+        s->start   += n;
+        s->fill    -= n;
+        s->logical += (uint32_t)n;
+        done       += n;
+    }
+    if (s->fill == 0) s->start = 0;
+
+    /* 预读: 空余 >=5KB 就补上, 提前为下一块备数据 (失败静默跳过, 下轮再试) */
+    while (s->cap - s->start - s->fill >= ASTREAM_PUMP_FREE) {
+        if (!astream_pump()) break;
+    }
+    return done;
+}
+
+/* 定位: 清空缓冲 + 底层 fseek */
+static bool astream_seek(struct audio_stream_s *self, long off, int whence)
+{
+    astream_t *s = (astream_t *)self;
+    if (!s->f) return false;
+
+    long target;
+    if (whence == SEEK_SET)      target = off;
+    else if (whence == SEEK_CUR) target = (long)s->logical + off;
+    else                         target = (long)s->fsize + off;
+    if (target < 0) target = 0;
+    if ((uint32_t)target > s->fsize) target = (long)s->fsize;
+
+    bool ok;
+    sd_fs_lock();
+    ok = (s->f && fseek(s->f, target, SEEK_SET) == 0);
+    sd_fs_unlock();
+    if (!ok) return false;
+
+    s->start = 0;
+    s->fill  = 0;
+    s->logical = (uint32_t)target;
+    s->feof_file = false;
+    return true;
+}
+
+static long astream_tell(struct audio_stream_s *self)
+{
+    return (long)((astream_t *)self)->logical;
+}
+
+static uint32_t astream_size(struct audio_stream_s *self)
+{
+    return ((astream_t *)self)->fsize;
+}
+
+/* 任务启动时分配预读缓冲并绑定接口 (只做一次) */
+static bool astream_init(void)
+{
+    memset(&s_astream, 0, sizeof(s_astream));
+    s_astream.iface.read = astream_read;
+    s_astream.iface.seek = astream_seek;
+    s_astream.iface.tell = astream_tell;
+    s_astream.iface.size = astream_size;
+    s_astream.buf = (uint8_t *)heap_caps_malloc(ASTREAM_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_astream.buf) {
+        s_astream.buf = (uint8_t *)heap_caps_malloc(ASTREAM_CAP, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    if (!s_astream.buf) return false;
+    s_astream.cap = ASTREAM_CAP;
+    return true;
+}
+
+/* 打开底层文件并复位游标 (缓冲由 astream_init 持有, 不清空) */
+static bool astream_open(const char *path)
+{
+    astream_t *s = &s_astream;
+    s->start = 0; s->fill = 0; s->logical = 0; s->fsize = 0;
+    s->feof_file = false; s->f = NULL;
+
+    sd_fs_lock();
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        struct stat st;
+        if (stat(path, &st) == 0) s->fsize = (uint32_t)st.st_size;
+        s->f = f;
+    }
+    sd_fs_unlock();
+    if (!f) return false;
+    atomic_store_bool(&g_audio_decoder_open, true);   /* 已占用 SD 文件, 阻止卸载 */
+    return true;
+}
+
+/* 关闭底层文件 (缓冲区保留复用) */
+static void astream_close(void)
+{
+    astream_t *s = &s_astream;
+    sd_fs_lock();
+    if (s->f) { fclose(s->f); s->f = NULL; }
+    sd_fs_unlock();
+    s->start = 0; s->fill = 0; s->logical = 0; s->fsize = 0; s->feof_file = false;
+    atomic_store_bool(&g_audio_decoder_open, false);
+}
+
 /* ── PCM 输出 ── */
 static bool     s_pending_pcm = false;   /* 是否有一块已转换待发送的 PCM */
 static int16_t *s_pcm_buf = NULL;        /* 解码原始 PCM 缓冲 */
@@ -78,11 +245,9 @@ static void close_decoder(void)
     if (s_decoder) {
         audio_decoder_t *d = s_decoder;
         s_decoder = NULL;
-        sd_fs_lock();                  /* 与 SD 卸载互斥: 避免 fclose 与卸载竞争 */
-        d->close(d);                   /* 各解码器的资源释放 (fclose) */
-        atomic_store_bool(&g_audio_decoder_open, false);   /* 锁内置否, 卸载等待可立即看到 */
-        sd_fs_unlock();
-        free(d);                       /* 释放对象本体 */
+        d->close(d);        /* 释放解码器自身资源 (缓冲/封面; 不再 fclose) */
+        astream_close();    /* 关闭底层文件 + 清占用标志 (内部持 sd_fs_lock) */
+        free(d);            /* 释放对象本体 */
     }
 }
 
@@ -108,12 +273,12 @@ static bool open_decoder(const char *path)
         printf("[音频] 创建解码器失败\n");
         return false;
     }
-    sd_fs_lock();   /* 与卸载互斥; 持锁后再复核 SD 是否仍就绪 */
-    bool opened = atomic_load_bool(&g_sd_ready) && s_decoder->open(s_decoder, path);
-    if (opened) atomic_store_bool(&g_audio_decoder_open, true);   /* 锁内公示, 供卸载等待 */
-    sd_fs_unlock();
+    /* 打开底层文件流 (内部持 sd_fs_lock); 复核 SD 仍就绪后交给解码器解析头部 */
+    bool opened = atomic_load_bool(&g_sd_ready) && astream_open(path)
+                  && s_decoder->open(s_decoder, path, &s_astream.iface);
     if (!opened) {
         printf("[音频] 无法打开 %s\n", path);
+        astream_close();
         free(s_decoder);
         s_decoder = NULL;
         return false;
@@ -328,9 +493,7 @@ static void audio_task(void *arg)
                     /* 暂停只停 PCM 输出, 音乐头信息仍要解析 */
                     if (s_decoder && !s_info_done) {
                         size_t bytes = 0;
-                        sd_fs_lock();
                         bool ok = s_decoder->decode(s_decoder, s_pcm_buf, &bytes) && bytes > 0;
-                        sd_fs_unlock();
                         if (ok) {
                             fill_song_info();   /* 利用暂停前补解析歌曲信息 */
                             s_info_done = true;
@@ -342,9 +505,7 @@ static void audio_task(void *arg)
                     if (s_decoder && s_decoder->seek) {
                         uint32_t fsz = s_decoder->get_file_size(s_decoder);
                         uint32_t target = (uint64_t)fsz * cmd.param / 1000;   /* param=千分比 → 字节偏移 */
-                        sd_fs_lock();
                         s_decoder->seek(s_decoder, target);
-                        sd_fs_unlock();
                         xStreamBufferReset(s_pcm_stream);
                         s_pending_pcm = false;
                         s_pcm_offset = 0;
@@ -379,9 +540,7 @@ static void audio_task(void *arg)
                     break;
                 }
                 s_pcm_bytes = MP3_PCM_BUF_SAMPLES * sizeof(int16_t);   /* 传入缓冲容量 (解码器据此限幅) */
-                sd_fs_lock();   /* 与 SD 卸载互斥 */
                 bool dec_ok = s_decoder->decode(s_decoder, s_pcm_buf, &s_pcm_bytes);
-                sd_fs_unlock();
                 if (!dec_ok) {
                     if (s_decoder->is_eof(s_decoder)) {   /* 解码失败且到 EOF = 播放完毕 */
                         int64_t elapsed = esp_timer_get_time() - s_play_start_us;
@@ -434,10 +593,11 @@ static void audio_task(void *arg)
                     update_duration_elapsed();
                 }
 
-                /* 转换到 44.1k stereo 输出缓冲 */
+                /* 转换到 44.1k stereo 输出缓冲 (顺带施加软件音量增益) */
                 size_t frames = s_pcm_bytes / (ch * 2);   /* 帧数 = 字节/(声道数×2字节/样本) */
                 s_out_bytes = pcm_pipeline_process(s_pipeline, s_pcm_buf, frames,
-                                                   (uint8_t*)s_out_buf, PCM_OUT_BUF_SAMPLES * sizeof(int16_t));
+                                                   (uint8_t*)s_out_buf, PCM_OUT_BUF_SAMPLES * sizeof(int16_t),
+                                                   (uint8_t)volume_get_gain());
 
                 s_pending_pcm = true;
                 s_pcm_offset = 0;
@@ -489,9 +649,7 @@ static void audio_task(void *arg)
                 if (s_decoder && s_decoder->seek) {
                     uint32_t fsz = s_decoder->get_file_size(s_decoder);
                     uint32_t target = (uint64_t)fsz * cmd.param / 1000;
-                    sd_fs_lock();
                     s_decoder->seek(s_decoder, target);
-                    sd_fs_unlock();
                     if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
                     g_song_info.elapsed_sec =
                         (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
@@ -516,6 +674,11 @@ extern "C" void audio_task_init(const audio_task_params_t *params)
     s_pcm_stream = params->pcm_stream;
 
     if (!s_info_mux) s_info_mux = xSemaphoreCreateMutex();   /* 歌曲信息快照锁 (须在任务启动前建好) */
+
+    if (!astream_init()) {   /* SD 预读缓冲 (20KB PSRAM) */
+        printf("[音频] FATAL: 预读缓冲分配失败\n");
+        return;
+    }
 
     /* 大缓冲优先放 PSRAM, 失败回退内部 RAM (纯 CPU 顺序访问, PSRAM 带宽绰绰有余) */
     s_pcm_buf = (int16_t *)heap_caps_malloc(MP3_PCM_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);

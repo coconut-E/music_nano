@@ -13,15 +13,24 @@ extern "C" {
  * 音量 / 上次播放歌曲 / 播放模式
  */
 
-/* ── 音量 ── */
-#define VOLUME_MIN      0     /* 最小音量 (静音) */
-#define VOLUME_MAX      127   /* 最大音量 (蓝牙 A2DP 标准 0~127) */
+/* ── 音量 ──
+ * 内部为 32 档 (index 0~31): 显示目标 0,4,...,124; 硬件音量按 8 向上取整 (末档钳到 127);
+ * 低于硬件步进的部分由 PCM 软件增益补足 (gain 0~100%).
+ * 按钮/耳机按键每次只 ±1 档, 实际值查表. */
+#define VOLUME_MIN      0     /* 最小目标音量 (静音, 对应 0 档) */
+#define VOLUME_MAX      127   /* 目标音量显示量程上限 (蓝牙 A2DP 标准 0~127) */
+#define VOLUME_STEPS    32    /* 内部档位数 */
 
-int32_t volume_get(void);                       /* 读取当前音量 */
-void    volume_set(int32_t v);                  /* 设定音量 (内部钳制到 0~127, 并同步到蓝牙) */
-void    volume_inc(int32_t delta);              /* 音量增减 (delta 可为负) */
+int32_t volume_index_get(void);                 /* 当前档位 (0~31) */
+void    volume_set_index(int32_t idx);          /* 直接设定档位 (内部钳制到 0~31) */
+void    volume_inc(int32_t delta);              /* 档位增减 (delta 为档数, 一般为 ±1) */
 
-void    volume_load_from_nvs(void);             /* 开机从 NVS 读音量 */
+int32_t volume_get(void);                       /* 当前档位对应目标音量 (0/4/.../124), 供 UI 显示 */
+int32_t volume_get_hw(void);                    /* 当前档位对应硬件音量 (8 的倍数, 末档 127), 发蓝牙 */
+int32_t volume_get_gain(void);                  /* 当前档位对应软件增益 (%) 0~100 */
+void    volume_set_from_hw(int32_t hw);         /* 按耳机回传的绝对音量 (0~127) 映射到最近档位 */
+
+void    volume_load_from_nvs(void);             /* 开机从 NVS 恢复音量档位 */
 void    volume_save_to_nvs(void);               /* 音量变化后写回 NVS */
 
 /* ── 亮度 ── */

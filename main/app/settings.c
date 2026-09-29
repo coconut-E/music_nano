@@ -11,33 +11,100 @@
 
 static const char *TAG = "SETTINGS";
 
-/* ──────────────────────────── 音量 ──────────────────────────── */
-#define VOL_KEY    "volume"
+/* ──────────────────────── 软件音量调节 ────────────────────────
+ * 本优化主要面向低成本耳机/入门级音频设备。此类设备的音量调节级数通常约为 16 级，
+ * 且多数未采用对数/感知音量映射，导致低音量区段步进偏大、响度变化不够均匀。
+ *
+ * 取舍：
+ * 对于高品质耳机/音频设备，其通常具备更细的音量调节粒度、更优的音量控制策略
+ * 以及更符合感知特性的映射曲线。因此，本优化可能使其音量映射偏离理论最优，
+ * 引入轻微回退；但该差异在常规听音条件下通常没有明显差异。
+ *
+ * 本优化以牺牲少量高品质设备的音量映射最优性与调节细粒度，
+ * 换取整体设备（尤其是低成本设备）音量调节体验的一致性、感知线性度与可用性。 */
+/* ──────────────────────────── 音量 ────────────────────────────
+ * 内部 32 档, 每档 {目标音量, 硬件音量, 软件增益%}.
+ * 便宜耳机音量只按 8 步进(向下取整), 且低档跨得比高档大 —— 实测硬件幅度
+ * 大致 ∝ 档值² (每 +8 的 dB 跨度随档号递减). 故用软件增益把每对上下两跳
+ * 拉平: 配对上半档(目标 8k-4, 硬件 8k)的增益取该硬件跨度的一半,
+ *   g_k = (k-1)/k        (k = 硬件档序号, 硬件 = 8k)
+ * 例: 目标 12 → 硬件 16, 增益 1/2 = 50%; 目标 20 → 硬件 24, 增益 2/3 ≈ 66%.
+ * 目标 4 的下锚点是静音无法取中点, 取经验值 50%; 末档硬件钳到 AVRCP 上限 127.
+ * 增益只用整数百分比 (无 FPU). */
+#define VOL_KEY       "volume"    /* 旧键: 直接存 0~127 目标音量 (仅用于迁移) */
+#define VOL_IDX_KEY   "volidx"    /* 新键: 存档位 0~31 */
 
-static volatile int32_t s_volume = 64;          /* 当前音量 (0~127), 原子访问, 供多任务读取 */
-static int32_t          s_vol_last_saved = -1;  /* 上次成功写盘的音量, 用于去重避免频繁擦写 NVS */
+typedef struct {
+    int16_t target;   /* 目标/显示音量 (4 的倍数) */
+    int16_t hw;       /* 硬件音量 (8 的倍数, 末档钳到 127) */
+    uint8_t gain;     /* 软件增益百分比 (0~100) */
+} vol_step_t;
 
-/* 读取当前音量 (原子操作, 返回 0~127) */
-int32_t volume_get(void)
+static const vol_step_t VOL_TABLE[VOLUME_STEPS] = {
+    {  0,   0,   0}, {  4,   8,  50}, {  8,   8, 100}, { 12,  16,  50},
+    { 16,  16, 100}, { 20,  24,  66}, { 24,  24, 100}, { 28,  32,  75},
+    { 32,  32, 100}, { 36,  40,  80}, { 40,  40, 100}, { 44,  48,  83},
+    { 48,  48, 100}, { 52,  56,  85}, { 56,  56, 100}, { 60,  64,  87},
+    { 64,  64, 100}, { 68,  72,  88}, { 72,  72, 100}, { 76,  80,  90},
+    { 80,  80, 100}, { 84,  88,  90}, { 88,  88, 100}, { 92,  96,  91},
+    { 96,  96, 100}, {100, 104,  92}, {104, 104, 100}, {108, 112,  92},
+    {112, 112, 100}, {116, 120,  93}, {120, 120, 100}, {124, 127,  93},
+};
+
+static volatile int32_t s_vol_index = 16;            /* 当前档位 0~31 (默认 16 → 音量 64), 原子访问 */
+static int32_t          s_vol_idx_last_saved = -1;   /* 上次成功写盘的档位, 去重防磨损 */
+
+/* 档位钳制到 [0, VOLUME_STEPS-1] */
+static int32_t vol_clamp_index(int32_t idx)
 {
-    return atomic_load_i32(&s_volume);
+    if (idx < 0) return 0;
+    if (idx > VOLUME_STEPS - 1) return VOLUME_STEPS - 1;
+    return idx;
 }
 
-/* 设定音量: v=目标音量, 内部钳制到 [VOLUME_MIN, VOLUME_MAX] */
-void volume_set(int32_t v)
+int32_t volume_index_get(void)
 {
-    if (v < VOLUME_MIN) v = VOLUME_MIN;
-    if (v > VOLUME_MAX) v = VOLUME_MAX;
-    atomic_store_i32(&s_volume, v);
+    return atomic_load_i32(&s_vol_index);
 }
 
-/* 音量增减: delta=增减量 (可为负, 如按一下耳机+键传 +8) */
+void volume_set_index(int32_t idx)
+{
+    atomic_store_i32(&s_vol_index, vol_clamp_index(idx));
+}
+
+/* 档位增减: delta=档数 (可为负, 如按一下耳机+键传 +1) */
 void volume_inc(int32_t delta)
 {
-    volume_set(volume_get() + delta);
+    volume_set_index(volume_index_get() + delta);
 }
 
-/* 开机时从 NVS 恢复音量 (只读命名空间, 失败则保持默认 64) */
+/* 当前档位对应目标音量 (0/4/.../124), 供 UI 显示 */
+int32_t volume_get(void)
+{
+    return VOL_TABLE[vol_clamp_index(volume_index_get())].target;
+}
+
+/* 当前档位对应硬件音量 (8 的倍数, 末档 127), 发蓝牙 */
+int32_t volume_get_hw(void)
+{
+    return VOL_TABLE[vol_clamp_index(volume_index_get())].hw;
+}
+
+/* 当前档位对应软件增益 (%) 0~100 */
+int32_t volume_get_gain(void)
+{
+    return VOL_TABLE[vol_clamp_index(volume_index_get())].gain;
+}
+
+/* 耳机回传的绝对音量 (0~127) → 最近档位. 耳机只按 8 步进, hw/4 落在偶数档 (增益 100%) */
+void volume_set_from_hw(int32_t hw)
+{
+    if (hw < 0) hw = 0;
+    if (hw > VOLUME_MAX) hw = VOLUME_MAX;
+    volume_set_index(hw / 4);
+}
+
+/* 开机时从 NVS 恢复音量档位 (只读; 先新键, 再旧键迁移, 都失败保持默认 16) */
 void volume_load_from_nvs(void)
 {
     nvs_handle_t handle;
@@ -45,23 +112,33 @@ void volume_load_from_nvs(void)
         return;
     }
 
-    int32_t v = VOLUME_MIN;
-    esp_err_t ret = nvs_get_i32(handle, VOL_KEY, &v);   /* 读取, 失败时 v 保持初值 */
-    nvs_close(handle);
+    int32_t idx = -1;
+    esp_err_t ret = nvs_get_i32(handle, VOL_IDX_KEY, &idx);   /* 新键优先 */
+    if (ret == ESP_OK && idx >= 0 && idx < VOLUME_STEPS) {
+        nvs_close(handle);
+        atomic_store_i32(&s_vol_index, idx);
+        s_vol_idx_last_saved = idx;                        /* 标记已保存, 避免刚开机重复写盘 */
+        ESP_LOGI(TAG, "已从 NVS 恢复音量档位: %d (音量 %d)", idx, VOL_TABLE[idx].target);
+        return;
+    }
 
-    /* 值合法才采纳, 防止 NVS 里残留脏数据 */
+    /* 迁移旧键 (0~127 目标音量): 换算为档位 */
+    int32_t v = VOLUME_MIN;
+    ret = nvs_get_i32(handle, VOL_KEY, &v);
+    nvs_close(handle);
     if (ret == ESP_OK && v >= VOLUME_MIN && v <= VOLUME_MAX) {
-        atomic_store_i32(&s_volume, v);
-        s_vol_last_saved = v;                            /* 标记已保存, 避免刚开机就重复写盘 */
-        ESP_LOGI(TAG, "已从 NVS 恢复音量: %d", v);
+        idx = vol_clamp_index(v / 4);
+        atomic_store_i32(&s_vol_index, idx);
+        s_vol_idx_last_saved = -1;                         /* 触发下次写成新键 */
+        ESP_LOGI(TAG, "旧音量迁移: %d → 档位 %d (音量 %d)", v, idx, VOL_TABLE[idx].target);
     }
 }
 
-/* 把当前音量写回 NVS; 与上次保存值相同则跳过 (防磨损) */
+/* 把当前档位写回 NVS; 与上次保存值相同则跳过 (防磨损) */
 void volume_save_to_nvs(void)
 {
-    int32_t v = volume_get();
-    if (v == s_vol_last_saved) return;                   /* 值没变, 不写 flash */
+    int32_t idx = volume_index_get();
+    if (idx == s_vol_idx_last_saved) return;               /* 值没变, 不写 flash */
 
     nvs_handle_t handle;
     if (nvs_open(SETTINGS_NS, NVS_READWRITE, &handle) != ESP_OK) {
@@ -69,15 +146,15 @@ void volume_save_to_nvs(void)
         return;
     }
 
-    esp_err_t ret = nvs_set_i32(handle, VOL_KEY, v);     /* 暂存在缓存, 需 commit 才落盘 */
+    esp_err_t ret = nvs_set_i32(handle, VOL_IDX_KEY, idx);   /* 暂存在缓存, 需 commit 才落盘 */
     if (ret == ESP_OK) {
-        ret = nvs_commit(handle);                        /* 提交到 flash */
+        ret = nvs_commit(handle);                          /* 提交到 flash */
     }
     nvs_close(handle);
 
     if (ret == ESP_OK) {
-        s_vol_last_saved = v;
-        ESP_LOGI(TAG, "已保存音量: %d", v);
+        s_vol_idx_last_saved = idx;
+        ESP_LOGI(TAG, "已保存音量档位: %d (音量 %d)", idx, VOL_TABLE[idx].target);
     } else {
         ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
     }

@@ -19,7 +19,7 @@
 typedef struct {
     audio_decoder_t iface;
 
-    FILE     *file;          /* 文件句柄 */
+    audio_stream_t *in;      /* 输入流 (音频任务提供的预读流) */
     uint8_t  *inbuf;         /* PSRAM 原始输入缓冲 */
     bool      eof;           /* 是否已到文件尾 */
 
@@ -66,17 +66,17 @@ static void copy_info_text(const uint8_t *d, uint32_t len, char *out, size_t out
 /* 解析 LIST 块内的 INFO 子块 (INAM/IART/IPRD) */
 static void wav_parse_list_info(decoder_wav_t *d, uint32_t size)
 {
-    long start = ftell(d->file);   /* 记住 LIST 块数据起点 */
+    long start = d->in->tell(d->in);   /* 记住 LIST 块数据起点 */
     if (size < 4 || size > WAV_LIST_MAX) {   /* 尺寸异常直接跳过 */
-        fseek(d->file, start + (long)size + (size & 1), SEEK_SET);   /* +1 对齐 */
+        d->in->seek(d->in, start + (long)size + (size & 1), SEEK_SET);   /* +1 对齐 */
         return;
     }
     uint8_t *chunk = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);   /* 整块读入 PSRAM */
     if (!chunk) {
-        fseek(d->file, start + (long)size + (size & 1), SEEK_SET);
+        d->in->seek(d->in, start + (long)size + (size & 1), SEEK_SET);
         return;
     }
-    if (fread(chunk, 1, size, d->file) == size) {
+    if (d->in->read(d->in, chunk, size) == size) {
         uint32_t p = 0;
         while (p + 8 <= size) {   /* 遍历子块: 每个 = 4字节ID + 4字节长度 + 数据 */
             const uint8_t *h = chunk + p;
@@ -100,14 +100,14 @@ static void wav_parse_list_info(decoder_wav_t *d, uint32_t size)
         }
     }
     heap_caps_free(chunk);
-    fseek(d->file, start + (long)size + (size & 1), SEEK_SET);   /* 跳回 LIST 数据末尾 */
+    d->in->seek(d->in, start + (long)size + (size & 1), SEEK_SET);   /* 跳回 LIST 数据末尾 */
 }
 
 /* 释放上次残留资源 (防止重复 open 泄漏) */
 static void wav_free_state(decoder_wav_t *d)
 {
-    if (d->file) { fclose(d->file); d->file = NULL; }
     if (d->inbuf) { heap_caps_free(d->inbuf); d->inbuf = NULL; }
+    d->in = NULL;
     d->eof = false;
     d->data_pos = 0;
     d->data_start = 0;
@@ -115,23 +115,18 @@ static void wav_free_state(decoder_wav_t *d)
 }
 
 /* 打开 WAV 文件: 校验 RIFF/WAVE 头, 解析 fmt/data/LIST 块 */
-static bool wav_open(audio_decoder_t *iface, const char *path)
+static bool wav_open(audio_decoder_t *iface, const char *path, audio_stream_t *in)
 {
     decoder_wav_t *d = (decoder_wav_t *)iface;
+    (void)path;
     wav_free_state(d);
 
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    d->file = f;
-
-    {   /* 记录文件总大小 */
-        struct stat st;
-        if (stat(path, &st) == 0) d->file_size = (uint32_t)st.st_size;
-    }
+    d->in = in;
+    d->file_size = in->size(in);   /* 记录文件总大小 */
 
     /* RIFF 头: "RIFF" + size + "WAVE" */
     uint8_t h[12];
-    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
+    if (in->read(in, h, 12) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
         wav_free_state(d);
         return false;
     }
@@ -141,9 +136,9 @@ static bool wav_open(audio_decoder_t *iface, const char *path)
     /* 遍历各块直到 data 块 (最多 64 块防呆) */
     for (int guard = 0; guard < 64; guard++) {
         uint8_t ch[8];
-        if (fread(ch, 1, 8, f) != 8) break;   /* 块头 = 4字节ID + 4字节长度 */
+        if (d->in->read(d->in, ch, 8) != 8) break;   /* 块头 = 4字节ID + 4字节长度 */
         uint32_t size = le32(ch + 4);
-        uint32_t cur = (uint32_t)ftell(f);
+        uint32_t cur = (uint32_t)d->in->tell(d->in);
         uint32_t remain = (d->file_size > cur) ? d->file_size - cur : 0;
         if (size > remain) size = remain;   /* 防块长度越界文件 */
 
@@ -151,7 +146,7 @@ static bool wav_open(audio_decoder_t *iface, const char *path)
             if (size < 16) { wav_free_state(d); return false; }
             uint8_t fh[40] = {0};
             size_t to_read = size < 40 ? size : 40;   /* 只读前 40 字节 (含扩展头) */
-            if (fread(fh, 1, to_read, f) != to_read) { wav_free_state(d); return false; }
+            if (d->in->read(d->in, fh, to_read) != to_read) { wav_free_state(d); return false; }
             uint16_t afmt = le16(fh);               /* 编码格式: 1=PCM */
             d->channels = (uint8_t)le16(fh + 2);
             d->sample_rate = le32(fh + 4);
@@ -164,13 +159,13 @@ static bool wav_open(audio_decoder_t *iface, const char *path)
                 wav_free_state(d);
                 return false;
             }
-            if (size > to_read) fseek(f, (long)(size - to_read), SEEK_CUR);   /* 跳过剩余 */
+            if (size > to_read) d->in->seek(d->in, (long)(size - to_read), SEEK_CUR);   /* 跳过剩余 */
             have_fmt = true;
             continue;
         }
 
         if (!memcmp(ch, "data", 4)) {   /* 数据块: 记录偏移和大小 */
-            d->data_start = (uint32_t)ftell(f);
+            d->data_start = (uint32_t)d->in->tell(d->in);
             d->data_size = size;
             have_data = true;
             break;
@@ -181,7 +176,7 @@ static bool wav_open(audio_decoder_t *iface, const char *path)
             continue;
         }
 
-        fseek(f, (long)size + (size & 1), SEEK_CUR);   /* 跳过未知块 */
+        d->in->seek(d->in, (long)size + (size & 1), SEEK_CUR);   /* 跳过未知块 */
     }
 
     if (!have_fmt || !have_data) { wav_free_state(d); return false; }
@@ -207,7 +202,7 @@ static bool wav_open(audio_decoder_t *iface, const char *path)
 static bool wav_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *bytes)
 {
     decoder_wav_t *d = (decoder_wav_t *)iface;
-    if (!d->file || !d->inbuf) return false;
+    if (!d->in || !d->inbuf) return false;
 
     uint32_t frame_bytes = d->channels * (d->bits_per_sample / 8);
     if (frame_bytes == 0) { d->eof = true; return false; }
@@ -219,7 +214,7 @@ static bool wav_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *bytes
     if (raw > remain) raw = remain;                /* 最后一块只读剩余 */
     if (raw == 0) { d->eof = true; return false; }
 
-    size_t n = fread(d->inbuf, 1, raw, d->file);
+    size_t n = d->in->read(d->in, d->inbuf, raw);
     if (n == 0) { d->eof = true; return false; }
     d->data_pos += (uint32_t)n;
     uint32_t samples = (uint32_t)n / frame_bytes * d->channels;   /* 完整样本数 */
@@ -311,9 +306,9 @@ static uint32_t wav_get_position(audio_decoder_t *iface)
 static bool wav_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
     decoder_wav_t *d = (decoder_wav_t *)iface;
-    if (!d->file) return false;
+    if (!d->in) return false;
     if (byte_offset > d->data_size) byte_offset = d->data_size;   /* 钳制 */
-    if (fseek(d->file, (long)(d->data_start + byte_offset), SEEK_SET) != 0) return false;
+    if (!d->in->seek(d->in, (long)(d->data_start + byte_offset), SEEK_SET)) return false;
     d->data_pos = byte_offset;
     d->eof = false;
     return true;

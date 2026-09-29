@@ -38,11 +38,25 @@ extern volatile bool g_song_info_valid; /* 信息有效性标志 (先置字段�
  * out=输出; 返回 true=当前信息有效且已完整拷贝; 供 UI 单次一致读取, 避免撕裂 */
 bool song_info_snapshot(song_info_t *out);
 
+/* ──────────────────────── 输入字节流 ────────────────────────
+ * 由音频任务实现 (持文件句柄 + 20KB PSRAM 预读缓冲 + SD 读失败重试).
+ * 解码器不再直接碰 FILE*, 只通过本流顺序读取/定位:
+ *   read  返回实际读取字节数; 仅当文件真正到尾或持续读失败超过预算才返回 0.
+ *   seek  whence 支持 SEEK_SET/SEEK_CUR/SEEK_END, off 为相对该基准的字节偏移.
+ *   tell  返回逻辑读位置 (已交付给解码器的下一字节的文件偏移), 非底层预读位置.
+ *   size  返回文件总字节数. */
+typedef struct audio_stream_s {
+    size_t   (*read)(struct audio_stream_s *self, void *dst, size_t len);   /* 顺序读 */
+    bool     (*seek)(struct audio_stream_s *self, long off, int whence);    /* 定位 */
+    long     (*tell)(struct audio_stream_s *self);                          /* 逻辑读位置 */
+    uint32_t (*size)(struct audio_stream_s *self);                          /* 文件大小 */
+} audio_stream_t;
+
 /* ──────────────────────── 解码器抽象接口 ──────────────────────── */
 /* 所有解码器实现同一组函数指针, 音频任务不关心具体格式.
  * self=解码器对象 (各实现自定义结构, 首字段是本接口). */
 typedef struct audio_decoder_s {
-    bool      (*open)(struct audio_decoder_s *self, const char *path);  /* 打开文件: path=文件路径, 成功返回 true */
+    bool      (*open)(struct audio_decoder_s *self, const char *path, audio_stream_t *in);  /* 打开: path=路径, in=输入流; 成功返回 true */
     bool      (*decode)(struct audio_decoder_s *self, int16_t *pcm, size_t *bytes);  /* 解码一块: pcm=输出缓冲, bytes 输入容量/输出实际字节数 */
     bool      (*is_eof)(struct audio_decoder_s *self);                  /* 是否到达文件末尾 */
     void      (*close)(struct audio_decoder_s *self);                   /* 关闭并释放 */

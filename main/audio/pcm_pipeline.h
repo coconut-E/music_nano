@@ -30,12 +30,13 @@ bool pcm_pipeline_open(pcm_pipeline_t *p, uint32_t src_rate, uint8_t src_bits, u
 
 /*
  * 转换一块解码出的交错 PCM。
- * src: 交错样本起始, src_frames: 帧数(每帧含 src_ch 个样本)
+ * src: 交错样本起始 (会被原地施加软件增益, 需可写), src_frames: 帧数(每帧含 src_ch 个样本)
  * dst: 输出缓冲(>= 输出字节数), dst_cap_bytes: 输出缓冲容量
+ * gain_percent: 软件增益 0~100 (%) —— 独立一层, 上混后、重采样/直通前对所有路径生效
  * 返回: 实际写入 dst 的字节数
  */
-size_t pcm_pipeline_process(pcm_pipeline_t *p, const void *src, size_t src_frames,
-                            uint8_t *dst, size_t dst_cap_bytes);
+size_t pcm_pipeline_process(pcm_pipeline_t *p, void *src, size_t src_frames,
+                            uint8_t *dst, size_t dst_cap_bytes, uint8_t gain_percent);
 
 void pcm_pipeline_close(pcm_pipeline_t *p);
 void pcm_pipeline_free(pcm_pipeline_t *p);

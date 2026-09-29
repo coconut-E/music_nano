@@ -26,7 +26,7 @@
 #define APP_RC_CT_TL_RN_VOLUME_CHANGE  (1)   /* AVRCP 事务标签: 音量变化通知 */
 
 #define CACHE_MAX 16        /* 扫描缓存设备数上限 */
-#define VOL_STEP  4   /* 耳机音量±键一次步进 */
+#define VOL_STEP  1   /* 耳机音量±键一次步进 (1 档) */
 
 /* 连接后音量设置时序: 等 AVRC 连上 → 再等 VOL_SET_DELAY_MS → 发音量 → 放行 A2DP 流启动.
  * 静音机制已删除: 窗口期流不启动, 到点先发音量再启流.
@@ -99,7 +99,7 @@ static int           s_known_count = 0;
 
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;  /* 耳机端通知能力位图 */
 
-static int32_t s_last_sent_vol = -1; /* 已同步到耳机的音量, -1 表示未同步 */
+static int32_t s_last_sent_vol = -1; /* 已同步到耳机的硬件音量, -1 表示未同步 */
 
 static QueueHandle_t    s_dispatch_queue = NULL;  /* 协议栈事件分发队列 */
 static QueueSetHandle_t s_queue_set      = NULL;  /* 队列集 (命令+分发) */
@@ -270,9 +270,11 @@ static void bt_a2dp_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *ev
     switch (event_id) {
     case ESP_AVRC_RN_VOLUME_CHANGE: {
         ESP_LOGI(RC_TAG, "音量已变化: %d", event_parameter->volume);
-        /* 耳机端音量已生效, 同步全局并标记已同步, 避免 5Hz 轮询回环 */
-        volume_set(event_parameter->volume);
-        s_last_sent_vol = event_parameter->volume;
+        /* 耳机端音量已生效: 仅当与我方硬件音量不同才映射档位 (避免自发回环跳档) */
+        if (event_parameter->volume != volume_get_hw()) {
+            volume_set_from_hw(event_parameter->volume);
+        }
+        s_last_sent_vol = volume_get_hw();
         bt_a2dp_volume_changed();   /* 续约通知 */
         break;
     }
@@ -329,9 +331,11 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
     }
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT: {   /* 绝对音量设置应答 */
         ESP_LOGI(RC_TAG, "设置绝对音量响应: %d", rc->set_volume_rsp.volume);
-        /* 耳机确认后的实际音量(可能被钳位) */
-        volume_set(rc->set_volume_rsp.volume);
-        s_last_sent_vol = rc->set_volume_rsp.volume;
+        /* 耳机确认后的实际音量(可能被钳位): 不同才映射档位 */
+        if (rc->set_volume_rsp.volume != volume_get_hw()) {
+            volume_set_from_hw(rc->set_volume_rsp.volume);
+        }
+        s_last_sent_vol = volume_get_hw();
         break;
     }
     default:
@@ -384,7 +388,10 @@ static void bt_a2dp_hdl_avrc_tg_evt(uint16_t event, void *p_param)
         break;
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:   /* 耳机设定绝对音量 */
         ESP_LOGI(RC_TAG, "耳机绝对音量: %d", rc->set_abs_vol.volume);
-        volume_set(rc->set_abs_vol.volume);
+        if (rc->set_abs_vol.volume != volume_get_hw()) {
+            volume_set_from_hw(rc->set_abs_vol.volume);
+        }
+        s_last_sent_vol = volume_get_hw();   /* 耳机已生效, 回写硬件音量, 避免 5Hz 回环 */
         break;
     default:
         break;
@@ -787,7 +794,7 @@ static void bt_a2dp_hdl_stack_up(void)
 static void bt_sync_volume(void)
 {
     if (s_pending_vol) return;   /* 待设窗口内不推 */
-    int32_t v = volume_get();
+    int32_t v = volume_get_hw();   /* 发硬件音量 (8 的倍数) */
     if (v != s_last_sent_vol) {   /* 有变化才发送 */
         s_last_sent_vol = v;
         esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
@@ -906,7 +913,7 @@ static void bt_a2dp_task(void *arg)
                     bool fb = s_connect_at_us != 0 &&
                               (now - s_connect_at_us) >= VOL_WAIT_FALLBACK_MS * 1000LL;
                     if (ready || fb) {   /* 到点发音量, 放行流启动 */
-                        int32_t v = volume_get();
+                        int32_t v = volume_get_hw();
                         s_last_sent_vol = v;
                         esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
                         ESP_LOGI(RC_TAG, "AVRC就绪后 %dms 发音量 %d, 放行流媒体启动",
@@ -1079,7 +1086,7 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
     xQueueAddToSet(s_iface.cmd_queue, s_queue_set);
     xQueueAddToSet(s_dispatch_queue, s_queue_set);
 
-    if (xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, &s_task, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 4096, NULL, 1, &s_task, 0) != pdPASS) {
         return NULL;
     }
 

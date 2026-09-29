@@ -115,15 +115,30 @@ bool pcm_pipeline_open(pcm_pipeline_t *p, uint32_t src_rate, uint8_t src_bits, u
     return true;
 }
 
+/* 对交错 int16 PCM 原地施加整数百分比增益 (0~100), 一次连续扫描.
+ * 顺序访问, 对 PSRAM 友好; gain>=100 原样返回, gain<=0 直接静音. */
+static void pcm_apply_gain_inplace(int16_t *s, size_t count, int gain)
+{
+    if (!s || count == 0 || gain >= 100) return;
+    if (gain <= 0) {
+        memset(s, 0, count * sizeof(int16_t));
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        s[i] = (int16_t)(((int32_t)s[i] * gain) / 100);
+    }
+}
+
 /* 转换一块解码出的交错 PCM.
- * src=输入样本, src_frames=输入帧数, dst=输出缓冲, dst_cap_bytes=输出容量.
+ * src=输入样本 (原地施加软件增益), src_frames=输入帧数, dst=输出缓冲,
+ * dst_cap_bytes=输出容量, gain_percent=软件增益 (%).
  * 返回实际写入 dst 的字节数. */
-size_t pcm_pipeline_process(pcm_pipeline_t *p, const void *src, size_t src_frames,
-                            uint8_t *dst, size_t dst_cap_bytes)
+size_t pcm_pipeline_process(pcm_pipeline_t *p, void *src, size_t src_frames,
+                            uint8_t *dst, size_t dst_cap_bytes, uint8_t gain_percent)
 {
     if (!p || !p->active || !src || !dst) return 0;
 
-    const uint8_t *in = (const uint8_t *)src;
+    uint8_t *in = (uint8_t *)src;
 
     /* 1) mono -> stereo: 用 pcm_convert 做格式拷贝+上混 */
     if (p->need_upmix) {
@@ -132,6 +147,13 @@ size_t pcm_pipeline_process(pcm_pipeline_t *p, const void *src, size_t src_frame
                                  TARGET_BITS / 8, TARGET_CH,
                                  (uint32_t)src_frames);
         in = p->stereo_in;   /* 之后按立体声处理 */
+    }
+
+    /* 1.5) 软件音量层: 独立一层, 无论是否重采样都生效 (重采样层只在需重采样时走).
+     *      对输入块原地缩放 —— 一次连续大块扫描, PSRAM 友好, 不新占缓冲. */
+    uint8_t in_bps = p->need_upmix ? (TARGET_BITS / 8) : p->src_bps;
+    if (in_bps == 2 && gain_percent != 100) {
+        pcm_apply_gain_inplace((int16_t *)in, src_frames * TARGET_CH, gain_percent);
     }
 
     /* 2) 源速率 == 44100: 直接拷贝 (零开销) */

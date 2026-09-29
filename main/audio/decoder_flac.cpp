@@ -28,7 +28,7 @@ typedef struct {
 typedef struct {
     audio_decoder_t iface;
 
-    FILE                     *file;      /* 文件句柄 */
+    audio_stream_t           *in;        /* 输入流 (音频任务提供的预读流) */
     micro_flac::FLACDecoder  *flac;      /* micro-flac 解码器对象 */
     uint8_t                  *inbuf;     /* 压缩输入缓冲 */
     size_t                    in_off;    /* 缓冲内当前消费偏移 */
@@ -227,7 +227,6 @@ static void parse_seektable(const uint8_t *data, size_t len, decoder_flac_t *d)
 /* 释放上次残留资源 (防止重复 open 泄漏) */
 static void flac_free_state(decoder_flac_t *d)
 {
-    if (d->file) { fclose(d->file); d->file = NULL; }
     if (d->flac) { delete d->flac; d->flac = NULL; }
     if (d->inbuf) { heap_caps_free(d->inbuf); d->inbuf = NULL; }
     if (d->out32) { heap_caps_free(d->out32); d->out32 = NULL; }
@@ -252,7 +251,7 @@ static bool flac_parse_header(decoder_flac_t *d)
     int guard = 0;
     while (guard++ < 64) {   /* 最多 64 轮防呆 */
         if (d->in_len == 0) {
-            d->in_len = fread(d->inbuf, 1, FLAC_INPUT_CHUNK_SIZE, d->file);   /* 读入数据 */
+            d->in_len = d->in->read(d->in, d->inbuf, FLAC_INPUT_CHUNK_SIZE);   /* 读入数据 */
             if (d->in_len == 0) return false;
             d->in_off = 0;
         }
@@ -272,18 +271,17 @@ static bool flac_parse_header(decoder_flac_t *d)
 }
 
 /* 打开 FLAC: 解析头部/流信息/元数据, 分配解码与输出缓冲 */
-static bool flac_open(audio_decoder_t *iface, const char *path)
+static bool flac_open(audio_decoder_t *iface, const char *path, audio_stream_t *in)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
 
     flac_free_state(d);
 
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
+    d->in = in;
 
     d->inbuf = (uint8_t *)heap_caps_malloc(FLAC_INPUT_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
     if (!d->inbuf) {
-        fclose(f);
+        d->in = NULL;
         return false;
     }
 
@@ -291,7 +289,7 @@ static bool flac_open(audio_decoder_t *iface, const char *path)
     if (!flac) {
         heap_caps_free(d->inbuf);
         d->inbuf = NULL;
-        fclose(f);
+        d->in = NULL;
         return false;
     }
     /* 限制各类元数据块大小, 防止恶意超大块吃光内存 */
@@ -303,14 +301,10 @@ static bool flac_open(audio_decoder_t *iface, const char *path)
                                 FLAC_MAX_SEEKTABLE_SIZE);
     flac->set_crc_check_enabled(true);   /* 开启 CRC 校验, 损坏帧可检测 */
 
-    d->file = f;
     d->flac = flac;
     d->eof = false;
 
-    {   /* 记录文件大小 */
-        struct stat st;
-        if (stat(path, &st) == 0) d->file_size = (uint32_t)st.st_size;
-    }
+    d->file_size = in->size(in);   /* 记录文件大小 */
 
     if (!flac_parse_header(d)) {   /* 解析 STREAMINFO 等头部 */
         ESP_LOGW(FLAC_TAG, "打开失败 (无有效 FLAC 头): %s", path);
@@ -319,7 +313,7 @@ static bool flac_open(audio_decoder_t *iface, const char *path)
     }
     d->header_done = true;
     /* 头部已读完, 当前文件游标 - 缓冲内未消费字节 = 音频数据起点 */
-    d->audio_start = (uint32_t)(ftell(d->file) - (long)d->in_len);
+    d->audio_start = (uint32_t)((long)in->tell(in) - (long)d->in_len);
 
     /* 读取流信息 */
     const micro_flac::FLACStreamInfo &info = flac->get_stream_info();
@@ -376,7 +370,7 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
 
-    if (!d->file || !d->flac || !d->out32) return false;
+    if (!d->in || !d->flac || !d->out32) return false;
 
     /* 调用方经 *bytes 传入输出缓冲容量(字节), 据此限幅, 防止越界写 */
     size_t cap_samples = *bytes / sizeof(int16_t);
@@ -413,7 +407,7 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
 
         /* 解码新帧 */
         if (d->in_len == 0) {   /* 输入耗尽 → 读下一块 */
-            d->in_len = fread(d->inbuf, 1, FLAC_INPUT_CHUNK_SIZE, d->file);
+            d->in_len = d->in->read(d->in, d->inbuf, FLAC_INPUT_CHUNK_SIZE);
             if (d->in_len == 0) { d->eof = true; return false; }
             d->in_off = 0;
         }
@@ -434,7 +428,7 @@ static bool flac_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *byte
                 printf("[FLAC] 重同步完成: %" PRIu32 " 次尝试, 整块跳过 %" PRIu32
                        ", 耗时 %lld ms, 到偏移 %lld\n",
                        d->resync_iters, d->resync_skips, total / 1000,
-                       (long long)ftell(d->file));
+                       (long long)d->in->tell(d->in));
             }
             d->seek_resync = false;   /* 已同步到有效帧 */
             d->out_remaining = samples;
@@ -538,8 +532,8 @@ static uint32_t flac_get_file_size(audio_decoder_t *iface)
 static uint32_t flac_get_position(audio_decoder_t *iface)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
-    if (!d->file) return 0;
-    long pos = ftell(d->file);
+    if (!d->in) return 0;
+    long pos = d->in->tell(d->in);
     return pos > 0 ? (uint32_t)pos : 0;
 }
 
@@ -548,7 +542,7 @@ static uint32_t flac_get_position(audio_decoder_t *iface)
 static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
-    if (!d->file || !d->flac || d->total_samples == 0) return false;
+    if (!d->in || !d->flac || d->total_samples == 0) return false;
 
     /* 字节偏移 → 目标采样号 (按文件长度线性换算) */
     uint32_t fsz = d->file_size ? d->file_size : 1;
@@ -576,7 +570,7 @@ static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
     }
 
     if (found) {
-        if (fseek(d->file, (long)entry.offset, SEEK_SET) != 0) return false;
+        if (!d->in->seek(d->in, (long)entry.offset, SEEK_SET)) return false;
         /* 从 seekpoint 到目标的样本用 skip 丢弃 */
         d->skip_remaining = (target - entry.sample) * d->channels;
         d->seek_resync = false;
@@ -589,7 +583,7 @@ static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
     uint32_t pos = byte_offset;
     if (pos < d->audio_start) pos = d->audio_start;   /* 不能跳到音频区之前 */
     if (pos >= fsz) pos = fsz ? fsz - 1 : 0;
-    if (fseek(d->file, (long)pos, SEEK_SET) != 0) return false;
+    if (!d->in->seek(d->in, (long)pos, SEEK_SET)) return false;
 
     /* 跳过一整块 (以解码缓冲容量估算) 后再开始输出, 抹平定位误差 */
     d->skip_remaining = (uint64_t)(d->out_cap / (d->channels ? d->channels : 1)) * d->channels;

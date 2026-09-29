@@ -22,7 +22,7 @@
 typedef struct {
     audio_decoder_t iface;
 
-    FILE                  *file;       /* 文件句柄 */
+    audio_stream_t        *in;         /* 输入流 (音频任务提供的预读流) */
     micro_mp3::Mp3Decoder *mp3;        /* micro-mp3 解码器对象 */
     uint8_t               *inbuf;      /* 压缩输入缓冲 */
     size_t                 in_off;     /* 缓冲内当前消费偏移 */
@@ -59,14 +59,14 @@ static uint32_t be32(const uint8_t *p)
 /* 解析 ID3v2 标签: 提取标题/歌手/封面.
  * f=文件, off=输出 MP3 数据起始偏移, title_out/artist_out=输出缓冲,
  * cover_out=封面指针(PSRAM), cover_size_out=封面大小. */
-static void parse_id3v2(FILE *f, long *off,
+static void parse_id3v2(audio_stream_t *in, long *off,
                         char *title_out, size_t title_size,
                         char *artist_out, size_t artist_size,
                         uint8_t **cover_out, size_t *cover_size_out)
 {
     *off = 0;
     uint8_t h[10];
-    if(fread(h,1,10,f)!=10 || memcmp(h,"ID3",3)) { fseek(f,0,SEEK_SET); return; }   /* 非 ID3 头 */
+    if(in->read(in,h,10)!=10 || memcmp(h,"ID3",3)) { in->seek(in,0,SEEK_SET); return; }   /* 非 ID3 头 */
     /* ID3v2 头: [0..2]="ID3", [3]=主版本, [4]=修订号, [5]=标志, [6..9]=标签大小(同步安全整数).
      * 标志位: 0x80=非同步, 0x40=扩展头, 0x20=实验, 0x10=footer(仅 v2.4).
      * 注意标志在 h[5] 而非 h[4] (h[4] 是修订号). */
@@ -74,12 +74,12 @@ static void parse_id3v2(FILE *f, long *off,
     ESP_LOGI(MP3_TAG, "ID3v2.%u 标签, 大小 %" PRIu32, v, ts);
     uint32_t pos=10;   /* 当前标签内偏移 */
     while(pos<ts){
-        uint8_t fh[10]; if(fread(fh,1,10,f)!=10) break; pos+=10;   /* 帧头: ID + 大小 + 标志 */
-        if(fh[0]==0){fseek(f,-10,SEEK_CUR);break;}   /* 帧 ID 为空 = 标签结束 */
+        uint8_t fh[10]; if(in->read(in,fh,10)!=10) break; pos+=10;   /* 帧头: ID + 大小 + 标志 */
+        if(fh[0]==0){in->seek(in,-10,SEEK_CUR);break;}   /* 帧 ID 为空 = 标签结束 */
         uint32_t fs=(v>=4)?syncsafe(fh+4):be32(fh+4);   /* v2.4 用 syncsafe, 更早用普通大端 */
         if(fs>ts-pos)break;
         uint8_t *d=(uint8_t*)malloc(fs);
-        if(!d||fread(d,1,fs,f)!=fs){free(d);break;} pos+=fs;   /* 读帧数据 */
+        if(!d||in->read(in,d,fs)!=fs){free(d);break;} pos+=fs;   /* 读帧数据 */
         if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1){   /* 标题 (跳过首字节编码标志) */
             size_t n=(size_t)(fs-1); if(n>=title_size)n=title_size-1;
             if(title_out){memcpy(title_out,d+1,n);title_out[n]='\0';}
@@ -116,9 +116,10 @@ static void parse_id3v2(FILE *f, long *off,
 }
 
 /* 打开 MP3 文件: 解析 ID3, 创建解码器 */
-static bool mp3_open(audio_decoder_t *iface, const char *path)
+static bool mp3_open(audio_decoder_t *iface, const char *path, audio_stream_t *in)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    (void)path;
 
     /* 释放上次残留封面 (防止重复 open 泄漏) */
     if (d->cover_data) {
@@ -127,11 +128,10 @@ static bool mp3_open(audio_decoder_t *iface, const char *path)
         d->cover_size = 0;
     }
 
-    FILE *f = fopen(path, "rb");
-    if(!f) return false;
+    d->in = in;
 
     long off = 0;
-    parse_id3v2(f, &off, d->title, sizeof(d->title), d->artist, sizeof(d->artist),
+    parse_id3v2(in, &off, d->title, sizeof(d->title), d->artist, sizeof(d->artist),
                 &d->cover_data, &d->cover_size);   /* 先解析头部标签 */
 
     d->mp3 = new micro_mp3::Mp3Decoder();
@@ -140,25 +140,20 @@ static bool mp3_open(audio_decoder_t *iface, const char *path)
         if(d->mp3){delete d->mp3; d->mp3=NULL;}
         if(d->inbuf){heap_caps_free(d->inbuf); d->inbuf=NULL;}
         if(d->cover_data){heap_caps_free(d->cover_data); d->cover_data=NULL; d->cover_size=0;}
-        fclose(f);
+        d->in = NULL;
         return false;
     }
 
-    fseek(f, off, SEEK_SET);   /* 定位到 MP3 音频数据起始 */
-    d->file = f;
+    in->seek(in, off, SEEK_SET);   /* 定位到 MP3 音频数据起始 */
     d->eof  = false;
     d->info_done = false;
     d->in_off = 0;
     d->in_len = 0;
-    d->file_size = 0;
 
     {   /* 记录文件大小 */
-        struct stat st;
-        if(stat(path, &st)==0){
-            d->file_size = (uint32_t)st.st_size;
-            printf("[音频] 文件大小=%ld bytes, ID3偏移=%ld → MP3数据=%ld bytes\n",
-                   (long)st.st_size, off, (long)st.st_size - off);
-        }
+        d->file_size = in->size(in);
+        printf("[音频] 文件大小=%u bytes, ID3偏移=%ld → MP3数据=%u bytes\n",
+               (unsigned)d->file_size, off, (unsigned)(d->file_size - (uint32_t)off));
     }
 
     return true;
@@ -170,11 +165,11 @@ static bool mp3_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *bytes
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
 
-    if(!d->file || !d->mp3 || !d->inbuf) return false;
+    if(!d->in || !d->mp3 || !d->inbuf) return false;
 
     while(1){
         if(d->in_len == 0){   /* 缓冲耗尽 → 重新读入一块 */
-            d->in_len = fread(d->inbuf, 1, MP3_INPUT_CHUNK_SIZE, d->file);
+            d->in_len = d->in->read(d->in, d->inbuf, MP3_INPUT_CHUNK_SIZE);
             if(d->in_len == 0){ d->eof = true; return false; }
             d->in_off = 0;
         }
@@ -206,8 +201,8 @@ static bool mp3_decode_frame(audio_decoder_t *iface, int16_t *pcm, size_t *bytes
                     memmove(d->inbuf, d->inbuf + d->in_off, d->in_len);
                     d->in_off = 0;
                 }
-                size_t nread = fread(d->inbuf + d->in_len, 1,   /* 追加读入 */
-                                     MP3_INPUT_CHUNK_SIZE - d->in_len, d->file);
+                size_t nread = d->in->read(d->in, d->inbuf + d->in_len,   /* 追加读入 */
+                                     MP3_INPUT_CHUNK_SIZE - d->in_len);
                 if(nread == 0){ d->eof = true; return false; }
                 d->in_len += nread;
             }
@@ -234,10 +229,10 @@ static bool mp3_is_eof(audio_decoder_t *iface)
 static void mp3_close(audio_decoder_t *iface)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
-    if(d->file){ fclose(d->file); d->file = NULL; }
     if(d->mp3){ delete d->mp3; d->mp3 = NULL; }
     if(d->inbuf){ heap_caps_free(d->inbuf); d->inbuf = NULL; }
     if(d->cover_data){ heap_caps_free(d->cover_data); d->cover_data = NULL; d->cover_size = 0; }
+    d->in     = NULL;
     d->in_off = 0;
     d->in_len = 0;
     d->eof    = false;
@@ -274,8 +269,8 @@ static uint32_t mp3_get_file_size(audio_decoder_t *iface)
 static uint32_t mp3_get_position(audio_decoder_t *iface)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
-    if (!d->file) return 0;
-    long pos = ftell(d->file);
+    if (!d->in) return 0;
+    long pos = d->in->tell(d->in);
     return pos > 0 ? (uint32_t)pos : 0;
 }
 
@@ -283,9 +278,9 @@ static uint32_t mp3_get_position(audio_decoder_t *iface)
 static bool mp3_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
-    if(!d->file || !d->mp3) return false;
+    if(!d->in || !d->mp3) return false;
     if(byte_offset > d->file_size) byte_offset = d->file_size;
-    if(fseek(d->file, (long)byte_offset, SEEK_SET) != 0) return false;
+    if(!d->in->seek(d->in, (long)byte_offset, SEEK_SET)) return false;
     d->mp3->reset();   /* 解码器状态复位 */
     d->in_off = 0;
     d->in_len = 0;

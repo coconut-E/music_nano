@@ -80,6 +80,12 @@ bool sd_request_delete_file(const char *group, const char *name, int idx)
 
 static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
 static bool          s_mounted = false;  /* 是否已挂载 */
+static uint8_t      *s_dma_buf = NULL;   /* 持久 DMA bounce buffer (挂载时预置, 卸载时释放) */
+
+/* 预置 DMA 缓冲大小: 便宜耳机/UI 活动会把内部 RAM 挤碎, sdmmc 驱动每次读若临时
+ * 申请 DMA 缓冲就会失败 (allocate_dma_buf 0x101). 预置后驱动复用该缓冲, 不再逐次分配.
+ * 1KB = 2 个扇区/次; 有 20KB 预读, 吞吐无影响. */
+#define SD_DMA_BUF_SIZE 1024
 
 static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的音乐缓存指针 (用于释放) */
 static fs_cache_t   *s_fs_cache_retire = NULL;  /* 已下线待回收的旧音乐缓存 (交由 UI 任务释放) */
@@ -248,6 +254,13 @@ void sdmmc_disk_init(void)
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 
+    /* 预置持久 DMA 缓冲: 驱动读/写时复用它, 避免每次传输临时 malloc 失败 */
+    s_dma_buf = (uint8_t *)heap_caps_malloc(SD_DMA_BUF_SIZE, MALLOC_CAP_DMA);
+    if (!s_dma_buf) {
+        ESP_LOGW(TAG_SDMMC, "DMA 预读缓冲分配失败 (%d B), 回退逐次分配", SD_DMA_BUF_SIZE);
+    }
+    host.dma_aligned_buffer = s_dma_buf;
+
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1;                                /* 1bit 模式 */
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP; /* 使用内部上拉 */
@@ -263,6 +276,7 @@ void sdmmc_disk_init(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_SDMMC, "挂载失败 (%s)", esp_err_to_name(ret));
         atomic_store_bool(&g_sd_ready, false);
+        if (s_dma_buf) { heap_caps_free(s_dma_buf); s_dma_buf = NULL; }   /* 挂载失败: 释放预置缓冲 */
         if (s_event_cb) s_event_cb("mount_failed", s_event_ctx);
         return;
     }
@@ -330,6 +344,7 @@ void sdmmc_disk_deinit(void)
         ESP_LOGE(TAG_SDMMC, "卸载失败 (%s)", esp_err_to_name(ret));
     }
 
+    if (s_dma_buf) { heap_caps_free(s_dma_buf); s_dma_buf = NULL; }   /* 释放预置 DMA 缓冲 (驱动不负责) */
     s_card    = NULL;
     s_mounted = false;
     ESP_LOGI(TAG_SDMMC, "SD 卡已卸载");
@@ -483,5 +498,5 @@ static void sys_monitor_task(void *arg)
 void sys_monitor_init(void)
 {
     if (!s_sd_fs_mutex) s_sd_fs_mutex = xSemaphoreCreateMutex();   /* SD/FATFS 互斥 (须在任务及各 IO 之前建好) */
-    xTaskCreatePinnedToCore(sys_monitor_task, "sys_monitor", 8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(sys_monitor_task, "sys_monitor", 5120, NULL, 1, NULL, 1);
 }

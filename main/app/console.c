@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -131,6 +132,10 @@ static void cmd_free(void)
     uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL); /* 最大连续块 */
     printf("[RAM] 总空闲: %"PRIu32"KB  最大连续块: %"PRIu32"KB\n",
            total / 1024, largest / 1024);
+    uint32_t dma_total = heap_caps_get_free_size(MALLOC_CAP_DMA);           /* 可 DMA 内存空闲 */
+    uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA); /* 可 DMA 最大连续块 */
+    printf("[RAM] DMA 空闲: %"PRIu32"KB  最大连续块: %"PRIu32"KB\n",
+           dma_total / 1024, dma_largest / 1024);
 }
 
 /* psram 命令: 打印外部 PSRAM 空闲情况 */
@@ -211,13 +216,83 @@ static void cmd_backtrace_all(void)
     esp_backtrace_print_all_tasks(50);
 }
 
+/* 任务状态短名 */
+static const char *task_state_name(eTaskState st)
+{
+    switch (st) {
+        case eRunning:   return "Run";
+        case eReady:     return "Rdy";
+        case eBlocked:   return "Blk";
+        case eSuspended: return "Sus";
+        case eDeleted:   return "Del";
+        default:         return "?";
+    }
+}
+
+/* 任务核号显示: 未绑核(tskNO_AFFINITY)显示 any, 否则核心号 */
+static void task_core_str(const TaskStatus_t *t, char *buf, size_t n)
+{
+    if (t->xCoreID == tskNO_AFFINITY) snprintf(buf, n, "any");
+    else                              snprintf(buf, n, "%d", (int)t->xCoreID);
+}
+
+/* taskmem 命令: 查看各任务的"栈峰值余量".
+ * name==NULL 打印全部任务总览; 否则只打印该任务.
+ * 说明: 只读 FreeRTOS 任务快照的栈水位, 不挂起调度器, 零额外开销. */
+static void cmd_taskmem(const char *name)
+{
+    TaskHandle_t want = NULL;
+    if (name && name[0]) {
+        want = xTaskGetHandle(name);            /* 按名字查任务句柄 */
+        if (!want) {
+            printf("[taskmem] 未找到任务: %s\n", name);
+            return;
+        }
+    }
+
+    /* 任务快照: 名称/状态/优先级/核/栈峰值余量 */
+    UBaseType_t nt = uxTaskGetNumberOfTasks() + 2;
+    TaskStatus_t *snap = malloc(nt * sizeof(TaskStatus_t));
+    if (!snap) {
+        printf("[taskmem] 内存不足\n");
+        return;
+    }
+    uint32_t total = 0;
+    nt = uxTaskGetSystemState(snap, nt, &total);
+
+    if (!want) {
+        printf("\n[taskmem] 名称                 状态  优先   核  栈峰值余量\n");
+    }
+
+    for (UBaseType_t i = 0; i < nt; i++) {
+        if (want && snap[i].xHandle != want) continue;   /* 只要单个任务时跳过其它 */
+
+        const char *st = task_state_name(snap[i].eCurrentState);
+        char corebuf[16];
+        task_core_str(&snap[i], corebuf, sizeof(corebuf));
+
+        if (want) {
+            printf("\n[taskmem] %s: 状态=%s 优先=%u 核=%s 栈峰值余量=%u B\n",
+                   snap[i].pcTaskName, st, (unsigned)snap[i].uxCurrentPriority,
+                   corebuf, (unsigned)snap[i].usStackHighWaterMark);
+        } else {
+            printf("[taskmem] %-20s %-5s %4u %3s  %8u B\n",
+                   snap[i].pcTaskName, st, (unsigned)snap[i].uxCurrentPriority,
+                   corebuf, (unsigned)snap[i].usStackHighWaterMark);
+        }
+    }
+    printf("\n");
+
+    free(snap);
+}
+
 /* 控制台任务: 非阻塞读串口, 逐字符拼行, 回车后解析执行 */
 static void console_task(void *arg)
 {
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);   /* 设非阻塞读, 任务循环里轮询 */
 
     printf("\n=== 音乐播放器 ===\n");
-    printf("系统命令: stats | ram | psram | nvs | vbat | temp | bt [任务名]\n");
+    printf("系统命令: stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名]\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     //printf("命令> ");
 
@@ -250,6 +325,10 @@ static void console_task(void *arg)
                         cmd_backtrace_all();
                     } else if (strncmp(line, "bt ", 3) == 0) {   /* "bt <任务名>" */
                         cmd_backtrace(line + 3);
+                    } else if (strcmp(line, "taskmem") == 0) {
+                        cmd_taskmem(NULL);
+                    } else if (strncmp(line, "taskmem ", 8) == 0) {   /* "taskmem <任务名>" */
+                        cmd_taskmem(line + 8);
                     } else {
                         /* ── 应用命令 (封包后发到 app 队列, 由 UI 消费) ── */
                         app_cmd_t cmd;
@@ -309,5 +388,5 @@ void console_init(QueueHandle_t app_cmd_queue)
                                        pdTRUE, NULL, stats_timer_cb);   /* 自动重载定时器 */
     xTimerStart(timer, 0);
 
-    xTaskCreatePinnedToCore(console_task, "sys_serial", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(console_task, "sys_serial", 4096, NULL, 1, NULL, 1);
 }

@@ -180,7 +180,7 @@ static void mode_panel_create(void)
     lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(lbl, COLOR_FG, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(lbl, "随机/顺序到喜欢的\n单曲循环次数");
+    lv_label_set_text(lbl, "随机/顺序到喜欢的\n歌曲的单曲循环次数");
 
     /* － 数字 ＋ 步进器 */
     make_step_btn(s_panel, MINUS_X, LV_SYMBOL_MINUS, mode_minus_cb, &s_minus_btn);

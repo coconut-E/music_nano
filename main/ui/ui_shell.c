@@ -26,7 +26,7 @@ extern const lv_font_t lv_font_montserrat_14;
 #define PIN_VOL_UP     36
 #define PIN_VOL_DOWN   38
 #define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
-#define VOLUME_STEP    4                 /* 音量单步步进 */
+#define VOLUME_STEP    1                 /* 音量单步步进 (1 档) */
 #define BRIGHTNESS_STEP 8                /* 小说模式: 亮度单步步进 */
 #define VOL_KEY_POLL_MS 10               /* 轮询周期 10ms */
 #define VOL_LONGPRESS_MS 600             /* 长按判定: 超过此值进入重复模式 */
@@ -242,7 +242,7 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
                 lcd_set_brightness((uint8_t)b);   /* 立即写背光 (之前只改内存值, 屏幕不变) */
                 power_mgr_set_cur_bri((uint8_t)b);
             } else {
-                volume_inc(dir * VOLUME_STEP);
+                volume_inc(dir * VOLUME_STEP);   /* 每次 ±1 档, 实际值查表 */
             }
         }
     } else {
