@@ -865,10 +865,14 @@ static void bri_overlay_click_cb(lv_event_t *e)
 static void bri_open(void)
 {
     if (s_bri_expanded) return;
+    if (!s_bri_draw) return;
     s_bri_expanded = true;
 
     if (!s_bri_overlay) {
-        s_bri_overlay = lv_btn_create(lv_scr_act());
+        /* 遮罩挂到抽屉的同一父对象 (音乐组根容器), 而非屏幕.
+         * 否则遮罩会盖在抽屉之上, 吞掉滑块触摸 (点滑块即退出)。
+         * 同父后 bri_open 里的 move_foreground(s_bri_draw) 才能把面板压到遮罩之上。 */
+        s_bri_overlay = lv_btn_create(lv_obj_get_parent(s_bri_draw));
         lv_obj_set_pos(s_bri_overlay, 0, 0);
         lv_obj_set_size(s_bri_overlay, TFT_HOR_RES, TFT_VER_RES);
         lv_obj_set_style_bg_opa(s_bri_overlay, LV_OPA_TRANSP, 0);
@@ -930,6 +934,8 @@ static void bri_draw_create(void)
     lv_obj_set_style_shadow_width(panel, 0, 0);
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    /* 面板本身不接收点击: 点面板空白处穿透给下层透明遮罩 → 关闭抽屉 (仅滑块可操作) */
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
 
     /* 竖向亮度滑块 (高>宽自动竖排), range 1~255 */
     s_bri_slider = lv_slider_create(panel);

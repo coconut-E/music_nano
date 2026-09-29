@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $env:IDF_PATH           = "C:\Users\123\esp\v5.5.5\esp-idf"
 $env:IDF_PYTHON_ENV_PATH = "d:\espressif\python_env\idf5.5_py3.11_env"
@@ -36,6 +36,7 @@ if ($regenerate) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+# === 开始编译 ===
 Write-Host "=== 开始编译... ===" -ForegroundColor Cyan
 
 $err_count = 0

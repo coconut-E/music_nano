@@ -15,6 +15,7 @@
 #include "settings.h"
 #include "bt_a2dp.h"
 #include "ui_core.h"
+#include "mode_anim.h"
 #include "sys_monitor.h"
 #include "app_mode.h"
 #include "battery_low_img.h"
@@ -252,6 +253,9 @@ static void mode_switch_dark_done(lv_anim_t *a)
 {
     (void)a;
     if (s_switch_work) s_switch_work();
+    /* 纯黑下先把新界面同步刷入帧缓冲, 再淡入.
+     * 否则亮屏首帧仍显示旧画面, 会闪一下. */
+    lv_refr_now(NULL);
     screen_fade(brightness_get(), mode_switch_light_done);
 }
 
@@ -263,12 +267,25 @@ static void mode_switch_light_done(lv_anim_t *a)
     ui_touch_set_enabled(true);
 }
 
-/* 模式切换黑屏过渡入口 */
+/* 光圈动画结束回调 (非 lv_anim 版本) */
+static void mode_switch_finish(void)
+{
+    s_mode_switching = false;
+    ui_touch_set_enabled(true);
+}
+
+/* 模式切换黑屏过渡入口: 优先"光圈缩放"合成动画, 资源不足时降级为淡黑 */
 void power_mgr_mode_transition(void (*work)(void))
 {
     s_mode_switching = true;
     s_switch_work    = work;
-    ui_touch_set_enabled(false);   /* 黑屏期间关触摸, 避免误触 */
+    ui_touch_set_enabled(false);   /* 过渡期间关触摸, 避免误触 */
+
+    if (mode_anim_run(work, mode_switch_finish)) {
+        return;   /* 已由动画接管, 结束后回调 mode_switch_finish */
+    }
+
+    /* 降级: 背光淡出 → 切换 → 淡入 */
     screen_fade(0, mode_switch_dark_done);
 }
 

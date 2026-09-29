@@ -1,7 +1,10 @@
 #include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
 #include "esp_log.h"
 #include "nvs.h"
 #include "atomic_utils.h"
+#include "song_hash.h"
 #include "settings.h"
 
 #define SETTINGS_NS  "player"   /* NVS 统一命名空间, 所有设置都存这里 */
@@ -191,6 +194,114 @@ bool last_song_load(char *buf, size_t size)
 
     strncpy(s_last, buf, sizeof(s_last) - 1);   /* 同步内存缓存 */
     s_last[sizeof(s_last) - 1] = '\0';
+    return true;
+}
+
+/* ──────────────────────── 上次打开的小说 ──────────────────────── */
+#define LAST_NOVEL_KEY   "novel"   /* NVS key: 上次打开的小说路径 */
+
+static char s_last_novel[LAST_MAX] = {0};   /* 内存缓存, 用于去重 */
+
+/* 保存上次打开的小说路径到 NVS; path=小说真实路径 */
+void last_novel_save(const char *path)
+{
+    if (!path || !path[0]) return;
+    if (strcmp(s_last_novel, path) == 0) return;   /* 未变化不写 flash */
+
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_str(handle, LAST_NOVEL_KEY, path);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (ret == ESP_OK) {
+        strncpy(s_last_novel, path, sizeof(s_last_novel) - 1);
+        s_last_novel[sizeof(s_last_novel) - 1] = '\0';
+        ESP_LOGI(TAG, "已保存小说路径: %s", path);
+    } else {
+        ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
+    }
+}
+
+/* 读取上次打开的小说路径: 成功返回 true */
+bool last_novel_load(char *buf, size_t size)
+{
+    if (!buf || size == 0) return false;
+
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &handle) != ESP_OK) return false;
+
+    size_t len = size;
+    esp_err_t ret = nvs_get_str(handle, LAST_NOVEL_KEY, buf, &len);
+    nvs_close(handle);
+
+    if (ret != ESP_OK || len == 0 || buf[0] == '\0') return false;
+
+    strncpy(s_last_novel, buf, sizeof(s_last_novel) - 1);
+    s_last_novel[sizeof(s_last_novel) - 1] = '\0';
+    return true;
+}
+
+/* ─────────────────────── 小说阅读进度 ─────────────────────── */
+/* key = "np" + 8 位十六进制(文件名去扩展名后的 32 位哈希), 长度 10 < NVS 上限 15.
+ * 用文件名(而非完整路径)作键, 避免路径过长; 值 = 文件字节偏移 */
+
+/* 由 path 取文件名(去扩展名)算出进度 key, 写入 out (至少 16 字节) */
+static void novel_progress_key(const char *path, char *out, size_t out_size)
+{
+    const char *slash = strrchr(path, '/');
+    const char *fname = slash ? slash + 1 : path;
+
+    char name_key[160];                                  /* 去扩展名后的文件名 */
+    song_hash_name_key(fname, name_key, sizeof(name_key));
+    uint32_t h = song_hash32(name_key, strlen(name_key));
+
+    snprintf(out, out_size, "np%08" PRIx32, h);
+}
+
+/* 保存小说阅读进度: path=小说路径, offset=文件字节偏移 */
+void novel_progress_save(const char *path, uint32_t offset)
+{
+    if (!path || !path[0]) return;
+
+    char key[16];
+    novel_progress_key(path, key, sizeof(key));
+
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &handle) != ESP_OK) return;
+
+    esp_err_t ret = nvs_set_u32(handle, key, offset);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "已保存小说进度: %s -> %lu", path, (unsigned long)offset);
+    } else {
+        ESP_LOGW(TAG, "保存进度失败 (%s)", esp_err_to_name(ret));
+    }
+}
+
+/* 读取小说阅读进度, 成功返回 true 并输出 offset */
+bool novel_progress_load(const char *path, uint32_t *offset)
+{
+    if (!path || !path[0] || !offset) return false;
+
+    char key[16];
+    novel_progress_key(path, key, sizeof(key));
+
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &handle) != ESP_OK) return false;
+
+    uint32_t v = 0;
+    esp_err_t ret = nvs_get_u32(handle, key, &v);
+    nvs_close(handle);
+
+    if (ret != ESP_OK) return false;
+    *offset = v;
     return true;
 }
 

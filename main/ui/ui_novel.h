@@ -19,6 +19,9 @@ void ui_novel_open(const char *group, const char *name);
 /* SD 拔出: 关闭当前打开的小说文件 (不销毁 UI) */
 void ui_novel_on_sd_remove(void);
 
+/* SD 插入: 小说模式下恢复上次打开的小说 (非小说模式 no-op) */
+void ui_novel_on_sd_ready(void);
+
 /* 小说组是否处于活动状态 (已构建) */
 bool ui_novel_is_active(void);
 

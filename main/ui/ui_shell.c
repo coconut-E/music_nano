@@ -18,6 +18,7 @@
 #include "audio_task.h"
 #include "played_bits.h"
 #include "power_mgr.h"
+#include "drv_display.h"
 
 extern const lv_font_t lv_font_montserrat_14;
 
@@ -100,9 +101,28 @@ static void vol_popup_set_x(void *obj, int32_t x)
     lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)x);
 }
 
+/* 按当前模式同步弹窗量程/值/文本 (音乐=音量, 小说=亮度), 并记录基线值.
+ * 模式切换后必须调用, 避免弹出时仍显示另一模式的残留值/量程. */
+static void vol_popup_sync(void)
+{
+    if (!s_vol_bar || !s_vol_val) return;
+    if (app_mode_is_novel()) {
+        lv_bar_set_range(s_vol_bar, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+        lv_bar_set_value(s_vol_bar, brightness_get(), LV_ANIM_OFF);
+        lv_label_set_text_fmt(s_vol_val, "%" PRId32, (int32_t)brightness_get());
+        s_media_last = brightness_get();
+    } else {
+        lv_bar_set_range(s_vol_bar, VOLUME_MIN, VOLUME_MAX);
+        lv_bar_set_value(s_vol_bar, volume_get(), LV_ANIM_OFF);
+        lv_label_set_text_fmt(s_vol_val, "%" PRId32, volume_get());
+        s_media_last = volume_get();
+    }
+}
+
 /* 从屏外滑入, overshoot 过冲后回落目标位 */
 static void vol_popup_slide_in(void)
 {
+    vol_popup_sync();   /* 弹出前先恢复当前模式的值 */
     lv_anim_del(s_vol_cont, NULL);
     lv_obj_move_foreground(s_vol_cont);
     lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
@@ -219,6 +239,7 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
                 if (b < BRIGHTNESS_MIN) b = BRIGHTNESS_MIN;
                 if (b > BRIGHTNESS_MAX) b = BRIGHTNESS_MAX;
                 brightness_set((uint8_t)b);
+                lcd_set_brightness((uint8_t)b);   /* 立即写背光 (之前只改内存值, 屏幕不变) */
                 power_mgr_set_cur_bri((uint8_t)b);
             } else {
                 volume_inc(dir * VOLUME_STEP);
@@ -240,7 +261,7 @@ static void btn_key_poll_cb(lv_timer_t *timer)
     vol_key_poll_one(PIN_VOL_DOWN, -1, &s_vol_down);
 }
 
-/* ── SD 卡状态监视 (轮询定时器): 插卡加载/拔卡清理 ── */
+/* ── SD 卡状态监视 (20HZ轮询定时器): 插卡加载/拔卡清理 ── */
 static void fs_sd_monitor_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -266,6 +287,7 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
         fs_browser_on_sd_ready();
         played_bits_on_sd_ready();   /* 全量校验并载入各文件夹随机去重位图 */
         player_on_sd_ready();        /* 音乐模式: 恢复上次歌曲 (仅音乐模式生效) */
+        ui_novel_on_sd_ready();      /* 小说模式: 恢复上次打开的小说 (仅小说模式生效) */
     }
 
     last_ready = sd_ready;
@@ -289,6 +311,5 @@ void ui_shell_on_mode_changed(void)
     lv_obj_add_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
     s_vol_state = VOL_STATE_HIDDEN;
     s_vol_idle = 0;
-    /* 记录目标模式的当前值, 避免切换后立刻弹窗 */
-    s_media_last = app_mode_is_novel() ? brightness_get() : volume_get();
+    vol_popup_sync();   /* 同步为目标模式当前值 (含量程), 避免切换后立刻误弹/残留 */
 }

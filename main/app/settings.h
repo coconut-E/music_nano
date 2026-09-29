@@ -39,6 +39,14 @@ void    brightness_save_to_nvs(void);           /* 亮度变化后写回 NVS */
 void last_song_save(const char *path);          /* 保存上次播放曲目路径到 NVS */
 bool last_song_load(char *buf, size_t size);    /* 读取上次播放曲目, 成功返回 true; buf=输出缓冲, size=缓冲大小 */
 
+/* ── 上次打开的小说 ── */
+void last_novel_save(const char *path);         /* 保存上次打开的小说路径到 NVS */
+bool last_novel_load(char *buf, size_t size);   /* 读取上次打开的小说, 成功返回 true */
+
+/* ── 小说阅读进度 (按文件名去扩展名的 32 位哈希作 key, 值为文件字节偏移) ── */
+void novel_progress_save(const char *path, uint32_t offset);   /* 保存进度 (key 由 path 的文件名哈希得到) */
+bool novel_progress_load(const char *path, uint32_t *offset);  /* 读取进度, 成功返回 true; offset=输出偏移 */
+
 /* ── 播放模式 ── */
 typedef enum {
     PLAY_MODE_SEQUENTIAL = 0,   /* 顺序(到头回绕) */

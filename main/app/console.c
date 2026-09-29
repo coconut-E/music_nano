@@ -14,6 +14,7 @@
 #include "esp_debug_helpers.h"
 #include "esp_private/freertos_debug.h"
 #include "xtensa_context.h"
+#include "nvs.h"
 #include "app.h"
 #include "sys_monitor.h"
 
@@ -145,6 +146,23 @@ static void cmd_psram(void)
            total / 1024, largest / 1024);
 }
 
+/* nvs 命令: 打印 NVS 分区条目统计与剩余比例 */
+static void cmd_nvs(void)
+{
+    nvs_stats_t st;
+    esp_err_t err = nvs_get_stats(NULL, &st);   /* NULL = 默认 "nvs" 分区 */
+    if (err != ESP_OK) {
+        printf("[NVS] 查询失败: %s\n", esp_err_to_name(err));
+        return;
+    }
+    uint32_t pct = st.total_entries
+                 ? (uint32_t)((uint64_t)st.free_entries * 100 / st.total_entries) : 0;
+    printf("[NVS] 命名空间:%u  已用条目:%u  空闲条目:%u  可用条目:%u  总条目:%u  空闲:%"PRIu32"%%\n",
+           (unsigned)st.namespace_count, (unsigned)st.used_entries,
+           (unsigned)st.free_entries, (unsigned)st.available_entries,
+           (unsigned)st.total_entries, pct);
+}
+
 /* 打印指定 RTOS 任务的 backtrace (带任务名): name=任务名.
  * 阻塞/挂起任务: 用 TCB 保存的栈顶 pxTopOfStack (pc/a1/a0) 回溯其自身栈, 精确.
  * 正在运行的任务: 快照为最近一次被切出时的上下文 (略旧, 但栈内容仍在).
@@ -199,7 +217,7 @@ static void console_task(void *arg)
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);   /* 设非阻塞读, 任务循环里轮询 */
 
     printf("\n=== 音乐播放器 ===\n");
-    printf("系统命令: stats | ram | psram | vbat | temp | bt [任务名]\n");
+    printf("系统命令: stats | ram | psram | nvs | vbat | temp | bt [任务名]\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     //printf("命令> ");
 
@@ -226,6 +244,8 @@ static void console_task(void *arg)
                         printf("[CPU温度] %.1f C\n", t);
                     } else if (strcmp(line, "psram") == 0) {
                         cmd_psram();
+                    } else if (strcmp(line, "nvs") == 0) {
+                        cmd_nvs();
                     } else if (strcmp(line, "bt") == 0) {
                         cmd_backtrace_all();
                     } else if (strncmp(line, "bt ", 3) == 0) {   /* "bt <任务名>" */

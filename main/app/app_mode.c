@@ -82,6 +82,7 @@ static void app_mode_switch_work(void)
         fs_browser_close_panel();
         fs_browser_set_source(APP_MODE_MUSIC);
         player_show();
+        player_on_sd_ready();   /* 切回音乐: 恢复上次播放歌曲 (只加载不自动播放) */
 
         s_mode = APP_MODE_MUSIC;
     }
