@@ -89,6 +89,13 @@ static esp_bd_addr_t s_connect_bda;        /* 目标设备地址 */
 
 static char        s_connecting_name[32];  /* 连接中的设备名 */
 static char        s_connected_name[32];   /* 已连接的设备名 */
+static bool        s_auto_connected = false;  /* 本次连接是否为对端主动连入 (被动连接) */
+
+/* 已知设备名缓存 (BDA→名称): 扫描发现/连接成功时更新, 供被动连接显示名称 */
+#define KNOWN_NAME_MAX 8
+static esp_bd_addr_t s_known_bda[KNOWN_NAME_MAX];
+static char          s_known_name[KNOWN_NAME_MAX][32];
+static int           s_known_count = 0;
 
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;  /* 耳机端通知能力位图 */
 
@@ -98,6 +105,7 @@ static QueueHandle_t    s_dispatch_queue = NULL;  /* 协议栈事件分发队列
 static QueueSetHandle_t s_queue_set      = NULL;  /* 队列集 (命令+分发) */
 static TaskHandle_t     s_task           = NULL;  /* 蓝牙任务句柄 (模式切换挂起用) */
 static volatile bool    s_paused         = false; /* 是否处于挂起态 (小说模式) */
+static volatile bool    s_task_ready     = false; /* 蓝牙任务已完成初始化, 可安全挂起 */
 
 /* 蓝牙地址 → 可读字符串 "xx:xx:xx:xx:xx:xx". 返回 str 或 NULL */
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
@@ -156,6 +164,39 @@ static bool cache_add(esp_bd_addr_t bda, const char *device_name)
     s_cache_name[s_cache_count][clen] = '\0';
     s_cache_count++;
     return true;
+}
+
+/* ── 已知设备名缓存 (BDA→名称), 被动连接时用于显示名字 ── */
+static void known_name_put(const esp_bd_addr_t bda, const char *name)
+{
+    if (!name || !name[0]) return;
+    for (int i = 0; i < s_known_count; i++) {
+        if (memcmp(s_known_bda[i], bda, ESP_BD_ADDR_LEN) == 0) {
+            size_t n = strnlen(name, sizeof(s_known_name[0]) - 1);
+            memcpy(s_known_name[i], name, n);
+            s_known_name[i][n] = '\0';
+            return;
+        }
+    }
+    int idx = (s_known_count < KNOWN_NAME_MAX) ? s_known_count++ : 0;   /* 满则覆盖 slot0 */
+    memcpy(s_known_bda[idx], bda, ESP_BD_ADDR_LEN);
+    size_t n = strnlen(name, sizeof(s_known_name[0]) - 1);
+    memcpy(s_known_name[idx], name, n);
+    s_known_name[idx][n] = '\0';
+}
+
+static bool known_name_get(const esp_bd_addr_t bda, char *out, size_t size)
+{
+    if (!out || size == 0) return false;
+    for (int i = 0; i < s_known_count; i++) {
+        if (memcmp(s_known_bda[i], bda, ESP_BD_ADDR_LEN) == 0) {
+            size_t n = strnlen(s_known_name[i], size - 1);
+            memcpy(out, s_known_name[i], n);
+            out[n] = '\0';
+            return true;
+        }
+    }
+    return false;
 }
 
 /* 发送蓝牙事件给 UI: type=事件类型, name=相关设备名(可空), error=错误码 */
@@ -356,14 +397,6 @@ static uint64_t s_cb_total_bytes   = 0;   /* 编码器累计请求字节数 (诊
 static uint64_t s_cb_total_got     = 0;   /* 从 PCM 流累计实得字节数 (诊断; 差=欠载) */
 static int64_t  s_cb_last_print_us = 0;   /* 上次统计打印时刻 (限频) */
 
-/* 欠载诊断: pcm_stream 不够取时记录 (已禁用, 调试用) */
-#if 0
-extern volatile bool g_anim_active;
-static int64_t  s_cb_last_underrun_us = 0;
-static uint32_t s_cb_underrun_count   = 0;
-static uint32_t s_cb_underrun_empty   = 0;
-#endif
-
 /* A2DP 源数据回调 (BT 上下文): 从 PCM 流取 len 字节填入编码器缓冲, 不足补静音 */
 static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
 {
@@ -382,15 +415,6 @@ static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
     size_t got = xStreamBufferReceive(s_iface.pcm_stream, data, (size_t)len, 0);
     if (got < (size_t)len) {
         memset(data + got, 0, (size_t)len - got);   /* 补零 */
-#if 0
-        s_cb_underrun_count++;
-        int64_t now = esp_timer_get_time();
-        if ((now - s_cb_last_underrun_us) >= 50000LL) {
-            s_cb_last_underrun_us = now;
-            size_t avail = xStreamBufferBytesAvailable(s_iface.pcm_stream);
-            if (avail == 0) s_cb_underrun_empty++;
-        }
-#endif
     }
 
     s_cb_total_bytes += (uint64_t)len;
@@ -405,6 +429,21 @@ static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
     return len;
 }
 
+/* 结束连接流程: 清连接目标/重试状态, 停止仍在进行的连接扫描.
+ * 连接成功(含对端主动连入)、断开、或已连接时都要调用, 防止残留连接流程导致误报"连接失败" */
+static void bt_end_connect_flow(void)
+{
+    memset(s_connect_target, 0, sizeof(s_connect_target));
+    s_pending_connect_scan = false;
+    s_connect_found = false;
+    s_connect_retry = 0;
+    s_connecting = false;
+    s_connect_req_us = 0;
+    if (s_scanning) {
+        esp_bt_gap_cancel_discovery();
+    }
+}
+
 /* ── A2DP event handler ── */
 static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
 {
@@ -414,33 +453,54 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
     case ESP_A2D_CONNECTION_STATE_EVT: {   /* A2DP 连接状态 */
         if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             atomic_store_bool(&s_connected, true);
-            s_connecting = false;
-            s_connect_req_us = 0;   /* 连接成功, 清除超时计时 */
             s_stream_started = false;
             s_start_retry = false;
             memcpy(s_peer_bda, a2d->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+
+            /* 名字来源: 用户连接流程中的名字 → 已知缓存 → 待异步读远端名 */
+            if (s_connecting_name[0] != '\0') {
+                s_auto_connected = false;
+                strncpy(s_connected_name, s_connecting_name,
+                        sizeof(s_connected_name) - 1);   /* 连接中的名字转正 */
+                s_connected_name[sizeof(s_connected_name) - 1] = '\0';
+            } else if (known_name_get(s_peer_bda, s_connected_name, sizeof(s_connected_name))) {
+                s_auto_connected = true;   /* 无连接流程 = 对端主动连入, 名字取自缓存 */
+            } else {
+                s_auto_connected = true;
+                s_connected_name[0] = '\0';   /* 未知: 读远端名后刷新 */
+            }
+            if (s_connected_name[0] != '\0') {
+                known_name_put(s_peer_bda, s_connected_name);   /* 缓存供下次被动连接用 */
+            }
+            memset(s_connecting_name, 0, sizeof(s_connecting_name));
+
             /* 进入音量待设窗口: 等 AVRC 连上后再延迟发音量, 期间不启动流 */
             s_pending_vol = true;
             s_avrc_connected = false;
             s_avrc_at_us = 0;
             s_connect_at_us = esp_timer_get_time();
-            strncpy(s_connected_name, s_connecting_name,
-                    sizeof(s_connected_name) - 1);   /* 连接中的名字转正 */
-            s_connected_name[sizeof(s_connected_name) - 1] = '\0';
-            memset(s_connecting_name, 0, sizeof(s_connecting_name));
-            ESP_LOGI(BT_TAG, "A2DP 已连接");
+
+            bt_end_connect_flow();   /* 清连接流程/超时, 并停止仍在进行的连接扫描 */
+
+            ESP_LOGI(BT_TAG, "A2DP 已连接 (%s): %s",
+                     s_auto_connected ? "被动" : "主动",
+                     s_connected_name[0] ? s_connected_name : "(名未知)");
             send_evt(BT_EVT_CONNECTED, s_connected_name, 0);
+
+            if (s_connected_name[0] == '\0') {
+                esp_bt_gap_read_remote_name(s_peer_bda);   /* 异步读名, 结果刷新 UI */
+            }
         } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             /* 断开: 清所有连接状态 */
             atomic_store_bool(&s_connected, false);
-            s_connecting = false;
-            s_connect_req_us = 0;   /* 断开, 清除超时计时 */
+            s_auto_connected = false;
             s_stream_started = false;
             s_start_retry = false;
             s_pending_vol = false;
             s_avrc_connected = false;
             s_avrc_at_us = 0;
             s_connect_at_us = 0;
+            bt_end_connect_flow();   /* 清连接流程/停扫描 */
             memset(s_connected_name, 0, sizeof(s_connected_name));
             memset(s_connecting_name, 0, sizeof(s_connecting_name));
             ESP_LOGI(BT_TAG, "A2DP 已断开连接");
@@ -490,6 +550,7 @@ static void bt_a2dp_hdl_gap_evt(uint16_t event, void *p_param)
 
         bda2str(d->bda, bda_str, sizeof(bda_str));
         ESP_LOGI(BT_TAG, "扫描到设备: %s, 名称 %s", bda_str, d->name);
+        known_name_put(d->bda, d->name);   /* 记住名字, 供对端主动连接时显示 */
 
         if (s_connect_target[0] != '\0') {   /* 连接模式: 匹配目标名 */
             if (strcmp(d->name, s_connect_target) == 0) {
@@ -511,7 +572,9 @@ static void bt_a2dp_hdl_gap_evt(uint16_t event, void *p_param)
             s_scanning = false;
 
             if (s_connect_target[0] != '\0') {   /* 连接扫描结束 */
-                if (s_connect_found) {
+                if (s_connected) {   /* 已连接(可能对端主动连入): 连接流程作废, 不再重试/报错 */
+                    bt_end_connect_flow();
+                } else if (s_connect_found) {
                     ESP_LOGI(BT_TAG, "找到目标设备 %s，开始连接", s_connect_target);
                     memcpy(s_peer_bda, s_connect_bda, ESP_BD_ADDR_LEN);
                     esp_a2d_source_connect(s_peer_bda);   /* 发起 A2DP 连接 */
@@ -544,6 +607,19 @@ static void bt_a2dp_hdl_gap_evt(uint16_t event, void *p_param)
         } else if (state == ESP_BT_GAP_DISCOVERY_STARTED) {
             s_scanning = true;
             ESP_LOGI(BT_TAG, "设备搜索已开始。");
+        }
+        break;
+    }
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT: {   /* 远端名读取结果 (被动连接补名字) */
+        gap_disc_t *d = (gap_disc_t *)p_param;
+        if (!d) break;
+        known_name_put(d->bda, d->name);
+        ESP_LOGI(BT_TAG, "读取远端名: %s -> %s",
+                 bda2str(d->bda, bda_str, sizeof(bda_str)), d->name);
+        if (s_connected && memcmp(d->bda, s_peer_bda, ESP_BD_ADDR_LEN) == 0) {
+            strncpy(s_connected_name, d->name, sizeof(s_connected_name) - 1);
+            s_connected_name[sizeof(s_connected_name) - 1] = '\0';
+            send_state_rsp();   /* 刷新 UI 卡片名称 */
         }
         break;
     }
@@ -592,6 +668,19 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {   /* 编组扫描状态变化 */
         uint32_t state = (uint32_t)param->disc_st_chg.state;
         bt_a2dp_send_dispatch(BT_DISPATCH_GAP, event, &state, sizeof(state));
+        break;
+    }
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT: {   /* 远端名读取结果 → 投递 (补被动连接的名字) */
+        if (param->read_rmt_name.stat != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGW(BT_TAG, "读远端名失败: stat %d", param->read_rmt_name.stat);
+            break;
+        }
+        gap_disc_t d;
+        memcpy(d.bda, param->read_rmt_name.bda, ESP_BD_ADDR_LEN);
+        size_t nlen = strnlen((const char *)param->read_rmt_name.rmt_name, sizeof(d.name) - 1);
+        memcpy(d.name, param->read_rmt_name.rmt_name, nlen);
+        d.name[nlen] = '\0';
+        bt_a2dp_send_dispatch(BT_DISPATCH_GAP, event, &d, sizeof(d));
         break;
     }
     case ESP_BT_GAP_AUTH_CMPL_EVT:   /* 认证完成 (仅日志, 无共享状态) */
@@ -683,7 +772,9 @@ static void bt_a2dp_hdl_stack_up(void)
     esp_a2d_register_callback(&bt_a2dp_a2d_cb);
     esp_a2d_source_register_data_callback(bt_a2dp_data_cb);   /* PCM 数据回调 */
 
-    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);   /* 初始不可被发现 */
+    /* 音乐模式默认可连接(仍不可被发现): 允许已配对耳机主动连入;
+     * 小说模式由 bt_a2dp_pause() 关回不可连接 */
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
     atomic_store_bool(&s_bt_ready, true);
     ESP_LOGI(BT_TAG, "蓝牙初始化完成"); 
@@ -778,6 +869,8 @@ static void bt_a2dp_task(void *arg)
 
     /* 接口句柄(队列/流/分发)已在 bt_a2dp_init 同步创建, 此处只做协议栈启动 */
     bt_a2dp_hdl_stack_up();
+
+    s_task_ready = true;   /* 初始化(含 PHY/NVS)已完成: 允许模式切换时安全挂起 */
 
     bt_cmd_t          cmd;
     bt_dispatch_msg_t disp;
@@ -978,7 +1071,8 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
     }
 
     s_dispatch_queue = xQueueCreate(32, sizeof(bt_dispatch_msg_t));  /* 内部事件分发 (扫描期 DISC_RES 较多, 留足深度) */
-    s_queue_set      = xQueueCreateSet(16);                          /* 队列集 */
+    /* 队列集长度必须 >= 成员队列长度之和 (cmd 10 + dispatch 32), 否则会触发断言 */
+    s_queue_set      = xQueueCreateSet(48);                          /* 队列集 */
     if (!s_dispatch_queue || !s_queue_set) {
         return NULL;
     }
@@ -1020,13 +1114,25 @@ void bt_a2dp_pause(void)
             esp_a2d_source_disconnect(s_peer_bda);         /* 主动断开 (完成事件留待恢复后处理) */
         }
         s_connecting = false;
+        /* 小说模式: 关闭可连接(停 page scan), 耳机无法回连 (否则切换中会事件堆积) */
+        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     }
-    if (s_task) vTaskSuspend(s_task);
+    if (!s_task) return;
+    /* 等初始化完成再挂: 初始化中途会持 NVS/flash 锁, 直接挂起会死锁其它任务 (如 lvgl) */
+    for (int i = 0; i < 200 && !s_task_ready; i++) {   /* 最多等 ~1s */
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (!s_task_ready) return;   /* 未就绪则不挂起 (仅置 s_paused), 避免挂死持锁任务 */
+    vTaskSuspend(s_task);
 }
 
 /* 恢复蓝牙任务 (模式切回音乐) */
 void bt_a2dp_resume(void)
 {
     s_paused = false;
+    if (atomic_load_bool(&s_bt_ready)) {
+        /* 音乐模式: 恢复可连接(仍不可被发现), 允许耳机主动回连 */
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    }
     if (s_task) vTaskResume(s_task);
 }

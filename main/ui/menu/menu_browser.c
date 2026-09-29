@@ -6,6 +6,7 @@
 #include "sys_monitor.h"
 #include "ui_res.h"
 #include "ui_player.h"
+#include "ui_novel.h"
 #include "song_hash.h"
 #include "likes.h"
 #include "menu.h"
@@ -94,13 +95,28 @@ static const char *fs_root_title(void)
     return (s_fs_src == 1) ? "Novel Files" : "Music Files";
 }
 
+/* 在缓存中查找 group 下 name 的顺序号 (含目录项, 与列表顺序一致); 未找到返回 -1 */
+static int fs_cache_index_of(fs_cache_t *cache, const char *group, const char *name)
+{
+    if (!cache || !group || !name) return -1;
+    int seen = 0;
+    for (int i = 0; i < cache->count; i++) {
+        fs_entry_t *e = &cache->entries[i];
+        if (strcmp(e->group, group) != 0) continue;
+        if (strcmp(e->name, name) == 0) return seen;
+        seen++;
+    }
+    return -1;
+}
+
 static void fs_browser_create(void);
 static void fs_browser_open(void);
 static void fs_browser_close(void);
 static void fs_browser_update(void);
-static void fs_browser_rebuild(const char *group, int page);
+static void fs_browser_rebuild(const char *group, int page, const char *name);
 static void fs_browser_move_highlight(const char *name);
 static void fs_browser_show_page(int page);
+static void fs_browser_scroll_to_row(const char *name);
 static void fs_browser_enter_dir(const char *parent_group, const char *name);
 static void fs_browser_go_back(void);
 
@@ -368,10 +384,31 @@ static void fs_browser_show_page(int page)
         lv_obj_add_flag(s_fs_rows[i], LV_OBJ_FLAG_HIDDEN);
     }
 
+    /* 重建列表后把滚动归零: 避免残留旧目录/旧内容的滚动量 (拔卡时尤其明显),
+     * 否则视口会落在内容范围之外 → 列表显示空白, 滑动后被钳制到最底端.
+     * 需要保留滚动量的调用方 (refresh) 在返回后自行恢复. */
+    lv_obj_scroll_to_y(s_fs_list, 0, LV_ANIM_OFF);
+
     printf("[FS] show_page page=%d total=%d rows=%d(created %d) scan=%.2fms build=%.2fms\n",
            page, total, need, created, t_scan / 1000.0f,
            (esp_timer_get_time() - t0 - t_scan) / 1000.0f);
     fs_built_record(page);
+}
+
+/* 滚动到指定文件名所在行 (不高亮); name 为空则不动作 */
+static void fs_browser_scroll_to_row(const char *name)
+{
+    if (!name || !name[0] || !s_fs_list) return;
+    lv_obj_update_layout(s_fs_list);
+    for (int i = 0; i < s_fs_row_cnt; i++) {
+        lv_obj_t *btn = s_fs_rows[i];
+        if (lv_obj_has_flag(btn, LV_OBJ_FLAG_HIDDEN)) continue;
+        fs_entry_t *e = (fs_entry_t *)lv_obj_get_user_data(btn);
+        if (e && !e->is_dir && strcmp(e->name, name) == 0) {
+            lv_obj_scroll_to_view(btn, LV_ANIM_OFF);
+            break;
+        }
+    }
 }
 
 /* 上一页 */
@@ -650,17 +687,20 @@ static void fs_browser_create(void)
     fs_browser_precreate_step(0);
 }
 
-/* 重建到指定 group/page: 设标题 → 重绘本页 → 滚动到高亮行 */
-static void fs_browser_rebuild(const char *group, int page)
+/* 重建到指定 group/page: 设标题 → 重绘本页 → 定位到目标行
+ * 音乐: 滚动到当前播放歌曲 (带高亮); 小说: 滚动到当前打开文件 (不高亮) */
+static void fs_browser_rebuild(const char *group, int page, const char *name)
 {
     fs_set_group(group);
     s_fs_inside = (strcmp(group, fs_root_group()) != 0);
     lv_label_set_text(s_fs_title, fs_group_display_name(group));
     fs_browser_show_page(page);
 
-    /* 滚动到可见区域, 让高亮的当前歌曲行显示出来 */
     if (s_fs_current_btn) {
+        lv_obj_update_layout(s_fs_list);
         lv_obj_scroll_to_view(s_fs_current_btn, LV_ANIM_OFF);
+    } else if (s_fs_src == 1) {
+        fs_browser_scroll_to_row(name);
     }
 }
 
@@ -689,31 +729,41 @@ static void fs_browser_move_highlight(const char *name)
 }
 
 /* 打开时按需更新:
- *  (a) 目标与已构建状态完全一致 → 什么都不做;
- *  (b) 同组同页, 仅当前歌曲变了 → 只搬高亮;
+ *  (a) 目标与已构建状态完全一致 → 音乐什么都不做; 小说仍滚到当前文件;
+ *  (b) 同组同页(音乐), 仅当前歌曲变了 → 只搬高亮;
  *  (c) 其余 (换目录/换页/首次) → 重建。 */
 static void fs_browser_update(void)
 {
     const char *group;
     const char *name = NULL;
     int  page = 0;
+    char novel_group[FS_GROUP_MAX];
+    char novel_name[FS_NAME_MAX];
 
     if (s_fs_src == 1) {
-        /* 小说库: 每次打开都从根目录开始 */
-        group = fs_root_group();
+        /* 小说库: 定位到当前打开小说所在目录 (缓存中找不到则回退根目录) */
+        fs_cache_t *cache = g_novel_cache;
+        int pos = -1;
+        if (ui_novel_current(novel_group, sizeof(novel_group), novel_name, sizeof(novel_name))
+            && cache) {
+            pos = fs_cache_index_of(cache, novel_group, novel_name);
+        }
+        if (pos >= 0) {
+            group = novel_group;
+            name  = novel_name;
+            page  = pos / FS_ITEMS;
+        } else {
+            group = fs_root_group();
+            name  = NULL;
+            page  = 0;
+        }
     } else {
         group = player_current_group();
         name  = player_current_name();
         fs_cache_t *cache = fs_cache_active();
         if (group && name && cache) {
             /* 在组内找到当前歌曲序号 → 页码 (含目录项, 与列表顺序一致) */
-            int pos = -1, seen = 0;
-            for (int i = 0; i < cache->count; i++) {
-                fs_entry_t *e = &cache->entries[i];
-                if (strcmp(e->group, group) != 0) continue;
-                if (strcmp(e->name, name) == 0) { pos = seen; break; }
-                seen++;
-            }
+            int pos = fs_cache_index_of(cache, group, name);
             page = (pos >= 0) ? (pos / FS_ITEMS) : 0;   /* 未找到也停在该组首页 */
         } else {   /* 无当前歌曲: 根目录 */
             group = fs_root_group();
@@ -728,9 +778,10 @@ static void fs_browser_update(void)
 
     if (same_page && strcmp(s_fs_built_name, bn) == 0) {
         printf("[FS] open update: skip (unchanged)\n");   /* (a) */
+        if (s_fs_src == 1) fs_browser_scroll_to_row(name);  /* 小说每次打开都滚到当前文件 */
         return;
     }
-    if (same_page) {
+    if (same_page && s_fs_src == 0) {
         printf("[FS] open update: highlight only\n");     /* (b) */
         fs_browser_move_highlight(name);
         size_t nl = strnlen(bn, sizeof(s_fs_built_name) - 1);
@@ -740,7 +791,7 @@ static void fs_browser_update(void)
     }
 
     printf("[FS] open update: rebuild\n");                /* (c) */
-    fs_browser_rebuild(group, page);
+    fs_browser_rebuild(group, page, name);
 }
 
 /* 实际打开浏览器 (open_real): 确保控件存在 → 按需更新 → 显示 */
@@ -749,13 +800,15 @@ static void fs_browser_open(void)
     int64_t t0 = esp_timer_get_time();
     fs_browser_create();
     int64_t t1 = esp_timer_get_time();
-    fs_browser_update();
-    int64_t t2 = esp_timer_get_time();
 
-    /* 置顶: 保证盖在音乐/小说根容器之上 */
+    /* 先置顶并显示: 让布局立即生效, 之后的滚动定位 (scroll_to_view) 才准确.
+     * 否则在隐藏状态下定位, 坐标未更新, 可能把列表滚到错误位置. */
     lv_obj_move_foreground(s_fs_overlay);
     lv_obj_clear_flag(s_fs_overlay, LV_OBJ_FLAG_HIDDEN);
     s_fs_visible = true;
+
+    fs_browser_update();
+    int64_t t2 = esp_timer_get_time();
 
     fs_cache_t *cache = fs_cache_active();
     printf("[FS] open create=%.2fms update=%.2fms cache_count=%d\n",
@@ -791,7 +844,9 @@ void fs_browser_likes_changed(void)
 {
     s_fs_built_valid = false;
     if (s_fs_visible) {
+        lv_coord_t scroll_y = lv_obj_get_scroll_y(s_fs_list);   /* 仅图标变化: 保留滚动位置 */
         fs_browser_show_page(s_fs_page);
+        lv_obj_scroll_to_y(s_fs_list, scroll_y, LV_ANIM_OFF);
     }
 }
 

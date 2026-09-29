@@ -295,6 +295,12 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
 
 void ui_shell_init(void)
 {
+    /* 关闭屏幕自身滚动条/滚动: 音量/亮度弹窗会滑到屏外 (x=TFT_HOR_RES),
+     * 若屏幕可滚动会撑大内容从而在底部冒出水平滚动条. 原先只在音乐 player_build
+     * 里做, 直接启动小说模式走不到, 故提到公共初始化 (与模式无关). */
+    lv_obj_set_scrollbar_mode(lv_scr_act(), LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
+
     gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
     gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
 

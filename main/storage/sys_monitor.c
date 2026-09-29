@@ -56,7 +56,7 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 volatile bool  g_sd_ready = false;      /* SD 卡就绪标志 */
 volatile float g_vbat     = 0.0f;       /* 电池电压 (V) */
 volatile float g_cpu_temp = 0.0f;       /* CPU 温度 (C) */
-volatile bool  g_sd_manual_rescan = false;  /* 手动重扫标志 */
+volatile int8_t g_sd_manual_rescan = 0;    /* 手动重扫目标 (SD_RESCAN_*) */
 fs_cache_t     *g_fs_cache     = NULL;      /* 音乐文件缓存指针 (PSRAM) */
 fs_cache_t     *g_novel_cache  = NULL;      /* 小说文件缓存指针 (PSRAM) */
 
@@ -438,12 +438,13 @@ static void sys_monitor_task(void *arg)
             s_del_req = false;
         }
 
-        /* 手动重扫: 模拟拔卡→插卡流程 */
-        if (g_sd_manual_rescan) {
-            g_sd_manual_rescan = false;
-            ESP_LOGI(TAG_DETECT, "手动触发重新扫描");
-            g_music_scan_force = true;               /* 强制音乐全量重扫 */
-            g_novel_scan_force = true;               /* 强制小说全量重扫 */
+        /* 手动重扫: 模拟拔卡→插卡流程, 只对目标根置强制全量扫描标志 */
+        if (g_sd_manual_rescan != 0) {
+            int8_t what = g_sd_manual_rescan;
+            g_sd_manual_rescan = 0;
+            ESP_LOGI(TAG_DETECT, "手动触发重新扫描 (target=%d)", (int)what);
+            if (what == SD_RESCAN_ALL || what == SD_RESCAN_MUSIC) g_music_scan_force = true;
+            if (what == SD_RESCAN_ALL || what == SD_RESCAN_NOVEL) g_novel_scan_force = true;
             sdmmc_disk_deinit();
             vTaskDelay(pdMS_TO_TICKS(500));
             sdmmc_disk_init();

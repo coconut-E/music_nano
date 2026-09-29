@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "atomic_utils.h"
 
@@ -40,8 +41,15 @@ void sdmmc_disk_init(void);             /* 初始化 SD 卡 (探测+挂载) */
 void sdmmc_disk_deinit(void);           /* 卸载 SD 卡 */
 bool sdmmc_disk_is_mounted(void);       /* 查询 SD 卡是否已挂载 */
 
-/* 手动触发重新扫描: 置位后由 sys_monitor 任务模拟"拔卡→插卡"走现有流程 */
-extern volatile bool g_sd_manual_rescan;
+/* 手动触发重新扫描: 写入目标后由 sys_monitor 任务模拟"拔卡→插卡"走现有流程.
+ * 只对目标根置强制全量扫描标志, 其余根仍走"空间阈值内用缓存", 避免白扫. */
+enum {
+    SD_RESCAN_NONE  =  0,   /* 无请求 */
+    SD_RESCAN_MUSIC =  1,   /* 只重扫音乐 */
+    SD_RESCAN_NOVEL =  2,   /* 只重扫小说 */
+    SD_RESCAN_ALL   = -1,   /* 音乐 + 小说都重扫 */
+};
+extern volatile int8_t g_sd_manual_rescan;
 
 /* 磁盘事件回调类型: event=事件串 ("mounted"/"unmounted"/"mount_failed"), user_data=用户数据 */
 typedef void (*sd_event_cb_t)(const char *event, void *user_data);

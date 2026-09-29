@@ -61,7 +61,7 @@ extern const lv_font_t lv_font_global_16;
 #define BAT_PAD         2               /* 填充条距壳内边距 */
 #define BAT_FILL_MAX_W  (BAT_BODY_W - 2 * BAT_PAD)
 #define VBAT_PCT_MIN    3.3f
-#define VBAT_PCT_MAX    4.2f
+#define VBAT_PCT_MAX    4.15f
 
 static lv_obj_t *s_bri_draw    = NULL;  /* 抽屉容器 (常驻) */
 static lv_obj_t *s_bri_slider  = NULL;  /* 亮度滑块 */
@@ -94,6 +94,8 @@ static lv_obj_t *s_album_icon;      /* 无封面时的默认图标 */
 static lv_img_dsc_t s_cover_dsc;    /* 封面图像描述符 */
 static lv_obj_t *s_play_icon;       /* 播放/暂停图标 */
 static lv_obj_t *s_mode_icon;       /* 播放模式图标 */
+static lv_obj_t *s_icon_bt;         /* 顶部蓝牙图标 (已连接时变淡蓝) */
+static int       s_icon_bt_state = -1;  /* 蓝牙图标当前着色状态 (-1=未知, 0=未连, 1=已连) */
 
 /* 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) */
 static char s_pl_group[FS_GROUP_MAX];   /* 当前播放列表所在分组 */
@@ -405,7 +407,7 @@ static void del_wait_audio_cb(lv_timer_t *tmr)
         if (!sd_request_delete_file(s_del_group, s_del_name, s_del_idx)) {
             lv_timer_del(tmr);
             s_del_timer = NULL;
-            g_sd_manual_rescan = true;   /* 发不出去: 放弃并重扫恢复 UI */
+            g_sd_manual_rescan = SD_RESCAN_MUSIC;   /* 发不出去: 放弃并重扫恢复 UI */
             return;
         }
         s_del_sent = true;
@@ -424,8 +426,8 @@ static void del_wait_audio_cb(lv_timer_t *tmr)
     /* 成功才修位图 (纯 NVS, RAM 位图已被冻结释放); 失败不动位图 */
     if (st == 1) played_bits_remove_at(s_del_group, s_del_idx);
 
-    /* 恢复 UI: 拔卡/插卡 + 全量重扫 (失败也重扫, 否则冻结状态卡住) */
-    g_sd_manual_rescan = true;
+    /* 恢复 UI: 拔卡/插卡 + 音乐重扫 (失败也重扫, 否则冻结状态卡住) */
+    g_sd_manual_rescan = SD_RESCAN_MUSIC;
 
     lv_timer_del(tmr);
     s_del_timer = NULL;
@@ -615,7 +617,7 @@ static void dialog_rescan_cb(lv_event_t *e)
         lv_obj_del(s_dialog);
         s_dialog = NULL;
     }
-    g_sd_manual_rescan = true;
+    g_sd_manual_rescan = SD_RESCAN_MUSIC;
     printf("[LVGL] 请求重新扫描\n");
 }
 
@@ -716,6 +718,16 @@ static void song_info_monitor_cb(lv_timer_t *timer)
     if (s_play_icon) {
         lv_label_set_text(s_play_icon,
                           atomic_load_bool(&g_pcm_active) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+
+    /* 蓝牙图标: 已连接 → 淡蓝, 未连接 → 原色 (复用本 500ms 定时器) */
+    if (s_icon_bt) {
+        int bt_on = bt_a2dp_is_connected() ? 1 : 0;
+        if (bt_on != s_icon_bt_state) {
+            s_icon_bt_state = bt_on;
+            lv_obj_set_style_text_color(s_icon_bt,
+                bt_on ? lv_color_hex(0x64B5F6) : COLOR_MUTED, 0);
+        }
     }
 
     song_info_t info;
@@ -1005,12 +1017,10 @@ static void player_build(void)
 
     lv_obj_t *scr = lv_scr_act();
 
-    /* ── 屏幕底色 ── */
+    /* ── 屏幕底色 ──
+     * 屏幕滚动条/SCROLLABLE 已在 ui_shell_init 公共关闭 (两种模式一致), 此处不再重复. */
     lv_obj_set_style_bg_color(scr, COLOR_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    /* 关闭屏幕自身滚动条: 弹窗滑到屏外会撑大屏幕内容触发, 文件浏览器滚动条在各自 list 内部不受影响 */
-    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     /* ── 音乐组根容器 (全屏): 后续所有音乐控件挂其下, 便于整体销毁 ── */
     s_music_root = lv_obj_create(scr);
@@ -1035,9 +1045,10 @@ static void player_build(void)
 
     /* 蓝牙按钮 */
     lv_obj_t *btn_ble = make_icon_btn(scr, 126, 5, 40, 40, LV_SYMBOL_BLUETOOTH);
-    lv_obj_t *icon_ble = lv_obj_get_child(btn_ble, 0);
-    lv_obj_set_style_text_font(icon_ble, &lv_font_montserrat_20, 0);
+    s_icon_bt = lv_obj_get_child(btn_ble, 0);
+    lv_obj_set_style_text_font(s_icon_bt, &lv_font_montserrat_20, 0);
     lv_obj_add_event_cb(btn_ble, bt_menu_click_cb, LV_EVENT_CLICKED, NULL);
+    s_icon_bt_state = -1;   /* 重新建组: 强制按真实连接状态重新着色 */
 
     /* 文字 */
     s_status_label = lv_label_create(scr);
@@ -1333,6 +1344,8 @@ void player_destroy(void)
     s_fmt_val = s_sr_val = s_ch_val = s_bit_val = NULL;
     s_album_art = s_album_img = s_album_icon = NULL;
     s_play_icon = s_mode_icon = NULL;
+    s_icon_bt = NULL;
+    s_icon_bt_state = -1;
 
     /* 播放运行时状态复位 (切模式已断蓝牙, 保留无意义) */
     s_pl_count = 0;

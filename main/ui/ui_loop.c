@@ -37,7 +37,9 @@ void ui_loop_task(void *arg)
     app_mode_init();                     /* 按启动模式只构建并显示对应组 UI */
 
     /* 三个事件源聚合到一个队列集, 统一非阻塞轮询 */
-    s_queue_set = xQueueCreateSet(3);
+    /* 队列集长度必须 >= 所有成员队列长度之和 (app 10 + bt evt 20 + audio rsp 5),
+     * 否则成员队列消息一多会触发 FreeRTOS prvNotifyQueueSetContainer 断言 */
+    s_queue_set = xQueueCreateSet(48);
     xQueueAddToSet(g_ui_app_cmd_queue,  s_queue_set);         /* 应用命令 */
     xQueueAddToSet(g_ui_bt_iface->evt_queue, s_queue_set);    /* 蓝牙事件 */
     xQueueAddToSet(g_ui_audio_rsp_queue, s_queue_set);        /* 音频应答 */

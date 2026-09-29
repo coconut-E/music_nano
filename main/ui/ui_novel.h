@@ -2,6 +2,7 @@
 #define __UI_NOVEL_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,10 @@ void ui_novel_on_sd_ready(void);
 
 /* 小说组是否处于活动状态 (已构建) */
 bool ui_novel_is_active(void);
+
+/* 当前打开小说的 group/name (供文件浏览器定位目录). 无打开文件返回 false.
+ * 例: /sdcard/小说/foo/a.txt → group="sdcard/小说/foo", name="a.txt" */
+bool ui_novel_current(char *group, size_t group_size, char *name, size_t name_size);
 
 #ifdef __cplusplus
 }

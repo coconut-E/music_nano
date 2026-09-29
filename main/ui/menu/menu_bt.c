@@ -92,9 +92,10 @@ static void bt_show_list_view(void)
 static void bt_apply_state(bt_state_t state, const char *name)
 {
     s_bt_state = state;
-    if (name && name[0]) {
-        strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
-        s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+    if (name) {   /* 传入空串则清空: 被动连接名字待异步解析时避免残留旧名 */
+        size_t nlen = strnlen(name, sizeof(s_bt_connect_name) - 1);
+        memcpy(s_bt_connect_name, name, nlen);
+        s_bt_connect_name[nlen] = '\0';
     }
 
     if (!s_bt_open) return;   /* 面板没开就不渲染 */

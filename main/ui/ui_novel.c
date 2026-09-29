@@ -7,6 +7,7 @@
 #include "settings.h"
 #include "sys_monitor.h"
 #include "atomic_utils.h"
+#include "text_encoding.h"
 #include "ui_core.h"
 #include "ui_novel.h"
 #include "ui_player.h"
@@ -27,7 +28,9 @@ extern const lv_font_t lv_font_montserrat_12;
 #define NOVEL_TEXT_W     (NOVEL_READ_W - 10)   /* 文本显示宽度 (与 label 一致, 折行用) */
 #define PAGE_BYTES       1024   /* 每页读取字节数 */
 #define PAGE_STACK_MAX   256    /* 页首偏移栈容量 (RAM 内, 不落盘) */
-#define DISP_MAX         (PAGE_BYTES + 256)    /* 预折行显示缓冲 (每行最多 +1 个 '\n') */
+/* 原始字节转换 UTF-8 后的缓冲: GBK 双字节→UTF-8 三字节, 最坏 1.5x, 取 2x 富余 */
+#define U8_MAX           (PAGE_BYTES * 2 + 8)
+#define DISP_MAX         (U8_MAX + 256)        /* 预折行显示缓冲 (每行最多 +1 个 '\n') */
 #define NOVEL_PAGE_OFFSET 0
 
 /* 方案B: 把预折行后的文本按 NOVEL_BLOCK_LINES 行一组切成多个小 label.
@@ -46,7 +49,7 @@ extern const lv_font_t lv_font_montserrat_12;
 #define NBAT_PAD         2
 #define NBAT_FILL_MAX_W  (NBAT_BODY_W - 2 * NBAT_PAD)
 #define VBAT_PCT_MIN     3.3f
-#define VBAT_PCT_MAX     4.2f
+#define VBAT_PCT_MAX     4.15f
 
 /* ── 静态状态 ── */
 static lv_obj_t   *s_root       = NULL;  /* 全屏根容器 */
@@ -57,6 +60,7 @@ static int         s_block_pool = 0;     /* 池中已创建的控件数 */
 static int         s_block_used = 0;     /* 当前页实际使用的控件数 */
 static lv_obj_t   *s_read_cont  = NULL;  /* 阅读滚动容器 */
 static lv_timer_t *s_bat_timer  = NULL;
+static lv_obj_t   *s_dialog     = NULL;  /* "文件不存在/需重新扫描" 弹窗 */
 
 static FILE       *s_book       = NULL;  /* 当前小说文件 */
 static char        s_book_path[512] = {0};  /* 当前小说真实路径 (进度存 NVS / 去重) */
@@ -66,21 +70,12 @@ static uint32_t    s_page_next  = 0;     /* 下一页起始偏移 */
 static uint32_t    s_page_stack[PAGE_STACK_MAX];  /* 页首偏移历史栈 */
 static int         s_page_sp    = 0;     /* 栈顶指针 */
 
-static char        s_buf[PAGE_BYTES + 8];  /* 页数据缓冲 (含结尾 '\0') */
+static char        s_buf[PAGE_BYTES + 8];  /* 原始页数据缓冲 (含结尾 '\0') */
+static char        s_u8[U8_MAX];           /* 识别+转换后的 UTF-8 文本 */
 static char        s_disp[DISP_MAX];       /* 预折行后的显示串 (插入 '\n') */
 
-static void novel_open_path(const char *real_path);   /* 按真实路径打开 (供恢复复用) */
+static void novel_open_path(const char *real_path, bool interactive);   /* 按真实路径打开 (interactive=失败时弹框) */
 static void novel_restore_last(void);                 /* 恢复上次打开的小说 */
-
-/* ── UTF-8 工具 ── */
-static int utf8_char_len(uint8_t c)
-{
-    if ((c & 0x80) == 0x00) return 1;
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1;
-}
 
 /* 更新阅读百分比 (当前页起始 / 总大小) */
 static void novel_update_percent(void)
@@ -134,23 +129,23 @@ static void novel_update_percent(void)
  *   - K 取 3~4 是折中: K 太大会重新引入"整控件测量", K 太小则控件数过多.
  * ==========================================================================*/
 
-/* 预折行: 把 s_buf[0..valid) 按 label 宽度折成多行, 行尾插入 '\n' 存入 s_disp.
+/* 预折行: 把 src[0..valid) (已转好的 UTF-8) 按 label 宽度折成多行, 行尾插入 '\n' 存入 s_disp.
  * 本函数每页只执行一次; 返回值供 novel_display_blocks 分组. */
 
-static int novel_wrap_text(size_t valid)
+static int novel_wrap_text(const char *src, size_t valid)
 {
     const lv_font_t *font = &lv_font_global_16;
     size_t pos = 0, dp = 0;
     int lines = 0;
 
     while (pos < valid && dp + 1 < DISP_MAX) {
-        uint32_t line = _lv_txt_get_next_line(&s_buf[pos], font, 0, NOVEL_TEXT_W,
+        uint32_t line = _lv_txt_get_next_line(&src[pos], font, 0, NOVEL_TEXT_W,
                                               NULL, LV_TEXT_FLAG_NONE);
         if (line == 0) break;
         if (pos + line > valid) line = (uint32_t)(valid - pos);   /* 不越过有效数据 */
 
         for (uint32_t i = 0; i < line && dp + 1 < DISP_MAX; i++) {
-            s_disp[dp++] = s_buf[pos + i];
+            s_disp[dp++] = src[pos + i];
         }
         pos += line;
         lines++;
@@ -259,6 +254,62 @@ static void novel_show_message(const char *msg)
     lv_obj_scroll_to_y(s_read_cont, 0, LV_ANIM_OFF);
 }
 
+/* ── 文件不存在提示弹窗 (小说专属, 与音乐 show_file_not_found 对应) ── */
+static void novel_dialog_delete(void)
+{
+    if (s_dialog) { lv_obj_del(s_dialog); s_dialog = NULL; }
+}
+
+/* 确认: 关弹窗 + 请求重新扫描 (复用 sys_monitor 手动重扫流程) */
+static void novel_rescan_cb(lv_event_t *e)
+{
+    (void)e;
+    novel_dialog_delete();
+    g_sd_manual_rescan = SD_RESCAN_NOVEL;
+    printf("[NOVEL] 请求重新扫描\n");
+}
+
+/* 弹出"文件不存在"对话框 (含重新扫描确认按钮) */
+static void novel_show_file_not_found(void)
+{
+    novel_dialog_delete();
+
+    s_dialog = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_dialog, 150, 90);
+    lv_obj_align(s_dialog, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_dialog, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_dialog, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_dialog, 8, 0);
+    lv_obj_set_style_border_width(s_dialog, 0, 0);
+    lv_obj_set_style_shadow_width(s_dialog, 24, 0);
+    lv_obj_set_style_shadow_color(s_dialog, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(s_dialog, LV_OPA_60, 0);
+    lv_obj_clear_flag(s_dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(s_dialog);
+    lv_label_set_text(lbl, "该文件不存在\n需重新扫描");
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, -10);
+
+    lv_obj_t *btn = lv_btn_create(s_dialog);
+    lv_obj_set_size(btn, 64, 30);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 7);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_set_style_bg_color(btn, COLOR_ACCENT, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, novel_rescan_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_lbl = lv_label_create(btn);
+    lv_label_set_text(btn_lbl, "确认");
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(btn_lbl, lv_color_black(), 0);
+    lv_obj_center(btn_lbl);
+}
+
 
 /* 读取并显示 offset 起始的一页 */
 static void novel_read_page(uint32_t offset)
@@ -283,37 +334,28 @@ static void novel_read_page(uint32_t offset)
         return;
     }
 
-    /* 若读满一页, 向前回退到完整 UTF-8 字符边界, 避免截断多字节字符 */
-    size_t valid = n;
-    if (n == PAGE_BYTES) {
-        for (int i = (int)n - 1; i >= 0; i--) {
-            uint8_t c = (uint8_t)s_buf[i];
-            if ((c & 0xC0) != 0x80) {              /* 非续字节 = 字符首字节 */
-                int cl = utf8_char_len(c);
-                valid = ((size_t)i + (size_t)cl > n) ? (size_t)i : n;
-                break;
-            }
-        }
-    }
-    s_buf[valid] = '\0';
+    /* 自动识别编码并转 UTF-8: 去 BOM / UTF-8 原样 / GBK 转码;
+     * consumed = 实际消耗的原始字节 (已对齐完整字符边界, 含剥离的 BOM) */
+    size_t consumed = n;
+    int u8len = text_to_utf8((const uint8_t *)s_buf, n, s_u8, sizeof(s_u8), &consumed);
+    if (u8len < 0) u8len = 0;
 
-    /* 控制字符替换为空格 (换行/制表保留); '\r' 也替换, 避免 CRLF 被当成两条换行.
-     * UTF-8 字节 (>=0x80) 原样保留. 就地替换不改变长度, 保证页偏移仍按原始字节累计 */
-    for (size_t i = 0; i < valid; i++) {
-        unsigned char c = (unsigned char)s_buf[i];
+    /* 控制字符替换为空格 (换行/制表保留); '\r' 也替换, 避免 CRLF 被当成两条换行 */
+    for (size_t i = 0; i < (size_t)u8len; i++) {
+        unsigned char c = (unsigned char)s_u8[i];
         if (c == '\r') {
-            s_buf[i] = ' ';
+            s_u8[i] = ' ';
         } else if (c < 0x20 && c != '\n' && c != '\t') {
-            s_buf[i] = ' ';
+            s_u8[i] = ' ';
         }
     }
 
-    int lines = novel_wrap_text(valid);   /* 预折行 (每页一次) */
+    int lines = novel_wrap_text(s_u8, (size_t)u8len);   /* 预折行 (每页一次) */
     novel_display_blocks(lines);          /* 方案B: 按 3~4 行拆成多个小 label */
     lv_obj_scroll_to_y(s_read_cont, 0, LV_ANIM_OFF);
 
     s_page_start = offset;
-    s_page_next  = offset + (uint32_t)valid;
+    s_page_next  = offset + (uint32_t)consumed;
 
     novel_update_percent();
     printf("[NOVEL] page start=%lu next=%lu size=%lu\n",
@@ -405,8 +447,8 @@ static void novel_build(void)
     lv_obj_clear_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_root, LV_SCROLLBAR_MODE_OFF);
 
-    /* 左上: 文件浏览器按钮 (与音乐页同位置) */
-    lv_obj_t *btn_menu = make_icon_btn(s_root, 5, 5, 40, 40, LV_SYMBOL_LIST);
+    /* 左上: 文件浏览器按钮 (透明, 放大点击区, 后面会置顶覆盖阅读框, 便于点按) */
+    lv_obj_t *btn_menu = make_icon_btn(s_root, 0, 0, 56, 56, LV_SYMBOL_LIST);
     lv_obj_t *icon_menu = lv_obj_get_child(btn_menu, 0);
     lv_obj_set_style_text_font(icon_menu, &lv_font_montserrat_18, 0);
     lv_obj_add_event_cb(btn_menu, fs_menu_click_cb, LV_EVENT_CLICKED, NULL);
@@ -467,6 +509,9 @@ static void novel_build(void)
     lv_obj_set_style_pad_all(s_read_cont, 4, 0);
     lv_obj_set_scrollbar_mode(s_read_cont, LV_SCROLLBAR_MODE_AUTO);
 
+    /* 菜单按钮置顶: 覆盖在阅读框之上 (按钮透明, 不影响观感, 只扩大点击区) */
+    lv_obj_move_foreground(btn_menu);
+
     /* 文本控件按需创建 (方案B, 见文件上方方案说明); 先显示占位提示 */
     novel_show_message("请点击左上角选择小说文件");
 
@@ -506,6 +551,7 @@ void ui_novel_show(void)
 
 void ui_novel_destroy(void)
 {
+    novel_dialog_delete();
     novel_close_file();
     if (s_bat_timer) { lv_timer_del(s_bat_timer); s_bat_timer = NULL; }
     if (s_root) { lv_obj_del(s_root); s_root = NULL; }
@@ -517,8 +563,9 @@ void ui_novel_destroy(void)
     s_read_cont = NULL;
 }
 
-/* 按真实路径打开小说文件, 并恢复该文件的阅读进度 */
-static void novel_open_path(const char *real_path)
+/* 按真实路径打开小说文件, 并恢复该文件的阅读进度;
+ * interactive=true (用户手动点击) 时打开失败弹"重新扫描"框, 否则只显示行内提示 */
+static void novel_open_path(const char *real_path, bool interactive)
 {
     if (!real_path || !real_path[0]) return;
     if (!atomic_load_bool(&g_sd_ready)) return;
@@ -538,11 +585,17 @@ static void novel_open_path(const char *real_path)
     sd_fs_unlock();
 
     if (!s_book) {
-        novel_show_message("无法打开小说文件");
+        if (interactive) {
+            novel_show_file_not_found();   /* 手动点击失败: 弹框询问是否重扫 */
+        } else {
+            novel_show_message("无法打开小说文件");   /* 自动恢复失败: 静默行内提示 */
+        }
         if (s_pct_lbl) lv_label_set_text(s_pct_lbl, "0.0%");
         printf("[NOVEL] open failed: %s\n", real_path);
         return;
     }
+
+    novel_dialog_delete();   /* 成功打开: 清掉可能残留的失败弹框 */
 
     strncpy(s_book_path, real_path, sizeof(s_book_path) - 1);
     s_book_path[sizeof(s_book_path) - 1] = '\0';
@@ -569,7 +622,7 @@ static void novel_restore_last(void)
     char saved[512];
     if (!last_novel_load(saved, sizeof(saved))) return;
 
-    novel_open_path(saved);
+    novel_open_path(saved, false);   /* 自动恢复: 失败不弹框 */
 }
 
 void ui_novel_open(const char *group, const char *name)
@@ -578,7 +631,34 @@ void ui_novel_open(const char *group, const char *name)
 
     char path[512];
     fs_build_real_path(group, name, path, sizeof(path));
-    novel_open_path(path);
+    novel_open_path(path, true);   /* 用户手动点击: 失败弹框 */
+}
+
+/* 当前打开小说的 group/name: 由真实路径反推 (去掉开头 '/' → "sdcard/..." 后按最后一个 '/' 切分) */
+bool ui_novel_current(char *group, size_t group_size, char *name, size_t name_size)
+{
+    if (!s_book_path[0]) return false;
+
+    const char *p = s_book_path;
+    if (*p == '/') p++;                 /* /sdcard/小说/foo/a.txt → sdcard/小说/foo/a.txt */
+
+    const char *slash = strrchr(p, '/');
+    if (!slash || slash == p) return false;
+
+    if (group && group_size > 0) {
+        size_t gl = (size_t)(slash - p);
+        if (gl >= group_size) gl = group_size - 1;
+        memcpy(group, p, gl);
+        group[gl] = '\0';
+    }
+    if (name && name_size > 0) {
+        const char *bn = slash + 1;
+        size_t nl = strlen(bn);
+        if (nl >= name_size) nl = name_size - 1;
+        memcpy(name, bn, nl);
+        name[nl] = '\0';
+    }
+    return true;
 }
 
 /* SD 插入: 小说模式下恢复上次打开的小说 (由 ui_shell 的 SD 监视调用) */
@@ -591,6 +671,7 @@ void ui_novel_on_sd_ready(void)
 /* SD 拔出: 关闭当前打开的小说文件 (不销毁 UI) */
 void ui_novel_on_sd_remove(void)
 {
+    novel_dialog_delete();
     novel_close_file();
     novel_show_message("SD 卡已拔出");
     if (s_pct_lbl) lv_label_set_text(s_pct_lbl, "0.0%");

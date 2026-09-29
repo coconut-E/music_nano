@@ -147,7 +147,7 @@ static void enter_deep_sleep_now(void)
     gpio_config(&cut_cfg);
     gpio_set_level(PIN_PWR_CUT, 1);        /* 高 = 断电 */
 
-    vTaskDelay(pdMS_TO_TICKS(500));        /* 让外设电源轨放电 */
+    vTaskDelay(pdMS_TO_TICKS(300));        /* 让外设电源轨放电 */
 
     /* 固件配置过的其它 IO 全部复位为高阻 (输入, 关内部上下拉).
      * 否则深睡 autohold 会把它们锁在活动电平, 经断电外设的 GND 灌流 (实测 ~3mA).
