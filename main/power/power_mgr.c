@@ -146,11 +146,29 @@ static void enter_deep_sleep_now(void)
     };
     gpio_config(&cut_cfg);
     gpio_set_level(PIN_PWR_CUT, 1);        /* 高 = 断电 */
-    gpio_hold_en(PIN_PWR_CUT);             /* 锁定引脚电平, 深睡期间不掉 */
-    gpio_deep_sleep_hold_en();             /* 允许深睡期间保持引脚 */
+
+    vTaskDelay(pdMS_TO_TICKS(500));        /* 让外设电源轨放电 */
+
+    /* 固件配置过的其它 IO 全部复位为高阻 (输入, 关内部上下拉).
+     * 否则深睡 autohold 会把它们锁在活动电平, 经断电外设的 GND 灌流 (实测 ~3mA).
+     * GPIO22 例外: 需维持 PMOS 关断, 保持输出高。 */
+    static const int io_pins[] = {
+        1, 3,                  /* UART0 TX/RX */
+        2, 13, 14, 15,         /* SDMMC D0 / 检测 / CLK / CMD */
+        4, 5, 18, 23, 25, 32,  /* LCD 背光 / CS / SCLK / MOSI / RST / DC */
+        26, 27, 33,            /* 触摸 SDA / SCL / INT */
+    };
+    for (size_t i = 0; i < sizeof(io_pins) / sizeof(io_pins[0]); i++) {
+        gpio_num_t p = (gpio_num_t)io_pins[i];
+        gpio_reset_pin(p);                      /* 断开外设复用 (SPI/I2C/SDMMC/LEDC) */
+        gpio_set_pull_mode(p, GPIO_FLOATING);   /* 关掉 reset 默认使能的上拉 */
+        gpio_set_direction(p, GPIO_MODE_INPUT); /* OE=0 → 高阻 */
+    }
+
+    gpio_hold_en(PIN_PWR_CUT);             /* 锁定 GPIO22 高电平, 深睡期间不掉 */
+    gpio_deep_sleep_hold_en();             /* 允许深睡期间保持 (其余脚已是高阻) */
 
     esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);   /* GPIO37 高电平唤醒 */
-    vTaskDelay(pdMS_TO_TICKS(500));
     esp_deep_sleep_start();                          /* 进入深睡 (此处不返回) */
 }
 
