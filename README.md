@@ -10,12 +10,12 @@
 
 music_nano 是一款比拇指大小的迷你音乐播放器，整机仅 2.2cm × 4.2cm、厚 8mm（不含电池），能轻松塞进任何口袋。它由 ESP32 驱动，通过蓝牙 Classic A2DP 把音乐无线推送给耳机或音箱。
 
-<div style="display:flex;gap:10px;flex-wrap:wrap">
-  <img src="https://image.lceda.cn/oshwhub/pullImage/06aa0f48259349e1bd5eff58ef20a7e8.jpg" alt="" style="max-width:20%;height:auto;display:block" />
-  <img src="https://image.lceda.cn/oshwhub/pullImage/8deda5dd1d2e455283a9c7a36ae44efe.jpg" alt="" style="max-width:20%;height:auto;display:block" />
-  <img src="https://image.lceda.cn/oshwhub/pullImage/e695457dbfa041d5a04a398107d640b5.jpg" alt="" style="max-width:20%;height:auto;display:block" />
-  <img src="https://image.lceda.cn/oshwhub/pullImage/cbb9cd6702ac43699575452971bd362b.jpg" alt="" style="max-width:20%;height:auto;display:block" />
-</div>
+<p align="center">
+  <img src="docs/images/overview-1.jpg" width="180" alt="music_nano 外观 1" />
+  <img src="docs/images/overview-2.jpg" width="180" alt="music_nano 外观 2" />
+  <img src="docs/images/overview-3.jpg" width="180" alt="music_nano 外观 3" />
+  <img src="docs/images/overview-4.jpg" width="180" alt="music_nano 外观 4" />
+</p>
 
 ## 演示视频
 
@@ -145,6 +145,11 @@ idf.py -p COMx flash monitor
 - 修复小说编码识别失败时无提示，增加失败重扫弹窗
 - 内部稳定性修复若干
 
+<p align="center">
+  <img src="docs/images/update-20260930-1.jpg" width="220" alt="2026.9.30 更新" />
+  <img src="docs/images/update-20260930-2.jpg" width="220" alt="2026.9.30 更新" />
+</p>
+
 ### 2026.9.25
 
 **新增**
@@ -161,6 +166,12 @@ idf.py -p COMx flash monitor
 **修复**
 - 修复插拔 SD 卡偶发崩溃、蓝牙连接卡死、封面右边缘错位等问题
 - 内部稳定性修复（越界/内存泄漏/数据撕裂）若干
+
+<p align="center">
+  <img src="docs/images/update-20260925-1.jpg" width="180" alt="2026.9.25 更新" />
+  <img src="docs/images/update-20260925-2.jpg" width="180" alt="2026.9.25 更新" />
+  <img src="docs/images/update-20260925-3.jpg" width="180" alt="2026.9.25 更新" />
+</p>
 
 ## 许可证
 
