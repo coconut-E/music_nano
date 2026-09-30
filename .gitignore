@@ -7,3 +7,9 @@ dependencies.lock
 *.pyc
 __pycache__/
 managed_components/
+*.old
+*.bak
+.DS_Store
+Thumbs.db
+firmware/
+

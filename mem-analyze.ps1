@@ -1,11 +1,17 @@
 ﻿param(
-    [string]$ProjectDir = "E:\music_nano\music_nano",
-    [string]$IdfTools = "d:\espressif\tools",
+    [string]$ProjectDir = $PSScriptRoot,
+    [string]$IdfTools = $env:IDF_TOOLS_PATH,
     [string]$Target = "esp32",
     [int]$Last = 30
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $IdfTools) {
+    Write-Error "IDF_TOOLS_PATH 未设置。请先导出 ESP-IDF 环境，或用 -IdfTools 指定工具目录。"
+    exit 1
+}
+
 $nm = Get-ChildItem (Join-Path $IdfTools "xtensa-esp-elf") -Recurse -Filter "xtensa-$Target-elf-nm.exe" -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
 $size = Get-ChildItem (Join-Path $IdfTools "xtensa-esp-elf") -Recurse -Filter "xtensa-$Target-elf-size.exe" -ErrorAction SilentlyContinue |

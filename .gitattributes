@@ -1,0 +1,8 @@
+# 二进制资源（不做行尾/换行处理）
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.bin  binary
+*.elf  binary
+*.zip  binary

@@ -2,10 +2,16 @@
 
 ## 环境准备
 
-打开 PowerShell 后先导出 ESP-IDF 工具链：
+安装 **ESP-IDF ≥ 5.5.5**（低版本存在 SPI 总线死锁 bug），然后导出环境：
 
 ```powershell
-. C:\Users\123\esp\v5.5.5\esp-idf\export.ps1
+# Windows PowerShell（将 <IDF_DIR> 替换为你的 esp-idf 路径）
+. <IDF_DIR>\export.ps1
+```
+
+```bash
+# Linux / macOS
+. <IDF_DIR>/export.sh
 ```
 
 确认 `idf.py` 可用：
@@ -14,32 +20,43 @@
 idf.py --version
 ```
 
-## 编译（过滤无噪声输出）
-
-仅显示警告、错误和最终链接结果，屏蔽 CMake 配置和逐文件编译进度：
+## 直接编译
 
 ```powershell
-idf.py build 2>&1 | Select-String -Pattern "warning:|error:|FAILED|ninja: build stopped|Project build complete|Linking|ELF file|To flash" -SimpleMatch
+idf.py set-target esp32
+idf.py build
+idf.py -p COMx flash monitor
 ```
 
-`2>&1` 将 stderr 合并到 stdout，`Select-String` 只保留匹配行。
+## 使用 build.ps1（Windows，过滤噪声输出）
 
-## 清空重构
-
-更改 sdkconfig 后或遇到 CMake 缓存问题时：
+`build.ps1` 是对 `idf.py build` 的薄封装，只保留警告、错误与链接结果，屏蔽 CMake 配置和逐文件编译进度。
+**运行前必须先导出 ESP-IDF 环境**（见上），脚本会检查 `IDF_PATH`：
 
 ```powershell
-Remove-Item -Recurse -Force build; idf.py build 2>&1 | Select-String -Pattern "warning:|error:|FAILED|ninja: build stopped|Project build complete|Linking|ELF file|To flash" -SimpleMatch
+. <IDF_DIR>\export.ps1
+.\build.ps1
 ```
 
-## 仅编译 main 组件（快速验证）
+清空 build 目录后重新编译：
 
 ```powershell
-idf.py build 2>&1 | Select-String -Pattern "main.c|bt_a2dp|sys_serial|lvgl_task|audio_task|warning:|error:|FAILED|ninja: build stopped|Project build complete" -SimpleMatch
+.\build.ps1 -Clean
 ```
+
+## 内存占用分析
+
+`mem-analyze.ps1` 读取构建产物的 ELF，统计常驻 RAM（DRAM/IRAM）与 Flash 段占用及最大的常驻符号：
+
+```powershell
+.\mem-analyze.ps1                 # 默认分析 build/ 下最新的 app ELF
+.\mem-analyze.ps1 -Last 50        # 显示前 50 个最大符号
+```
+
+工具链路径默认取自 `$env:IDF_TOOLS_PATH`（导出环境后即已设置），可用 `-IdfTools` 覆盖。
 
 ## 注意事项
 
 - 路径分隔符用 `/` 或 `\` 均可，CMake 会自动处理
 - `sdkconfig.defaults` 中的 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y` 已启用
-- 首次完整构建约 1252 步，增量编译仅编译变更的文件
+- 首次完整构建步骤较多，增量编译仅编译变更的文件
