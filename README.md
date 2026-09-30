@@ -21,6 +21,12 @@ music_nano 是一款比拇指大小的迷你音乐播放器，整机仅 2.2cm ×
 
 [哔哩哔哩 · BV1nEtp6qE72](https://www.bilibili.com/video/BV1nEtp6qE72?t=42.2)
 
+## 硬件开源
+
+PCB 与 3D 外壳已在立创开源硬件平台开源：
+
+**[立创开源硬件平台 · music_nano](https://oshwhub.com/coconet/project_bxhxmpkd)**
+
 ## 功能特性
 
 - **音频解码**：MP3 / FLAC / WAV，最高支持 48kHz / 16bit / 320kbps
