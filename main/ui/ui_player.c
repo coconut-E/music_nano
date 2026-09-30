@@ -1038,13 +1038,13 @@ static void player_build(void)
 
     /* ── TOP BAR ── */
     /* 菜单按钮 */
-    lv_obj_t *btn_menu = make_icon_btn(scr, 5, 5, 40, 40, LV_SYMBOL_LIST);
+    lv_obj_t *btn_menu = make_icon_btn(scr, -3, -3, 56, 56, LV_SYMBOL_LIST);
     lv_obj_t *icon_menu = lv_obj_get_child(btn_menu, 0);
     lv_obj_set_style_text_font(icon_menu, &lv_font_montserrat_18, 0);
     lv_obj_add_event_cb(btn_menu, fs_menu_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 蓝牙按钮 */
-    lv_obj_t *btn_ble = make_icon_btn(scr, 126, 5, 40, 40, LV_SYMBOL_BLUETOOTH);
+    lv_obj_t *btn_ble = make_icon_btn(scr, 118, -3, 56, 56, LV_SYMBOL_BLUETOOTH);
     s_icon_bt = lv_obj_get_child(btn_ble, 0);
     lv_obj_set_style_text_font(s_icon_bt, &lv_font_montserrat_20, 0);
     lv_obj_add_event_cb(btn_ble, bt_menu_click_cb, LV_EVENT_CLICKED, NULL);

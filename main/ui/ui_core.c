@@ -87,7 +87,7 @@ lv_obj_t *make_icon_btn(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
     lv_obj_set_size(btn, w, h);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);   /* 圆形 */
     lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_bg_opa(btn, 8, 0);                  /* 微透明底 */
+    lv_obj_set_style_bg_opa(btn, 0, 0);                  /* 透明底 */
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
 

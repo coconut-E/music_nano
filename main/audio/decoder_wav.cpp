@@ -307,6 +307,9 @@ static bool wav_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
     decoder_wav_t *d = (decoder_wav_t *)iface;
     if (!d->in) return false;
+    /* 对齐到帧边界: 否则从半帧处解码会导致左右声道互换/样本错位 (PCM 无帧同步字) */
+    uint32_t frame_bytes = (uint32_t)d->channels * (d->bits_per_sample / 8);
+    if (frame_bytes) byte_offset -= byte_offset % frame_bytes;
     if (byte_offset > d->data_size) byte_offset = d->data_size;   /* 钳制 */
     if (!d->in->seek(d->in, (long)(d->data_start + byte_offset), SEEK_SET)) return false;
     d->data_pos = byte_offset;

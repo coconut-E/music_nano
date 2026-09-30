@@ -227,8 +227,7 @@ static size_t   s_pcm_offset  = 0;       /* 已写入蓝牙流的偏移 */
 
 /* ── 解码 -> 蓝牙 中间转换层 ── */
 static pcm_pipeline_t *s_pipeline  = NULL;   /* 转换层对象 */
-static uint32_t        s_pipe_rate = 0;      /* 转换层已配置的采样率 */
-static uint8_t         s_pipe_ch   = 0;      /* 转换层已配置的声道数 */
+static uint32_t        s_pipe_rate = 0;      /* 转换层已配置的采样率 (0=本首歌尚未配置) */
 static int16_t        *s_out_buf = NULL;     /* 转换输出缓冲 */
 static size_t          s_out_bytes = 0;      /* 当前块转换输出字节数 */
 static bool            s_info_done = false;  /* 歌曲信息是否已解析完成 */
@@ -411,7 +410,6 @@ static void start_play(const char *path)
     /* 重置所有播放状态 */
     atomic_store_bool(&g_song_info_valid, false);
     s_pipe_rate = 0;
-    s_pipe_ch   = 0;
     s_info_done = false;
     s_pending_pcm = false;
     s_total_decoded = 0;
@@ -573,7 +571,10 @@ static void audio_task(void *arg)
                         break;
                     }
                 }
-                if (rate != s_pipe_rate || ch != s_pipe_ch) {   /* 源格式变了才重配 */
+                if (s_pipe_rate == 0) {   /* 每首歌只配置一次: 采样率/声道是单文件恒定属性.
+                                           * seek 后解码器若落在帧中间可能重新探测出错误格式
+                                           * (假帧头), 据此重配会误启用重采样层 → 播放速度/
+                                           * 音调异常. 故锁定首次配置, 忽略中途格式变化. */
                     if (!pcm_pipeline_open(s_pipeline, rate, 16, ch)) {
                         printf("[音频] 转换层初始化失败 rate=%" PRIu32 " ch=%u\n", rate, ch);
                         close_decoder();
@@ -582,7 +583,6 @@ static void audio_task(void *arg)
                         break;
                     }
                     s_pipe_rate = rate;
-                    s_pipe_ch   = ch;
                     printf("[音频] 转换层: %" PRIu32 "Hz/%uch -> 44100Hz/2ch\n", rate, ch);
                 }
 

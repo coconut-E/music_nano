@@ -19,9 +19,9 @@ extern const lv_font_t lv_font_montserrat_12;
 
 /* ── 布局 ── */
 #define NOVEL_READ_X     2
-#define NOVEL_READ_Y     40
+#define NOVEL_READ_Y     34
 #define NOVEL_READ_W     168
-#define NOVEL_READ_H     238
+#define NOVEL_READ_H     244
 #define NOVEL_PAGE_Y     282
 #define NOVEL_BTN_W      78
 #define NOVEL_BTN_H      32
@@ -43,7 +43,7 @@ extern const lv_font_t lv_font_montserrat_12;
 #define NBAT_BODY_W      18
 #define NBAT_BODY_H      9
 #define NBAT_BODY_X      130
-#define NBAT_BODY_Y      20
+#define NBAT_BODY_Y      17
 #define NBAT_NUB_W       2
 #define NBAT_NUB_H       4
 #define NBAT_PAD         2
@@ -448,14 +448,14 @@ static void novel_build(void)
     lv_obj_set_scrollbar_mode(s_root, LV_SCROLLBAR_MODE_OFF);
 
     /* 左上: 文件浏览器按钮 (透明, 放大点击区, 后面会置顶覆盖阅读框, 便于点按) */
-    lv_obj_t *btn_menu = make_icon_btn(s_root, 0, 0, 56, 56, LV_SYMBOL_LIST);
+    lv_obj_t *btn_menu = make_icon_btn(s_root, 0, -8, 56, 56, LV_SYMBOL_LIST);
     lv_obj_t *icon_menu = lv_obj_get_child(btn_menu, 0);
     lv_obj_set_style_text_font(icon_menu, &lv_font_montserrat_18, 0);
     lv_obj_add_event_cb(btn_menu, fs_menu_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 中上: 阅读百分比 (原 n/n 位置) */
     s_pct_lbl = lv_label_create(s_root);
-    lv_obj_set_pos(s_pct_lbl, 54, 20);
+    lv_obj_set_pos(s_pct_lbl, 54, 13);
     lv_obj_set_size(s_pct_lbl, 65, 16);
     lv_obj_set_style_text_align(s_pct_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(s_pct_lbl, &lv_font_montserrat_14, 0);

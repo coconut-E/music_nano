@@ -56,6 +56,46 @@ static uint32_t be32(const uint8_t *p)
          | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
 
+/* 校验一段字节是否构成合法的 MPEG1/2/2.5 Layer III 帧头.
+ * 合法则回填采样率/声道数/帧长(字节)并返回 true.
+ * 用于 seek 后扫描真实帧边界, 避免落在帧中间时被随机字节误判为假帧头. */
+static bool mp3_hdr_parse(const uint8_t *p, size_t avail,
+                          uint32_t *rate, uint8_t *ch, int32_t *frame_len)
+{
+    if (avail < 4) return false;
+    if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return false;   /* 11bit 同步字 */
+    uint8_t ver = (p[1] >> 3) & 0x03;
+    if (ver == 0x01) return false;                             /* 保留版本 */
+    if (((p[1] >> 1) & 0x03) != 0x01) return false;            /* 仅 Layer III */
+    uint8_t bri = (p[2] >> 4) & 0x0F;
+    if (bri == 0 || bri == 0x0F) return false;                 /* free/bad 码率索引 */
+    uint8_t sri = (p[2] >> 2) & 0x03;
+    if (sri == 0x03) return false;                             /* 保留采样率索引 */
+    uint8_t pad = (p[2] >> 1) & 0x01;
+    uint8_t ch_mode = (p[3] >> 6) & 0x03;
+
+    static const uint16_t k_br_mpeg1[15] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320};
+    static const uint16_t k_br_mpeg2[15] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160};
+    static const uint16_t k_sr_mpeg1[3]  = {44100,48000,32000};
+    static const uint16_t k_sr_mpeg2[3]  = {22050,24000,16000};
+    static const uint16_t k_sr_mpeg25[3] = {11025,12000,8000};
+
+    uint32_t sr, kbps; bool mpeg1;
+    if (ver == 0x03)      { kbps = k_br_mpeg1[bri]; sr = k_sr_mpeg1[sri];  mpeg1 = true;  }
+    else if (ver == 0x02) { kbps = k_br_mpeg2[bri]; sr = k_sr_mpeg2[sri];  mpeg1 = false; }
+    else                  { kbps = k_br_mpeg2[bri]; sr = k_sr_mpeg25[sri]; mpeg1 = false; }
+    if (kbps == 0 || sr == 0) return false;
+
+    int32_t len = mpeg1 ? (int32_t)(144u * kbps * 1000u / sr + pad)
+                        : (int32_t)(72u  * kbps * 1000u / sr + pad);
+    if (len < 4 || len > 4096) return false;
+
+    if (rate)      *rate = sr;
+    if (ch)        *ch = (ch_mode == 0x03) ? 1 : 2;
+    if (frame_len) *frame_len = len;
+    return true;
+}
+
 /* 解析 ID3v2 标签: 提取标题/歌手/封面.
  * f=文件, off=输出 MP3 数据起始偏移, title_out/artist_out=输出缓冲,
  * cover_out=封面指针(PSRAM), cover_size_out=封面大小. */
@@ -274,19 +314,53 @@ static uint32_t mp3_get_position(audio_decoder_t *iface)
     return pos > 0 ? (uint32_t)pos : 0;
 }
 
-/* 按字节偏移 seek: 重置解码器, 丢弃输入缓冲重新定位 */
+/* seek 后按真实帧边界重定位 (避免落在帧中间被随机字节误判出假帧头/错误采样率).
+ * 复用已有输入缓冲 inbuf 扫描, 不新增堆内存; 前向链式校验只读 4 字节到栈.
+ * 返回对齐后的文件偏移 (找不到时回退原 offset, 由解码器自行重同步). */
+static long mp3_resync_frame(decoder_mp3_t *d, uint32_t offset)
+{
+    size_t got = d->in->read(d->in, d->inbuf, MP3_INPUT_CHUNK_SIZE);   /* 复用 2KB 输入缓冲 */
+    for (size_t i = 0; i + 4 <= got; i++) {
+        uint32_t r; uint8_t c; int32_t len;
+        if (!mp3_hdr_parse(d->inbuf + i, got - i, &r, &c, &len)) continue;
+        if (d->sample_rate && r != d->sample_rate) continue;   /* 须与已确立的流格式一致 */
+        if (d->channels && c != d->channels) continue;
+
+        /* 链式校验: 下一帧头 (offset+i+len) 也须合法且采样率相同.
+         * 用一次前向随机读代替大缓冲, 假帧头几乎不可能同时满足连续两帧. */
+        bool ok = true;
+        long next = (long)offset + (long)i + len;
+        if (next + 4 <= (long)d->file_size) {
+            uint8_t h4[4];
+            ok = d->in->seek(d->in, next, SEEK_SET) && d->in->read(d->in, h4, 4) == 4;
+            if (ok) {
+                uint32_t r2;
+                ok = mp3_hdr_parse(h4, 4, &r2, NULL, NULL) && r2 == r;
+            }
+        }
+        if (ok) return (long)offset + (long)i;
+    }
+    return (long)offset;
+}
+
+/* 按字节偏移 seek: 帧边界重同步后重置解码器重新定位 */
 static bool mp3_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
     if(!d->in || !d->mp3) return false;
     if(byte_offset > d->file_size) byte_offset = d->file_size;
     if(!d->in->seek(d->in, (long)byte_offset, SEEK_SET)) return false;
-    d->mp3->reset();   /* 解码器状态复位 */
+    d->mp3->reset();   /* 解码器状态复位 (丢弃旧比特池/滤波器状态) */
     d->in_off = 0;
     d->in_len = 0;
     d->eof    = false;
-    d->info_done = false;   /* 跳转后需重新解析流信息 */
-    printf("[音频] SEEK -> %" PRIu32 " bytes\n", byte_offset);
+    /* 注意: 不复位 info_done. MP3 单文件采样率/声道恒定, 保持已确立值,
+     * 避免 seek 后重探测到假帧头时用错误格式覆盖 (进而误触发重采样层). */
+    long aligned = mp3_resync_frame(d, byte_offset);
+    d->in->seek(d->in, aligned, SEEK_SET);   /* 无论是否对齐都重新定位 (扫描已推移流位置) */
+    d->in_off = 0;
+    d->in_len = 0;
+    printf("[音频] SEEK -> %" PRIu32 " bytes (帧对齐 %ld)\n", byte_offset, aligned);
     return true;
 }
 

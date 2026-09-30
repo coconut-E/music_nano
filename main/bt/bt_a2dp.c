@@ -862,9 +862,9 @@ static void bt_a2dp_task(void *arg)
         return;
     }
 
-    /* 安全参数: 输入输出能力 (可显示/输入) + 可变 PIN */
+    /* 安全参数: 无输入无输出 (Just Works 配对, 无需在 PC 上比对数字) */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
 
     esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
