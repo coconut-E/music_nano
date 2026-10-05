@@ -70,6 +70,7 @@ static const char *s_cur_name  = NULL;
 static lv_img_dsc_t s_fs_icon_dir;    /* 文件夹图标 */
 static lv_img_dsc_t s_fs_icon_music;  /* 音乐文件图标 */
 static lv_img_dsc_t s_fs_icon_heart;  /* 已喜欢文件图标 (粉色爱心) */
+static lv_img_dsc_t s_fs_icon_novel;  /* 小说文件图标 (TXT) */
 
 static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 音乐: 点击播放回调 */
 static void (*s_novel_cb)(const char *group, const char *name) = NULL;  /* 小说: 点击打开回调 */
@@ -263,14 +264,14 @@ static void fs_row_set(lv_obj_t *btn, fs_entry_t *entry)
     lv_obj_clear_flag(icon, LV_OBJ_FLAG_HIDDEN);
     if (entry->is_dir) {
         lv_img_set_src(icon, &s_fs_icon_dir);
+    } else if (s_fs_src == 1) {
+        /* 小说库: 统一 TXT 文件图标 */
+        lv_img_set_src(icon, &s_fs_icon_novel);
     } else {
-        /* 音乐库: 已喜欢的文件显示粉色爱心; 小说库: 统一文件图标 */
-        bool liked = false;
-        if (s_fs_src == 0) {
-            char key[160];
-            song_hash_name_key(entry->name, key, sizeof(key));
-            liked = likes_contains(song_hash32(key, strlen(key)));
-        }
+        /* 音乐库: 已喜欢的文件显示粉色爱心, 其余用音乐图标 */
+        char key[160];
+        song_hash_name_key(entry->name, key, sizeof(key));
+        bool liked = likes_contains(song_hash32(key, strlen(key)));
         lv_img_set_src(icon, liked ? &s_fs_icon_heart : &s_fs_icon_music);
     }
     lv_label_set_text(label, entry->name);
@@ -527,6 +528,11 @@ bool fs_browser_precreate_step(int budget_us)
             s_fs_icon_heart.data_size = 16 * 21 * 2;
             s_fs_icon_heart.header.cf = LV_IMG_CF_TRUE_COLOR;
             s_fs_icon_heart.data = (const uint8_t *)icon_heart;
+            s_fs_icon_novel.header.w = 16;
+            s_fs_icon_novel.header.h = 21;
+            s_fs_icon_novel.data_size = 16 * 21 * 2;
+            s_fs_icon_novel.header.cf = LV_IMG_CF_TRUE_COLOR;
+            s_fs_icon_novel.data = (const uint8_t *)icon_novel;
             s_fs_pc_step = FS_PC_OVERLAY;
             break;
 

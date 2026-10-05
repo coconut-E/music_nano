@@ -33,6 +33,7 @@ idf_component_register(SRCS "main.c"
                             "drivers/touch.c"
                             "resources/icon_file.c"
                             "resources/icon_heart.c"
+                            "resources/icon_novel.c"
                             "resources/lv_font_global_16.c"
                             "resources/lv_font_heart_44.c"
                     PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
