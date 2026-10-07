@@ -31,14 +31,20 @@ idf.py -p COMx flash monitor
 ## 使用 build.ps1（Windows，过滤噪声输出）
 
 `build.ps1` 是对 `idf.py build` 的薄封装，只保留警告、错误与链接结果，屏蔽 CMake 配置和逐文件编译进度。
-**运行前必须先导出 ESP-IDF 环境**（见上），脚本会检查 `IDF_PATH`：
+
+**一步完成**：若当前 shell 未导出 ESP-IDF 环境，脚本会自动探测系统里已安装的 ESP-IDF 并导入，无需手动执行 `export.ps1`（脚本内不硬编码任何本机路径）：
 
 ```powershell
-. <IDF_DIR>\export.ps1
 .\build.ps1
 ```
 
-清空 build 目录后重新编译：
+自动探测顺序：当前环境变量 → `esp_idf.json` 安装记录（`IDF_TOOLS_PATH`、`%USERPROFILE%\.espressif`、VS Code 扩展目录、各盘符的 `Espressif` 目录）。若探测失败，可手动指定：
+
+```powershell
+.\build.ps1 -IdfPath <IDF_DIR> [-IdfToolsPath <TOOLS_DIR>]
+```
+
+已在当前 shell 导出过环境时，脚本会直接复用。清空 build 目录后重新编译：
 
 ```powershell
 .\build.ps1 -Clean
