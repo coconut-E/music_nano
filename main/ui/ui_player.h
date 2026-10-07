@@ -35,6 +35,10 @@ void player_toggle_play(void);
 void player_next(void);                  /* 下一首 */
 void player_prev(void);                  /* 上一首 */
 
+/* 立即补存一次播放进度 (暂停/退出音乐模式/深睡前调用).
+ * 仅对 >10 分钟的歌生效; 非音乐模式/无有效歌曲时 no-op */
+void player_save_progress_now(void);
+
 /* 封面: 解码任务就绪后回调. buf=100x100 RGB565 封面或 NULL(无封面) */
 void player_show_cover(void *buf);
 

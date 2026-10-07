@@ -44,9 +44,14 @@ void    brightness_set(uint8_t v);              /* 设定背光亮度 (钳制到
 void    brightness_load_from_nvs(void);         /* 开机从 NVS 读亮度 */
 void    brightness_save_to_nvs(void);           /* 亮度变化后写回 NVS */
 
-/* ── 上次播放歌曲 ── */
-void last_song_save(const char *path);          /* 保存上次播放曲目路径到 NVS */
-bool last_song_load(char *buf, size_t size);    /* 读取上次播放曲目, 成功返回 true; buf=输出缓冲, size=缓冲大小 */
+/* ── 上次播放歌曲 (含播放进度) ──
+ * 同一 NVS 键 "song" 内存 blob: 路径(NUL 结尾) + uint16 千分比进度(0~1000).
+ * 进度仅对 >10 分钟的歌按 1 分钟粒度保存, 切歌置零 (策略见 ui_player.c). */
+void last_song_save(const char *path);          /* 保存曲目路径到 NVS (进度置零, 切歌用) */
+void last_song_progress_save(uint16_t progress);/* 只更新进度 (千分比 0~1000), 路径沿用缓存 */
+bool last_song_load(char *buf, size_t size, uint16_t *progress);
+                                                /* 读曲目路径与进度, 成功返回 true;
+                                                 * buf=路径输出, size=缓冲大小, progress=进度输出(可 NULL) */
 
 /* ── 上次打开的小说 ── */
 void last_novel_save(const char *path);         /* 保存上次打开的小说路径到 NVS */

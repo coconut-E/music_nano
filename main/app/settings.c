@@ -216,19 +216,32 @@ void brightness_save_to_nvs(void)
     }
 }
 
-/* ──────────────────────── 上次播放歌曲 ──────────────────────── */
-#define LAST_KEY   "song"
-#define LAST_MAX   512   /* 曲目路径最大长度 */
+/* ──────────────────────── 上次播放歌曲 (含播放进度) ────────────────────────
+ * 路径与进度存在同一个键里, 组成 blob: 路径(NUL 结尾) + uint16 千分比进度(0~1000).
+ *
+ * 为什么用千分比而不是"秒": 音频跳转接口 AUDIO_CMD_SEEK 的 param 只接受千分比,
+ * 直接存千分比可在恢复时立即 seek, 不必等解码器异步解析出总时长再换算.
+ *
+ * 进度策略(见 ui_player.c): 仅对 >10 分钟的歌保存, 粒度为 1 分钟; 切歌置零. */
+#define LAST_KEY       "song"
+#define LAST_MAX       512   /* 曲目路径最大长度 */
+#define LAST_PROG_LEN  2     /* 追加在路径后的进度字节数 (uint16 千分比) */
 
-static char s_last[LAST_MAX] = {0};   /* 内存缓存的最后播放路径, 用于去重 */
+static char     s_last[LAST_MAX] = {0};   /* 内存缓存的最后播放路径, 用于去重 */
+static uint16_t s_last_progress = 0;      /* 内存缓存的最后进度千分比, 用于去重防磨损 */
 
-/* 保存上次播放曲目路径到 NVS; path=曲目路径 */
-void last_song_save(const char *path)
+/* 把路径 + 进度打包写回 NVS; 成功后同步内存缓存.
+ * 这是唯一的落盘点, last_song_save / last_song_progress_save 都经它写盘 */
+static void last_song_write(const char *path, uint16_t progress)
 {
-    if (!path || !path[0]) return;
+    size_t plen = strlen(path);
+    if (plen > LAST_MAX - 1) plen = LAST_MAX - 1;
 
-    /* 路径未变化时跳过写 flash, 降低 NVS 磨损 */
-    if (strcmp(s_last, path) == 0) return;
+    uint8_t blob[LAST_MAX + LAST_PROG_LEN];   /* 路径 + NUL + 进度 */
+    memcpy(blob, path, plen);
+    blob[plen] = '\0';
+    memcpy(blob + plen + 1, &progress, LAST_PROG_LEN);   /* 原生小端 */
+    size_t blen = plen + 1 + LAST_PROG_LEN;
 
     nvs_handle_t handle;
     if (nvs_open(SETTINGS_NS, NVS_READWRITE, &handle) != ESP_OK) {
@@ -236,24 +249,48 @@ void last_song_save(const char *path)
         return;
     }
 
-    esp_err_t ret = nvs_set_str(handle, LAST_KEY, path);
+    esp_err_t ret = nvs_set_blob(handle, LAST_KEY, blob, blen);
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
     }
     nvs_close(handle);
 
     if (ret == ESP_OK) {
-        strncpy(s_last, path, sizeof(s_last) - 1);   /* 同步内存缓存 */
-        s_last[sizeof(s_last) - 1] = '\0';
-        ESP_LOGI(TAG, "已保存播放路径: %s", path);
+        memcpy(s_last, blob, plen + 1);   /* 同步内存缓存 */
+        s_last_progress = progress;
+        ESP_LOGI(TAG, "已保存播放路径/进度: %s (千分比 %u)", path, progress);
     } else {
         ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
     }
 }
 
-/* 读取上次播放曲目: buf=输出缓冲, size=缓冲大小; 成功返回 true */
-bool last_song_load(char *buf, size_t size)
+/* 保存上次播放曲目路径到 NVS (进度置零); path=曲目路径.
+ * 切歌或重播时调用, 即"切歌时自动置零" */
+void last_song_save(const char *path)
 {
+    if (!path || !path[0]) return;
+
+    /* 路径与进度都未变化时跳过写 flash, 降低 NVS 磨损 */
+    if (strcmp(s_last, path) == 0 && s_last_progress == 0) return;
+
+    last_song_write(path, 0);
+}
+
+/* 只更新进度 (路径沿用内存缓存), 写盘前与缓存比较去重.
+ * progress=千分比 0~1000; 无当前曲目时 no-op */
+void last_song_progress_save(uint16_t progress)
+{
+    if (!s_last[0]) return;
+    if (progress == s_last_progress) return;   /* 未变化不写 flash */
+
+    last_song_write(s_last, progress);
+}
+
+/* 读取上次播放曲目与进度: buf=路径输出缓冲, size=缓冲大小, progress=进度输出(可 NULL).
+ * 成功返回 true. 兼容旧版仅字符串格式 (此时进度按 0 处理). */
+bool last_song_load(char *buf, size_t size, uint16_t *progress)
+{
+    if (progress) *progress = 0;
     if (!buf || size == 0) return false;
 
     nvs_handle_t handle;
@@ -261,16 +298,32 @@ bool last_song_load(char *buf, size_t size)
         return false;
     }
 
-    size_t len = size;
-    esp_err_t ret = nvs_get_str(handle, LAST_KEY, buf, &len);   /* len 输入=缓冲大小, 输出=实际长度 */
+    /* NVS 的字符串与 blob 底层同为变长二进制, 旧字符串数据也能用 get_blob 读回:
+     * 此时长度为 strlen+1, 不含进度字节, progress 自然保持 0. */
+    uint8_t blob[LAST_MAX + LAST_PROG_LEN];
+    size_t  blen = sizeof(blob);
+    esp_err_t ret = nvs_get_blob(handle, LAST_KEY, blob, &blen);
     nvs_close(handle);
 
-    if (ret != ESP_OK || len == 0 || buf[0] == '\0') {
+    if (ret != ESP_OK || blen == 0) {
         return false;
+    }
+
+    blob[sizeof(blob) - 1] = '\0';
+    size_t plen = strnlen((const char *)blob, blen);
+    if (plen == 0 || plen >= size) {   /* 空路径 / 输出缓冲太小 */
+        return false;
+    }
+
+    memcpy(buf, blob, plen + 1);   /* 含 NUL */
+
+    if (progress && blen >= plen + 1 + LAST_PROG_LEN) {
+        memcpy(progress, blob + plen + 1, LAST_PROG_LEN);
     }
 
     strncpy(s_last, buf, sizeof(s_last) - 1);   /* 同步内存缓存 */
     s_last[sizeof(s_last) - 1] = '\0';
+    s_last_progress = progress ? *progress : 0;
     return true;
 }
 

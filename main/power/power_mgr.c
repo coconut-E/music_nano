@@ -18,6 +18,7 @@
 #include "mode_anim.h"
 #include "sys_monitor.h"
 #include "app_mode.h"
+#include "ui_player.h"
 #include "battery_low_img.h"
 #include "atomic_utils.h"
 #include "power_mgr.h"
@@ -138,6 +139,8 @@ static void screen_fade(uint8_t target, lv_anim_ready_cb_t done)
 static void enter_deep_sleep_now(void)
 {
     ESP_LOGI(TAG, "进入深度睡眠 (GPIO22 高电平保持, GPIO37 高电平唤醒)");
+
+    player_save_progress_now();   /* 深睡前补存播放进度 (非音乐模式 no-op) */
 
     /* 切外设供电: GPIO22 输出高 + 保持电平 (深睡中 GPIO 状态丢失, 靠 hold 保持) */
     gpio_config_t cut_cfg = {

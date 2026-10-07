@@ -29,6 +29,7 @@ typedef struct {
     uint32_t bitrate_kbps;             /* 码率 (kbps) */
     uint32_t duration_sec;             /* 总时长 (秒) */
     uint32_t elapsed_sec;              /* 已播放时长 (秒) */
+    uint32_t path_hash;                /* 当前文件路径的 xxHash32: 供 UI 确认快照属于哪首歌 */
 } song_info_t;
 
 extern song_info_t g_song_info;        /* 歌曲信息 (全局实例) */

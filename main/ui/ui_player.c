@@ -29,6 +29,14 @@ extern const lv_font_t lv_font_global_16;
 /* 用户命令发送: 与上一条间隔 < 500ms 则丢弃 */
 #define CMD_MIN_INTERVAL_US  500000
 
+/* ── 播放进度记忆策略 ──
+ * 为什么这么定: NVS 是 flash, 写入有寿命, 且每次写入可能触发 NVS 页回收(擦除),
+ * 频繁保存会加速磨损, 所以粒度放粗到 1 分钟.
+ * 但 1 分钟对小于 10 分钟的歌而言跨度过大(整首歌没几个保存点), 没有意义,
+ * 因此只对时长 >10 分钟的歌记忆进度; 切歌时进度自动置零. */
+#define PROGRESS_MIN_DURATION_SEC  600u   /* 仅时长 >10 分钟的歌才记忆 */
+#define PROGRESS_UNIT_SEC           60u   /* 保存粒度: 1 分钟 */
+
 /* ── 亮度抽屉: 左侧常驻容器, 收拢时只露灰条 (灰条贴容器右缘随容器移动) ── */
 #define BRI_PANEL_W     30              /* 面板宽度 (窄一点: 展开动画覆盖面积小, 减少重绘) */
 #define BRI_PANEL_H     150             /* 面板高度 */
@@ -108,6 +116,9 @@ static int         s_cur_plays = 1;            /* 当前曲已播放次数 */
 static bool        s_auto_advancing = false;   /* 是否自动切歌中 (决定文件缺失时行为) */
 static int64_t     s_last_user_cmd_us = 0;     /* 上次用户命令时刻 (节流) */
 static bool        s_was_playing = false;      /* 影子播放状态 (蓝牙重连续播用) */
+static uint32_t    s_progress_min = 0;         /* 已保存到的整分钟数, 用于按 1 分钟粒度去重 */
+static uint32_t    s_cur_path_hash = 0;        /* 当前曲目路径哈希: 过滤上一首的残留歌曲信息 */
+static uint32_t    s_tracked_hash  = 0;        /* 进度记忆已对齐的曲目哈希: 新曲首个快照只对齐不落盘 */
 
 /* ── 删除文件流程 (异步: 等音频释放 SD → 请求系统任务删除 → 修位图 → 重扫) ── */
 static lv_timer_t *s_del_timer = NULL;                       /* 驱动删除流程的两段式定时器 */
@@ -262,6 +273,8 @@ static void player_play_index(int idx)
 
     s_pl_index = idx;
     s_cur_plays = 1;                 /* 新曲: 已播次数归 1 */
+    s_progress_min = 0;              /* 切歌: 进度记忆重置, 下次按分钟重新记录 */
+    s_cur_path_hash = song_hash32(path, strlen(path));   /* 记录当前曲身份, 过滤上一首残留信息 */
     s_auto_advancing = false;
     s_was_playing = true;
     printf("[LVGL] PLAY: %s\n", path);
@@ -271,7 +284,7 @@ static void player_play_index(int idx)
 
     player_update_label();
 
-    /* 记录播放路径到 flash, 供下次插入 SD 卡时恢复 */
+    /* 记录播放路径到 flash, 供下次插入 SD 卡时恢复 (同时把进度置零) */
     last_song_save(path);
     /* 两向同步: 浏览器打开时刷新绿色高亮 */
     fs_browser_refresh();
@@ -318,6 +331,8 @@ void player_advance(void)
 
     s_pl_index = next;
     s_cur_plays = 1;                 /* 新曲: 已播次数归 1 */
+    s_progress_min = 0;              /* 切歌: 进度记忆重置 */
+    s_cur_path_hash = song_hash32(path, strlen(path));   /* 记录当前曲身份 */
     s_auto_advancing = true;
     s_was_playing = true;
     printf("[LVGL] AUTO PLAY: %s (mode %d)\n", path, s_play_mode);
@@ -327,7 +342,7 @@ void player_advance(void)
 
     player_update_label();
 
-    /* 自动切歌同样记录路径并刷新浏览器高亮 */
+    /* 自动切歌同样记录路径并刷新浏览器高亮 (同时把进度置零) */
     last_song_save(path);
     fs_browser_refresh();
 }
@@ -349,6 +364,9 @@ static void player_replay(void)
     cmd.path[plen] = '\0';
     xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
+    s_progress_min = 0;              /* 重播从头开始: 进度记忆重置 */
+    s_cur_path_hash = song_hash32(path, strlen(path));   /* 记录当前曲身份 */
+    last_song_save(path);            /* 把已存进度清零 (路径未变, 仅重置进度) */
     s_auto_advancing = true;
     s_was_playing = true;
     printf("[LVGL] REPLAY %d/%d: %s\n", s_cur_plays, s_loop_count, path);
@@ -573,6 +591,22 @@ void player_prev(void)
 static void player_prev_click_cb(lv_event_t *e) { player_prev(); }
 static void player_next_click_cb(lv_event_t *e) { player_next(); }
 
+/* 立即补存一次播放进度 (暂停 / 退出音乐模式 / 深睡前调用).
+ * 与 1 分钟粒度策略不同, 此处取当前实际位置, 尽量不丢"暂停/退出"时刻的进度;
+ * 仍遵守: 仅 >10 分钟的歌且千分比非零才记. 非音乐模式/无有效歌曲时 no-op */
+void player_save_progress_now(void)
+{
+    if (!s_music_root) return;                 /* 非音乐模式: 不记录 */
+    song_info_t info;
+    if (!song_info_snapshot(&info)) return;    /* 无有效歌曲 */
+    if (!info.path_hash || info.path_hash != s_cur_path_hash) return;   /* 非当前曲(残留信息): 忽略 */
+    if (info.duration_sec <= PROGRESS_MIN_DURATION_SEC) return;
+
+    uint32_t pm = (uint64_t)info.elapsed_sec * 1000 / info.duration_sec;
+    if (pm == 0 || pm > 1000) return;          /* 零则忽略; 越界防御 */
+    last_song_progress_save((uint16_t)pm);
+}
+
 /* 播放/暂停切换: 播放→暂停, 有歌续播, 无歌播当前项 (播放键 + 蓝牙耳机共用) */
 void player_toggle_play(void)
 {
@@ -582,6 +616,7 @@ void player_toggle_play(void)
         cmd.type = AUDIO_CMD_PAUSE;
         if (audio_user_send(&cmd)) {
             printf("[LVGL] PAUSE\n");
+            player_save_progress_now();   /* 暂停即补存当前进度 */
         }
     } else if (atomic_load_bool(&g_song_info_valid) && s_pl_count > 0) {
         /* 暂停中且有已加载歌曲 → 纯续播: 不清封面, 绕过 500ms 节流 */
@@ -772,6 +807,25 @@ static void song_info_monitor_cb(lv_timer_t *timer)
                 lv_slider_set_value(s_progress_slider, val, LV_ANIM_OFF);
             }
         }
+
+        /* 播放进度记忆: 仅 >10 分钟的歌, 粒度为 1 分钟 (原因见本文件顶部宏注释).
+         * 必须先确认快照属于当前曲 (path_hash 相符): 切歌后音频任务尚未处理 PLAY
+         * 的窗口里, g_song_info 仍是上一首, 否则会把旧进度错记到新歌上. */
+        if (info.path_hash && info.path_hash == s_cur_path_hash
+            && tot > PROGRESS_MIN_DURATION_SEC) {
+            uint32_t minute = cur / PROGRESS_UNIT_SEC;
+            if (info.path_hash != s_tracked_hash) {
+                /* 本曲首个有效快照: 只对齐当前分钟, 不落盘,
+                 * 避免恢复后立刻把已存的精确进度归一化覆盖 */
+                s_tracked_hash = info.path_hash;
+                s_progress_min = minute;
+            } else if (minute != s_progress_min) {
+                s_progress_min = minute;
+                uint32_t pm = (uint64_t)(minute * PROGRESS_UNIT_SEC) * 1000 / tot;
+                if (pm > 1000) pm = 1000;
+                last_song_progress_save((uint16_t)pm);
+            }
+        }
     } else {
         player_info_reset();
     }
@@ -780,6 +834,8 @@ static void song_info_monitor_cb(lv_timer_t *timer)
 /* SD 拔出: 停音频/复位播放列表/清封面 (由 ui_shell 的 SD 监视调用) */
 void player_on_sd_remove(void)
 {
+    player_save_progress_now();   /* 拔卡前补存进度 */
+
     audio_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_STOP;
@@ -799,15 +855,26 @@ void player_on_sd_ready(void)
 {
     if (!s_music_root) return;   /* 非音乐模式: 不恢复 */
 
-    /* 读 flash 路径 → 在缓存中查找 → 加载到解码器但不自动播放, 紧随发暂停 */
+    /* 读 flash 路径/进度 → 在缓存中查找 → 加载到解码器但不自动播放, 紧随发暂停 */
     char saved[512];
-    if (!last_song_load(saved, sizeof(saved))) return;
+    uint16_t progress = 0;
+    if (!last_song_load(saved, sizeof(saved), &progress)) return;
 
     char group[FS_GROUP_MAX];
     char name[FS_NAME_MAX];
     if (!fs_cache_find_by_path(saved, group, sizeof(group), name, sizeof(name))) return;
 
     player_play_file(group, name);
+
+    /* 恢复播放进度: 进度为零则忽略. 千分比可直接喂给 SEEK, 无需等总时长 */
+    if (progress > 0) {
+        audio_cmd_t seek;
+        memset(&seek, 0, sizeof(seek));
+        seek.type  = AUDIO_CMD_SEEK;
+        seek.param = progress;                       /* 千分比 0~1000 */
+        xQueueSend(g_ui_audio_cmd_queue, &seek, 0);  /* 队列顺序: PLAY → SEEK → PAUSE */
+        printf("[LVGL] 恢复进度: 千分比 %u\n", progress);
+    }
 
     audio_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -1358,6 +1425,7 @@ void player_destroy(void)
 /* 停止播放 (模式切换用): 只发停止命令, 不销毁 UI */
 void player_stop_playback(void)
 {
+    player_save_progress_now();   /* 退出音乐模式前补存进度 */
     audio_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_STOP;

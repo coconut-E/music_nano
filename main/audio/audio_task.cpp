@@ -19,6 +19,7 @@
 #include "cover.h"
 #include "sys_monitor.h"
 #include "settings.h"
+#include "song_hash.h"
 
 #define AUDIO_TAG "AUDIO"
 
@@ -368,6 +369,7 @@ static void fill_song_info(void)
     g_song_info.sample_rate  = s_decoder->get_sample_rate(s_decoder);
     g_song_info.channels     = s_decoder->get_channels(s_decoder);
     g_song_info.bits_per_sample = (s_decoder->get_bits ? s_decoder->get_bits(s_decoder) : 16);
+    g_song_info.path_hash    = song_hash32(s_current_path, strlen(s_current_path));   /* 曲目身份: 供 UI 过滤上一首残留快照 */
     update_duration_elapsed_locked();   /* 已持锁, 用 _locked 版本避免重复加锁 */
 
     atomic_store_bool(&g_song_info_valid, true);   /* 最后才置有效位 (先写字段后发信号) */
