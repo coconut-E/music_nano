@@ -1,5 +1,7 @@
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,6 +38,17 @@
 
 #define CONNECT_TIMEOUT_US  (20LL * 1000 * 1000)   /* 连接流程总超时 20s: 防止协议栈无回调时永久卡 CONNECTING */
 
+/* L2CAP 拥塞错误刷屏自动恢复:
+ * 弱链路下 IDF 会以约 20ms 周期打印 "l2cab is_cong_cback_context"，
+ * 计数达到阈值后执行一次 A2DP 挂起→启动（等价手动切暂停），复位卡住的流。
+ * 50 条约 1 秒；2 秒无新增清零，避免偶发错误跨小时累计误触发。
+ * 挂起/启动本身状态切换很快，ACK 超时与恢复冷却都压到 0.5 秒。 */
+#define BT_CONG_TRIGGER_COUNT      50
+#define BT_CONG_IDLE_RESET_US      (2LL * 1000 * 1000)
+#define BT_RECOVER_ACK_TIMEOUT_US  (500LL * 1000)
+#define BT_RECOVER_RETRY_US        (200LL * 1000)
+#define BT_RECOVER_COOLDOWN_US     (500LL * 1000)
+
 /* 内部事件分发类型: 区分协议栈回调来源 */
 typedef enum {
     BT_DISPATCH_A2DP,     /* A2DP 回调 */
@@ -66,6 +79,17 @@ static volatile bool s_connecting = false;       /* 正在连接 */
 static bool s_stream_started = false;   /* 媒体流是否已启动 (START/SUSPEND 状态) */
 static volatile bool s_start_retry = false;  /* START 被 BUSY 拒绝, 待前一条命令完成后重发 */
 static esp_bd_addr_t s_peer_bda;        /* 对端(耳机)蓝牙地址 */
+
+/* L2CAP 拥塞错误计数 + A2DP 流自动恢复状态 */
+static vprintf_like_t s_prev_log_vprintf = NULL; /* 原日志输出函数 (链式调用) */
+static volatile uint32_t s_cong_err_count = 0;   /* 日志钩子累计的拥塞错误数 */
+static uint32_t s_cong_seen = 0;                 /* 上次检查到的计数 */
+static int64_t  s_cong_last_us = 0;              /* 最近一次新增错误时刻 */
+static bool     s_recovering = false;            /* 正在自动恢复 */
+static int      s_recover_stage = 0;             /* 1=等挂起ACK, 2=等启动ACK */
+static int64_t  s_recover_deadline_us = 0;       /* 当前阶段超时时刻 */
+static int64_t  s_recover_retry_us = 0;          /* START BUSY 重试时刻 */
+static int64_t  s_recover_next_us = 0;           /* 下一次允许恢复的时刻 (冷却) */
 
 /* 连接后音量时序: 等 AVRC 连上后延迟 VOL_SET_DELAY_MS 发音量, 期间禁止启动流 */
 static volatile bool s_pending_vol = false;  /* 是否处于"待发音量"窗口 */
@@ -106,6 +130,20 @@ static QueueSetHandle_t s_queue_set      = NULL;  /* 队列集 (命令+分发) *
 static TaskHandle_t     s_task           = NULL;  /* 蓝牙任务句柄 (模式切换挂起用) */
 static volatile bool    s_paused         = false; /* 是否处于挂起态 (小说模式) */
 static volatile bool    s_task_ready     = false; /* 蓝牙任务已完成初始化, 可安全挂起 */
+
+/* 日志钩子: 只拦截 IDF L2CAP 的拥塞回调重入错误, 计数后丢弃该行,
+ * 避免弱链路下 20ms 级刷屏; 其他日志原样交给上一个输出函数. */
+static int bt_a2dp_log_filter(const char *fmt, va_list args)
+{
+    if (fmt && strstr(fmt, "is_cong_cback_context")) {
+        __atomic_add_fetch((uint32_t *)&s_cong_err_count, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (s_prev_log_vprintf) {
+        return s_prev_log_vprintf(fmt, args);
+    }
+    return vprintf(fmt, args);
+}
 
 /* 蓝牙地址 → 可读字符串 "xx:xx:xx:xx:xx:xx". 返回 str 或 NULL */
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
@@ -451,6 +489,91 @@ static void bt_end_connect_flow(void)
     }
 }
 
+/* ── L2CAP 拥塞刷屏自动恢复 ── */
+
+/* 清零计数与恢复状态 (连接/断开/挂起蓝牙任务时调用) */
+static void bt_cong_reset(void)
+{
+    __atomic_store_n((uint32_t *)&s_cong_err_count, 0, __ATOMIC_RELAXED);
+    s_cong_seen = 0;
+    s_cong_last_us = 0;
+    s_recovering = false;
+    s_recover_stage = 0;
+    s_recover_deadline_us = 0;
+    s_recover_retry_us = 0;
+    s_recover_next_us = 0;
+}
+
+/* 计数检查 (BT 任务 200ms 轮询): 2 秒无新增清零; 达到阈值触发一次挂起→启动 */
+static void bt_cong_check(int64_t now)
+{
+    uint32_t cnt = __atomic_load_n((uint32_t *)&s_cong_err_count, __ATOMIC_RELAXED);
+
+    if (cnt != s_cong_seen) {
+        s_cong_seen = cnt;
+        s_cong_last_us = now;
+    } else if (s_cong_last_us != 0 && now - s_cong_last_us >= BT_CONG_IDLE_RESET_US) {
+        /* 一段时间没有新增: 清零, 避免偶发错误跨小时累计 */
+        __atomic_store_n((uint32_t *)&s_cong_err_count, 0, __ATOMIC_RELAXED);
+        s_cong_seen = 0;
+        s_cong_last_us = 0;
+        return;
+    }
+
+    if (cnt < BT_CONG_TRIGGER_COUNT) return;
+
+    /* 先清零再触发; 恢复期间的新错误重新累计, 但会被 s_recovering/冷却挡住 */
+    __atomic_store_n((uint32_t *)&s_cong_err_count, 0, __ATOMIC_RELAXED);
+    s_cong_seen = 0;
+    s_cong_last_us = 0;
+
+    if (!s_connected || s_pending_vol || s_recovering) return;
+    if (now < s_recover_next_us) return;
+
+    s_recovering = true;
+    s_recover_stage = s_stream_started ? 1 : 2;
+    s_recover_deadline_us = now + BT_RECOVER_ACK_TIMEOUT_US;
+    s_recover_retry_us = 0;
+    s_recover_next_us = now + BT_RECOVER_COOLDOWN_US;
+
+    ESP_LOGW(BT_TAG, "L2CAP 拥塞错误达到 %d 次, 自动挂起/重启 A2DP 流",
+             BT_CONG_TRIGGER_COUNT);
+
+    if (s_recover_stage == 1) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    } else {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+    }
+}
+
+/* 恢复流程超时/BUSY 重试 (BT 任务 200ms 轮询) */
+static void bt_cong_recover_poll(int64_t now)
+{
+    if (!s_recovering) return;
+
+    /* START 被 BUSY 拒绝: 到点重发 */
+    if (s_recover_stage == 2 && s_recover_retry_us != 0 && now >= s_recover_retry_us) {
+        s_recover_retry_us = 0;
+        s_recover_deadline_us = now + BT_RECOVER_ACK_TIMEOUT_US;
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        return;
+    }
+
+    if (now < s_recover_deadline_us) return;
+
+    if (s_recover_stage == 1) {
+        ESP_LOGW(BT_TAG, "挂起 ACK 超时, 直接重启");
+        s_recover_stage = 2;
+        s_recover_deadline_us = now + BT_RECOVER_ACK_TIMEOUT_US;
+        s_recover_retry_us = 0;
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+    } else {
+        ESP_LOGW(BT_TAG, "启动 ACK 超时, 放弃本次恢复");
+        s_recovering = false;
+        s_recover_stage = 0;
+    }
+}
+
 /* ── A2DP event handler ── */
 static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
 {
@@ -462,6 +585,7 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             atomic_store_bool(&s_connected, true);
             s_stream_started = false;
             s_start_retry = false;
+            bt_cong_reset();   /* 新连接: 清空拥塞计数/恢复状态 */
             memcpy(s_peer_bda, a2d->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
 
             /* 名字来源: 用户连接流程中的名字 → 已知缓存 → 待异步读远端名 */
@@ -504,6 +628,7 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             s_stream_started = false;
             s_start_retry = false;
             s_pending_vol = false;
+            bt_cong_reset();   /* 断开: 清空拥塞计数/恢复状态 */
             s_avrc_connected = false;
             s_avrc_at_us = 0;
             s_connect_at_us = 0;
@@ -517,19 +642,67 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
         break;
     }
     case ESP_A2D_MEDIA_CTRL_ACK_EVT: {   /* 媒体控制 ACK */
-        if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
-            a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
-            ESP_LOGI(BT_TAG, "A2DP 流媒体已启动");
+        esp_a2d_media_ctrl_t cmd = a2d->media_ctrl_stat.cmd;
+        esp_a2d_media_ctrl_ack_t st = a2d->media_ctrl_stat.status;
+
+        if (cmd == ESP_A2D_MEDIA_CTRL_START &&
+            st == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            s_stream_started = true;
+            s_start_retry = false;
+            if (s_recovering) {   /* 自动恢复完成 */
+                s_recovering = false;
+                s_recover_stage = 0;
+                s_recover_retry_us = 0;
+                ESP_LOGI(BT_TAG, "A2DP 流媒体已自动恢复");
+            } else {
+                ESP_LOGI(BT_TAG, "A2DP 流媒体已启动");
+            }
             send_evt(BT_EVT_STREAM_READY, NULL, 0);
-        } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND &&
-                   a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
-            ESP_LOGI(BT_TAG, "A2DP 流媒体已挂起");
-            send_evt(BT_EVT_STREAM_STOPPED, NULL, 0);
-        } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
-                   a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_BUSY) {
-            /* 前一条命令尚未 ACK, START 被丢弃: 标记, 待其完成后重发 (非阻塞) */
-            s_start_retry = true;
-            ESP_LOGW(BT_TAG, "START 被 BUSY 拒绝, 稍后重发");
+        } else if (cmd == ESP_A2D_MEDIA_CTRL_SUSPEND &&
+                   st == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            s_stream_started = false;
+            if (s_recovering && s_recover_stage == 1) {
+                /* 挂起完成: 立刻重启, 等价手动“暂停→播放” */
+                ESP_LOGI(BT_TAG, "A2DP 流媒体已挂起, 正在重启");
+                s_recover_stage = 2;
+                s_recover_deadline_us = esp_timer_get_time() + BT_RECOVER_ACK_TIMEOUT_US;
+                s_recover_retry_us = 0;
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            } else {
+                ESP_LOGI(BT_TAG, "A2DP 流媒体已挂起");
+                send_evt(BT_EVT_STREAM_STOPPED, NULL, 0);
+            }
+        } else if (cmd == ESP_A2D_MEDIA_CTRL_START &&
+                   st == ESP_A2D_MEDIA_CTRL_ACK_BUSY) {
+            if (s_recovering && s_recover_stage == 2) {
+                s_recover_retry_us = esp_timer_get_time() + BT_RECOVER_RETRY_US;
+                ESP_LOGW(BT_TAG, "恢复 START 被 BUSY 拒绝, 稍后重试");
+            } else {
+                /* 前一条命令尚未 ACK, START 被丢弃: 标记, 待其完成后重发 (非阻塞) */
+                s_start_retry = true;
+                ESP_LOGW(BT_TAG, "START 被 BUSY 拒绝, 稍后重发");
+            }
+        } else if (cmd == ESP_A2D_MEDIA_CTRL_START &&
+                   st == ESP_A2D_MEDIA_CTRL_ACK_FAILURE) {
+            s_stream_started = false;
+            if (s_recovering) {
+                ESP_LOGW(BT_TAG, "恢复 START 失败, 放弃本次恢复");
+                s_recovering = false;
+                s_recover_stage = 0;
+                s_recover_retry_us = 0;
+            } else {
+                s_start_retry = true;   /* 下一轮重试 */
+                ESP_LOGW(BT_TAG, "START 失败, 稍后重试");
+            }
+        } else if (cmd == ESP_A2D_MEDIA_CTRL_SUSPEND &&
+                   st != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            if (s_recovering && s_recover_stage == 1) {
+                ESP_LOGW(BT_TAG, "恢复挂起失败, 直接重启");
+                s_recover_stage = 2;
+                s_recover_deadline_us = esp_timer_get_time() + BT_RECOVER_ACK_TIMEOUT_US;
+                s_recover_retry_us = 0;
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            }
         }
         break;
     }
@@ -900,7 +1073,10 @@ static void bt_a2dp_task(void *arg)
         }
 
         if (s_connected) {
-            /* 已连接: 200ms 超时轮询, 期间处理音量同步/流启停 */
+            /* 已连接: 200ms 超时轮询, 期间处理音量同步/拥塞恢复/流启停 */
+            int64_t now_us = esp_timer_get_time();
+            bt_cong_check(now_us);
+            bt_cong_recover_poll(now_us);
             active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(200));
             bt_sync_volume();
             if (active == NULL) {
@@ -921,11 +1097,12 @@ static void bt_a2dp_task(void *arg)
                         s_pending_vol = false;
                     }
                 }
-                if (!s_pending_vol) {   /* 音量窗口结束后, 按播放状态启停流 */
+                if (!s_pending_vol && !s_recovering) {   /* 音量窗口/自动恢复期间, 由各自流程控制流启停 */
                     bool want = atomic_load_bool(&g_pcm_active);
                     if (want && s_start_retry) {
                         /* 上次 START 被 BUSY 丢弃: 前一条命令完成后重发 (非阻塞) */
                         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                        s_stream_started = true;
                         s_start_retry = false;
                     } else if (want != s_stream_started) {
                         esp_a2d_media_ctrl(want ? ESP_A2D_MEDIA_CTRL_START
@@ -1068,6 +1245,14 @@ static void bt_a2dp_task(void *arg)
 /* 初始化蓝牙子系统: 同步创建接口句柄, 后台启动 BT 任务. 返回接口或 NULL. */
 bt_a2dp_iface_t *bt_a2dp_init(void)
 {
+    /* 安装日志钩子: 只过滤 L2CAP 拥塞回调重入错误并计数, 其他日志原样输出 */
+    if (!s_prev_log_vprintf) {
+        vprintf_like_t prev = esp_log_set_vprintf(bt_a2dp_log_filter);
+        if (prev != bt_a2dp_log_filter) {
+            s_prev_log_vprintf = prev;
+        }
+    }
+
     /* 接口句柄同步创建: 让 app_main 立即返回, BT 控制器启动在后台与 LCD/UI 初始化重叠.
      * 失败由任务内 ESP_LOGE 记录, UI 照常启动 */
     s_iface.cmd_queue  = xQueueCreate(10, sizeof(bt_cmd_t));    /* 命令队列 */
@@ -1115,6 +1300,7 @@ bool bt_a2dp_is_connected(void)
 void bt_a2dp_pause(void)
 {
     s_paused = true;
+    bt_cong_reset();   /* 挂起前清空拥塞计数/恢复状态, 避免恢复后残留 */
     if (atomic_load_bool(&s_bt_ready)) {
         if (s_scanning) esp_bt_gap_cancel_discovery();     /* 停止扫描 (CPU 大户) */
         if (atomic_load_bool(&s_connected) || atomic_load_bool(&s_connecting)) {
