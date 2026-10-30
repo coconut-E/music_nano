@@ -10,7 +10,9 @@ extern "C" {
 /* 电源管理: GPIO37 息屏/唤醒按键 + 深度睡眠 (GPIO22 切断外设供电) +
  * 电池电压 ADC (开机低电量检测 + sys_monitor 周期采样共用).
  * power_mgr_early_init 在 app_main 第一行调用 (LCD 前半段之前, 开启外设供电);
- * power_mgr_init 在 LVGL 任务中调用; 按键由 vol_key 定时器复用, 10ms 采样调 power_mgr_poll_key */
+ * power_mgr_init 在 LVGL 任务中调用; 按键由 vol_key 定时器复用, 10ms 采样调 power_mgr_poll_key.
+ * 无操作自动熄屏: 触摸/按键经 power_mgr_notify_activity 续期, 超时后执行与睡眠键短按
+ * 相同的动作 (由蓝牙状态自动选择只熄屏或深睡) */
 void power_mgr_early_init(void);
 void power_mgr_init(void);
 
@@ -32,6 +34,11 @@ void power_mgr_critical_shutdown(void);
 /* 外部亮度变化 (亮度滑块) 时同步当前亮度, 保证淡入/淡出起点正确.
  * v=新的当前亮度 (0~255) */
 void power_mgr_set_cur_bri(uint8_t v);
+
+/* 记录一次用户操作 (触摸/按键), 重置无操作熄屏计时.
+ * 触摸层在每次读到触点时调用 (含空容器/无效区), 按键在按下沿/步进时调用.
+ * 仅可在 LVGL 任务上下文调用 (与内部 idle 定时器同任务) */
+void power_mgr_notify_activity(void);
 
 /* 按键电平上报 (调用方每 10ms 上报一次当前电平).
  * 短按(松手时): 息屏/亮屏或深睡 (原逻辑); 长按(>=800ms): 切换音乐/小说模式.

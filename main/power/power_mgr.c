@@ -59,6 +59,12 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 /* 长按判定: 按住超过此值切换到另一模式 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
+/* 无操作自动熄屏: 音乐 1 分钟 / 小说 3 分钟 (阅读时停留更久).
+ * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡. */
+#define PWR_IDLE_MUSIC_US    (60LL * 1000 * 1000)
+#define PWR_IDLE_NOVEL_US    (3LL * 60 * 1000 * 1000)
+#define PWR_IDLE_POLL_MS     1000
+
 /* 电源状态机 */
 typedef enum {
     PWR_ACTIVE,       /* 正常: 亮屏 */
@@ -74,6 +80,7 @@ static bool        s_key_pending = false;  /* 已按下且尚未判定 (短按�
 static bool        s_key_long_fired = false; /* 本次长按已处理 */
 static uint8_t     s_cur_bri = 0;          /* 当前实际背光亮度 */
 static int         s_fade_dummy = 0;       /* 动画变量占位 (值由 bri_fade_exec 使用) */
+static int64_t     s_last_activity_us = 0; /* 最近一次用户操作时刻 (us), 无操作熄屏用 */
 
 /* 模式切换状态 */
 static bool  s_mode_switching = false;     /* 切换过渡中: 屏蔽按键/蓝牙轮询 */
@@ -93,6 +100,13 @@ static void bri_fade_exec(void *var, int32_t v)
 void power_mgr_set_cur_bri(uint8_t v)
 {
     s_cur_bri = v;
+}
+
+/* 记录一次用户操作: 触摸层每次读到触点、按键按下/步进时调用.
+ * 所有调用方都在 LVGL 任务上下文, 与 idle 定时器同任务, 无需加锁. */
+void power_mgr_notify_activity(void)
+{
+    s_last_activity_us = esp_timer_get_time();
 }
 
 /* 淡入/淡出时长: 变化幅度 diff → 50~400ms 线性映射 (diff=0 不淡).
@@ -196,6 +210,7 @@ static void screen_off(void)
 static void screen_on(void)
 {
     s_state = PWR_ACTIVE;
+    power_mgr_notify_activity();             /* 亮屏后重新计时, 避免立刻再次熄屏 */
     set_lvgl_slow_refresh(false);            /* 恢复刷新频率 */
     ui_touch_set_enabled(true);              /* 恢复触摸 */
     screen_fade(brightness_get(), NULL);     /* 淡入到保存的亮度 */
@@ -225,6 +240,24 @@ static void power_short_press_action(void)
     }
 }
 
+/* 无操作熄屏轮询 (1s): 亮屏且超过时限时, 执行与睡眠键短按相同的动作.
+ * 音乐 1 分钟 / 小说 3 分钟; 息屏、深睡淡出、模式切换过渡中均不处理. */
+static void idle_poll_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_mode_switching) return;
+    if (s_state != PWR_ACTIVE) return;
+
+    int64_t timeout_us = app_mode_is_novel() ? PWR_IDLE_NOVEL_US : PWR_IDLE_MUSIC_US;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_activity_us < timeout_us) return;
+
+    s_last_activity_us = now;   /* 先续期, 动作/淡出期间不重复触发 */
+    ESP_LOGI(TAG, "无操作 %d 秒, 自动执行睡眠键短按动作",
+             (int)(timeout_us / 1000000));
+    power_short_press_action();
+}
+
 /* 按键电平上报 (复用 vol_key 10ms 定时器).
  * 上升沿只记时; 按住 >=800ms 在亮屏态触发模式切换; 松手未触发长按则执行短按动作. */
 void power_mgr_poll_key(bool level)
@@ -237,6 +270,7 @@ void power_mgr_poll_key(bool level)
     s_key_prev = level;
 
     if (rising) {
+        power_mgr_notify_activity();   /* 电源键按下也算一次操作 */
         s_key_press_us   = now;
         s_key_long_fired = false;
         s_key_pending    = true;
@@ -286,6 +320,7 @@ static void mode_switch_light_done(lv_anim_t *a)
     (void)a;
     s_mode_switching = false;
     ui_touch_set_enabled(true);
+    power_mgr_notify_activity();   /* 切换完成重新计时 */
 }
 
 /* 光圈动画结束回调 (非 lv_anim 版本) */
@@ -293,6 +328,7 @@ static void mode_switch_finish(void)
 {
     s_mode_switching = false;
     ui_touch_set_enabled(true);
+    power_mgr_notify_activity();   /* 切换完成重新计时 */
 }
 
 /* 模式切换黑屏过渡入口: 优先"光圈缩放"合成动画, 资源不足时降级为淡黑 */
@@ -351,14 +387,16 @@ void power_mgr_init(void)
     /* 初始电平作为上次值: 开机时按钮若仍按住, 需等一次释放后再按才触发 */
     s_key_prev = (gpio_get_level(PIN_PWR_KEY) == 1);
     s_key_last_us = 0;
+    s_last_activity_us = esp_timer_get_time();   /* 开机即开始无操作计时 */
 
     /* 开机背光渐入: 从 0 渐升到保存亮度 (复用 screen_fade) */
     s_cur_bri = 0;
     lcd_set_brightness(0);
     screen_fade(brightness_get(), NULL);
 
-    /* 息屏期 BT 状态轮询: 1 秒一次 */
+    /* 息屏期 BT 状态轮询 + 无操作熄屏轮询: 均 1 秒一次 */
     lv_timer_create(bt_poll_cb, 1000, NULL);
+    lv_timer_create(idle_poll_cb, PWR_IDLE_POLL_MS, NULL);
 }
 
 /* ────────────────────────── 电池电压 ADC (开机检测) ────────────────────────── */

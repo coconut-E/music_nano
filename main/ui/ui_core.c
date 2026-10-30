@@ -10,6 +10,7 @@
 #include "touch.h"
 #include "ui_core.h"
 #include "settings.h"
+#include "power_mgr.h"
 
 #define TAG "ui_core"
 
@@ -61,6 +62,8 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 
     int32_t tx, ty;
     if (touch_poll(&tx, &ty)) {
+        /* 任意触点都算一次操作 (含空容器/无效区), 重置无操作熄屏计时 */
+        power_mgr_notify_activity();
         /* 原始 Y 映射到屏幕坐标 */
         ty = (int32_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
                        / (TOUCH_Y_MAX - TOUCH_Y_MIN));

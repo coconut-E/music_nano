@@ -234,6 +234,7 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
         }
 
         if (step) {
+            power_mgr_notify_activity();   /* 音量/亮度键步进 (含长按重复) 也算操作 */
             if (app_mode_is_novel()) {
                 int b = (int)brightness_get() + dir * BRIGHTNESS_STEP;
                 if (b < BRIGHTNESS_MIN) b = BRIGHTNESS_MIN;
