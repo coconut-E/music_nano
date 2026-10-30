@@ -37,8 +37,8 @@ typedef struct {
 
 /* 音乐扩展名 (含大小写) */
 static const char *MUSIC_EXTENSIONS[] = {
-    ".mp3", ".flac", ".wav", ".aac",
-    ".MP3", ".FLAC", ".WAV", ".AAC",
+    ".mp3", ".flac", ".wav",
+    ".MP3", ".FLAC", ".WAV",
 };
 /* 小说扩展名 (含大小写) */
 static const char *NOVEL_EXTENSIONS[] = {
