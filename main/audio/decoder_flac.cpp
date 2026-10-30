@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "micro_flac/flac_decoder.h"
 #include "audio.h"
+#include "text_encoding.h"
 
 #define FLAC_TAG "DEC_FLAC"
 
@@ -124,20 +125,14 @@ static void parse_vorbis_comments(const uint8_t *data, size_t len,
             }
 
             if (strcmp(key, "title") == 0 && vlen2 > 0) {
-                size_t n = vlen2 < title_size - 1 ? vlen2 : title_size - 1;
-                memcpy(title, val, n);
-                title[n] = '\0';
+                text_tag_to_utf8(val, vlen2, -1, title, title_size);
                 printf("[FLAC] 标题: %s\n", title);
             } else if (strcmp(key, "artist") == 0 && vlen2 > 0) {
-                size_t n = vlen2 < artist_size - 1 ? vlen2 : artist_size - 1;
-                memcpy(artist, val, n);
-                artist[n] = '\0';
+                text_tag_to_utf8(val, vlen2, -1, artist, artist_size);
                 printf("[FLAC] 艺术家: %s\n", artist);
             } else if (strcmp(key, "album") == 0 && vlen2 > 0) {
                 char buf[96];
-                size_t n = vlen2 < sizeof(buf) - 1 ? vlen2 : sizeof(buf) - 1;
-                memcpy(buf, val, n);
-                buf[n] = '\0';
+                text_tag_to_utf8(val, vlen2, -1, buf, sizeof(buf));
                 printf("[FLAC] 专辑: %s\n", buf);
             }
         }
@@ -232,6 +227,8 @@ static void flac_free_state(decoder_flac_t *d)
     if (d->out32) { heap_caps_free(d->out32); d->out32 = NULL; }
     if (d->cover_data) { heap_caps_free(d->cover_data); d->cover_data = NULL; d->cover_size = 0; }
     if (d->seekpts) { heap_caps_free(d->seekpts); d->seekpts = NULL; d->seek_count = 0; }
+    d->title[0]  = '\0';   /* 清掉上一首的标签, 防止无注释文件沿用旧标题 */
+    d->artist[0] = '\0';
     d->in_off = 0;
     d->in_len = 0;
     d->out_cap = 0;

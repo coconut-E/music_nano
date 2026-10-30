@@ -5,6 +5,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "audio.h"
+#include "text_encoding.h"
 
 #define WAV_TAG "DEC_WAV"
 
@@ -51,14 +52,17 @@ static uint16_t le16(const uint8_t *p)
 }
 
 /* ── RIFF LIST/INFO 子块: INAM=标题, IART=作者, IPRD=专辑 ── */
-/* 提取文本并去掉尾部空白: d=数据, len=长度, out=输出, out_size=缓冲大小 */
+/* 提取文本并去掉尾部空白: d=数据, len=长度, out=输出, out_size=缓冲大小.
+ * WAV LIST/INFO 没有统一编码: 统一按 UTF-8 / UTF-16 BOM / GBK / CP1251 识别后转 UTF-8 */
 static void copy_info_text(const uint8_t *d, uint32_t len, char *out, size_t out_size)
 {
-    size_t o = 0;
-    for (uint32_t i = 0; i < len && o < out_size - 1; i++) {
-        if (d[i] == 0) break;   /* 遇 NUL 结束 */
-        out[o++] = (char)d[i];
+    int enc = -1;
+    if (len >= 2 && ((d[0] == 0xFF && d[1] == 0xFE) ||
+                     (d[0] == 0xFE && d[1] == 0xFF))) {
+        enc = 1;   /* INFO 值偶见 UTF-16 BOM, 交给统一转换器按 BOM 解码 */
     }
+    text_tag_to_utf8(d, len, enc, out, out_size);
+    size_t o = strlen(out);
     while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;   /* 去尾部空白 */
     out[o] = '\0';
 }
@@ -107,6 +111,8 @@ static void wav_parse_list_info(decoder_wav_t *d, uint32_t size)
 static void wav_free_state(decoder_wav_t *d)
 {
     if (d->inbuf) { heap_caps_free(d->inbuf); d->inbuf = NULL; }
+    d->title[0]  = '\0';   /* 清掉上一首的标签, 防止无 INFO 文件沿用旧标题 */
+    d->artist[0] = '\0';
     d->in = NULL;
     d->eof = false;
     d->data_pos = 0;

@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "micro_mp3/mp3_decoder.h"
 #include "audio.h"
+#include "text_encoding.h"
 
 #define MP3_TAG "DEC_MP3"
 #define MP3_INPUT_CHUNK_SIZE 2048        /* 每次读入的压缩数据块大小 */
@@ -105,6 +106,9 @@ static void parse_id3v2(audio_stream_t *in, long *off,
                         uint8_t **cover_out, size_t *cover_size_out)
 {
     *off = 0;
+    if (title_out && title_size) title_out[0] = '\0';
+    if (artist_out && artist_size) artist_out[0] = '\0';
+
     uint8_t h[10];
     if(in->read(in,h,10)!=10 || memcmp(h,"ID3",3)) { in->seek(in,0,SEEK_SET); return; }   /* 非 ID3 头 */
     /* ID3v2 头: [0..2]="ID3", [3]=主版本, [4]=修订号, [5]=标志, [6..9]=标签大小(同步安全整数).
@@ -120,33 +124,56 @@ static void parse_id3v2(audio_stream_t *in, long *off,
         if(fs>ts-pos)break;
         uint8_t *d=(uint8_t*)malloc(fs);
         if(!d||in->read(in,d,fs)!=fs){free(d);break;} pos+=fs;   /* 读帧数据 */
-        if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1){   /* 标题 (跳过首字节编码标志) */
-            size_t n=(size_t)(fs-1); if(n>=title_size)n=title_size-1;
-            if(title_out){memcpy(title_out,d+1,n);title_out[n]='\0';}
-            printf("[ID3] 标题: %.*s\n",(int)(fs-1),d+1);
+        if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1){   /* 标题 */
+            if(title_out && title_size){
+                text_tag_to_utf8(d+1, (size_t)(fs-1), d[0], title_out, title_size);
+                printf("[ID3] 标题: %s\n", title_out);
+            }
         }
         if(!memcmp(fh,ID3_FRAME_ARTIST,4)&&fs>1){   /* 歌手 */
-            size_t n=(size_t)(fs-1); if(n>=artist_size)n=artist_size-1;
-            if(artist_out){memcpy(artist_out,d+1,n);artist_out[n]='\0';}
-            printf("[ID3] 艺术家: %.*s\n",(int)(fs-1),d+1);
+            if(artist_out && artist_size){
+                text_tag_to_utf8(d+1, (size_t)(fs-1), d[0], artist_out, artist_size);
+                printf("[ID3] 艺术家: %s\n", artist_out);
+            }
         }
-        if(!memcmp(fh,ID3_FRAME_ALBUM,4)&&fs>1)  printf("[ID3] 专辑: %.*s\n",(int)(fs-1),d+1);
+        if(!memcmp(fh,ID3_FRAME_ALBUM,4)&&fs>1){   /* 专辑 (仅日志) */
+            char album[SONG_TITLE_MAX];
+            text_tag_to_utf8(d+1, (size_t)(fs-1), d[0], album, sizeof(album));
+            if(album[0]) printf("[ID3] 专辑: %s\n", album);
+        }
         if(!memcmp(fh,ID3_FRAME_COVER,4)&&fs>4){   /* 封面 APIC: MIME\0类型\0描述\0图片 */
-            const char*m=(const char*)(d+1); size_t ml=strlen(m);   /* MIME 类型串 */
-            const uint8_t*p=d+1+ml+1; uint8_t pt=*p++;   /* 图片类型字节 */
-            while(*p&&p<d+fs)p++;   /* 跳过描述串 */
-            p++;
-            size_t isz=d+fs-p;   /* 剩余 = 图片数据 */
-            printf("[ID3] 封面: MIME=%s, 类型=%s, 大小=%zu bytes\n", m,
-                   pt==3?"封面(正面)":pt==4?"封面(背面)":"其他", isz);
-            /* 只取第一张封面, 拷贝到 PSRAM */
-            if (cover_out && *cover_out == NULL && isz > 0 && isz <= COVER_MAX_SIZE) {
-                uint8_t *buf = (uint8_t*)heap_caps_malloc(isz, MALLOC_CAP_SPIRAM);
-                if (buf) {
-                    memcpy(buf, p, isz);
-                    *cover_out = buf;
-                    if (cover_size_out) *cover_size_out = isz;
-                    printf("[ID3] 封面字节已提取到 PSRAM: %zu bytes\n", isz);
+            uint8_t enc = d[0];
+            const uint8_t *p = d + 1;
+            const uint8_t *end = d + fs;
+            const uint8_t *mime = p;
+            while (p < end && *p) p++;   /* MIME 固定为单字节 NUL 结尾 */
+            if (p < end) {
+                p++;   /* 跳过 MIME 的 NUL */
+            }
+            if (p < end) {
+                uint8_t pt = *p++;   /* 图片类型字节 */
+                /* 描述串按 enc 跳过: UTF-16 为 2 字节 NUL, 其余为 1 字节 NUL */
+                if (enc == 1 || enc == 2) {
+                    while (p + 1 < end) {
+                        if (p[0] == 0 && p[1] == 0) { p += 2; break; }
+                        p += 2;
+                    }
+                } else {
+                    while (p < end && *p) p++;
+                    if (p < end) p++;
+                }
+                size_t isz = (size_t)(end - p);   /* 剩余 = 图片数据 */
+                printf("[ID3] 封面: MIME=%s, 类型=%s, 大小=%zu bytes\n", (const char *)mime,
+                       pt==3?"封面(正面)":pt==4?"封面(背面)":"其他", isz);
+                /* 只取第一张封面, 拷贝到 PSRAM */
+                if (cover_out && *cover_out == NULL && isz > 0 && isz <= COVER_MAX_SIZE) {
+                    uint8_t *buf = (uint8_t*)heap_caps_malloc(isz, MALLOC_CAP_SPIRAM);
+                    if (buf) {
+                        memcpy(buf, p, isz);
+                        *cover_out = buf;
+                        if (cover_size_out) *cover_size_out = isz;
+                        printf("[ID3] 封面字节已提取到 PSRAM: %zu bytes\n", isz);
+                    }
                 }
             }
         }
