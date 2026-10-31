@@ -14,7 +14,7 @@
 
 #define TAG "ui_core"
 
-#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 10 * 7)   /* 绘制缓冲总大小 (屏的 70%) */
+#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 20 * 13)  /* 绘制缓冲总大小 (屏的 65%) */
 #define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)                    /* 单帧缓冲 = 一半 */
 
 /* 触摸原始坐标的可用范围 (用于线性映射到屏幕坐标) */
@@ -137,5 +137,5 @@ void ui_core_init(const ui_params_t *params)
     volume_load_from_nvs();       /* 从 NVS 恢复音量 */
     brightness_load_from_nvs();   /* 从 NVS 恢复亮度 */
 
-    xTaskCreatePinnedToCore(ui_loop_task, "lvgl", 8192, NULL, 1, NULL, 1);   /* LVGL 主任务 (core 1) */
+    xTaskCreatePinnedToCore(ui_loop_task, "lvgl", 6144, NULL, 1, NULL, 1);   /* LVGL 主任务 (core 1) */
 }

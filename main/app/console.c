@@ -388,5 +388,5 @@ void console_init(QueueHandle_t app_cmd_queue)
                                        pdTRUE, NULL, stats_timer_cb);   /* 自动重载定时器 */
     xTimerStart(timer, 0);
 
-    xTaskCreatePinnedToCore(console_task, "sys_serial", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(console_task, "sys_serial", 3072, NULL, 1, NULL, 1);
 }

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
+#include "esp_attr.h"
 #include "lvgl.h"
 #include "settings.h"
 #include "sys_monitor.h"
@@ -67,12 +68,13 @@ static char        s_book_path[512] = {0};  /* 当前小说真实路径 (进度�
 static uint32_t    s_book_size  = 0;     /* 文件总字节数 */
 static uint32_t    s_page_start = 0;     /* 当前页起始偏移 */
 static uint32_t    s_page_next  = 0;     /* 下一页起始偏移 */
-static uint32_t    s_page_stack[PAGE_STACK_MAX];  /* 页首偏移历史栈 */
+EXT_RAM_BSS_ATTR static uint32_t s_page_stack[PAGE_STACK_MAX];  /* 页首偏移历史栈 */
 static int         s_page_sp    = 0;     /* 栈顶指针 */
 
-static char        s_buf[PAGE_BYTES + 8];  /* 原始页数据缓冲 (含结尾 '\0') */
-static char        s_u8[U8_MAX];           /* 识别+转换后的 UTF-8 文本 */
-static char        s_disp[DISP_MAX];       /* 预折行后的显示串 (插入 '\n') */
+/* 页工作区 (约 6.4KB): 内部 RAM 紧张, 整块放 PSRAM (开机清零, 使用时机远晚于 PSRAM 初始化) */
+EXT_RAM_BSS_ATTR static char     s_buf[PAGE_BYTES + 8];  /* 原始页数据缓冲 (含结尾 '\0') */
+EXT_RAM_BSS_ATTR static char     s_u8[U8_MAX];           /* 识别+转换后的 UTF-8 文本 */
+EXT_RAM_BSS_ATTR static char     s_disp[DISP_MAX];       /* 预折行后的显示串 (插入 '\n') */
 
 static void novel_open_path(const char *real_path, bool interactive);   /* 按真实路径打开 (interactive=失败时弹框) */
 static void novel_restore_last(void);                 /* 恢复上次打开的小说 */
