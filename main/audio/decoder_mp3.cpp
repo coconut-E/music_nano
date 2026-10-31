@@ -16,6 +16,7 @@
 #define ID3_FRAME_ARTIST  "TPE1"   /* 艺术家帧 ID */
 #define ID3_FRAME_ALBUM   "TALB"   /* 专辑帧 ID */
 #define ID3_FRAME_COVER   "APIC"   /* 图片(封面)帧 ID */
+#define ID3_FRAME_LYRICS  "USLT"   /* 非同步歌词帧 ID */
 
 #define COVER_MAX_SIZE    (512 * 1024)   /* 封面大小上限, 防止超大图吃光 PSRAM */
 
@@ -38,6 +39,10 @@ typedef struct {
     char     title[SONG_TITLE_MAX];      /* 标题 (ID3 TIT2) */
     char     artist[SONG_ARTIST_MAX];    /* 歌手 (ID3 TPE1) */
     uint32_t file_size;                  /* 文件大小 */
+    uint32_t audio_start;                /* MP3 音频数据起点 (ID3 标签之后) */
+
+    char    *lyrics;                     /* USLT 歌词 UTF-8 (PSRAM), 无则 NULL */
+    size_t   lyrics_len;                 /* 歌词字节数 */
 
     uint8_t *cover_data;   /* APIC 图片字节 (PSRAM), 未移交时由 mp3_close 释放 */
     size_t   cover_size;   /* 封面大小 */
@@ -55,6 +60,31 @@ static uint32_t be32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
          | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+}
+
+/* 取 ID3 文本帧正文: 跳过编码字节/语言/描述串, 返回正文起点并写入长度.
+ * 本目录的 USLT 描述串实际是 "UTF-16 BOM + 空串", 因此必须按 2 字节步进找 00 00,
+ * 不能简单地从 d+4 直接转码 (否则会在描述串的 BOM 处截断). */
+static const uint8_t *id3_text_payload(const uint8_t *d, size_t fs,
+                                       uint8_t *enc, size_t *out_len)
+{
+    if (fs < 5) return NULL;
+    *enc = d[0];
+    const uint8_t *p = d + 4;   /* 跳过编码字节 + 3 字节语言 */
+    const uint8_t *end = d + fs;
+
+    if (*enc == 1 || *enc == 2) {
+        while (p + 1 < end) {
+            if (p[0] == 0 && p[1] == 0) { p += 2; break; }
+            p += 2;
+        }
+    } else {
+        while (p < end && *p) p++;
+        if (p < end) p++;
+    }
+    if (p >= end) return NULL;
+    *out_len = (size_t)(end - p);
+    return p;
 }
 
 /* 校验一段字节是否构成合法的 MPEG1/2/2.5 Layer III 帧头.
@@ -97,17 +127,21 @@ static bool mp3_hdr_parse(const uint8_t *p, size_t avail,
     return true;
 }
 
-/* 解析 ID3v2 标签: 提取标题/歌手/封面.
+/* 解析 ID3v2 标签: 提取标题/歌手/封面/歌词.
  * f=文件, off=输出 MP3 数据起始偏移, title_out/artist_out=输出缓冲,
- * cover_out=封面指针(PSRAM), cover_size_out=封面大小. */
+ * cover_out=封面指针(PSRAM), cover_size_out=封面大小,
+ * lyrics_out=歌词 UTF-8 (PSRAM, 无则 NULL), lyrics_len_out=歌词长度. */
 static void parse_id3v2(audio_stream_t *in, long *off,
                         char *title_out, size_t title_size,
                         char *artist_out, size_t artist_size,
-                        uint8_t **cover_out, size_t *cover_size_out)
+                        uint8_t **cover_out, size_t *cover_size_out,
+                        char **lyrics_out, size_t *lyrics_len_out)
 {
     *off = 0;
     if (title_out && title_size) title_out[0] = '\0';
     if (artist_out && artist_size) artist_out[0] = '\0';
+    if (lyrics_out) *lyrics_out = NULL;
+    if (lyrics_len_out) *lyrics_len_out = 0;
 
     uint8_t h[10];
     if(in->read(in,h,10)!=10 || memcmp(h,"ID3",3)) { in->seek(in,0,SEEK_SET); return; }   /* 非 ID3 头 */
@@ -122,6 +156,13 @@ static void parse_id3v2(audio_stream_t *in, long *off,
         if(fh[0]==0){in->seek(in,-10,SEEK_CUR);break;}   /* 帧 ID 为空 = 标签结束 */
         uint32_t fs=(v>=4)?syncsafe(fh+4):be32(fh+4);   /* v2.4 用 syncsafe, 更早用普通大端 */
         if(fs>ts-pos)break;
+        /* 超大封面直接跳过, 避免为 1.5MB 图片申请临时缓冲 (既慢又可能失败,
+         * 失败会中断后续帧解析, 连带丢掉 USLT 歌词). 反正 >512KB 的封面本来就不用. */
+        if(fs>COVER_MAX_SIZE && !memcmp(fh,ID3_FRAME_COVER,4)){
+            if(!in->seek(in,(long)fs,SEEK_CUR))break;
+            pos+=fs;
+            continue;
+        }
         uint8_t *d=(uint8_t*)malloc(fs);
         if(!d||in->read(in,d,fs)!=fs){free(d);break;} pos+=fs;   /* 读帧数据 */
         if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1){   /* 标题 */
@@ -140,6 +181,29 @@ static void parse_id3v2(audio_stream_t *in, long *off,
             char album[SONG_TITLE_MAX];
             text_tag_to_utf8(d+1, (size_t)(fs-1), d[0], album, sizeof(album));
             if(album[0]) printf("[ID3] 专辑: %s\n", album);
+        }
+        if(!memcmp(fh,ID3_FRAME_LYRICS,4)&&fs>4 && lyrics_out && !*lyrics_out){   /* 内嵌歌词 USLT */
+            uint8_t enc = 0;
+            size_t n = 0;
+            const uint8_t *p = id3_text_payload(d, fs, &enc, &n);
+            if (p && n) {
+                char *buf = (char *)heap_caps_malloc(LYRICS_BUF_MAX, MALLOC_CAP_SPIRAM);
+                if (!buf) {
+                    buf = (char *)heap_caps_malloc(LYRICS_BUF_MAX,
+                                                   MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+                }
+                if (buf) {
+                    int out = text_tag_to_utf8(p, n, enc, buf, LYRICS_BUF_MAX);
+                    if (out > 0) {
+                        buf[out] = '\0';
+                        *lyrics_out = buf;
+                        if (lyrics_len_out) *lyrics_len_out = (size_t)out;
+                        printf("[ID3] 歌词: %d bytes\n", out);
+                    } else {
+                        heap_caps_free(buf);
+                    }
+                }
+            }
         }
         if(!memcmp(fh,ID3_FRAME_COVER,4)&&fs>4){   /* 封面 APIC: MIME\0类型\0描述\0图片 */
             uint8_t enc = d[0];
@@ -188,18 +252,25 @@ static bool mp3_open(audio_decoder_t *iface, const char *path, audio_stream_t *i
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
     (void)path;
 
-    /* 释放上次残留封面 (防止重复 open 泄漏) */
+    /* 释放上次残留封面/歌词 (防止重复 open 泄漏) */
     if (d->cover_data) {
         heap_caps_free(d->cover_data);
         d->cover_data = NULL;
         d->cover_size = 0;
+    }
+    if (d->lyrics) {
+        heap_caps_free(d->lyrics);
+        d->lyrics = NULL;
+        d->lyrics_len = 0;
     }
 
     d->in = in;
 
     long off = 0;
     parse_id3v2(in, &off, d->title, sizeof(d->title), d->artist, sizeof(d->artist),
-                &d->cover_data, &d->cover_size);   /* 先解析头部标签 */
+                &d->cover_data, &d->cover_size,
+                &d->lyrics, &d->lyrics_len);   /* 先解析头部标签 */
+    d->audio_start = off > 0 ? (uint32_t)off : 0;
 
     d->mp3 = new micro_mp3::Mp3Decoder();
     d->inbuf = (uint8_t *)heap_caps_malloc(MP3_INPUT_CHUNK_SIZE, MALLOC_CAP_DEFAULT);
@@ -207,6 +278,7 @@ static bool mp3_open(audio_decoder_t *iface, const char *path, audio_stream_t *i
         if(d->mp3){delete d->mp3; d->mp3=NULL;}
         if(d->inbuf){heap_caps_free(d->inbuf); d->inbuf=NULL;}
         if(d->cover_data){heap_caps_free(d->cover_data); d->cover_data=NULL; d->cover_size=0;}
+        if(d->lyrics){heap_caps_free(d->lyrics); d->lyrics=NULL; d->lyrics_len=0;}
         d->in = NULL;
         return false;
     }
@@ -299,6 +371,7 @@ static void mp3_close(audio_decoder_t *iface)
     if(d->mp3){ delete d->mp3; d->mp3 = NULL; }
     if(d->inbuf){ heap_caps_free(d->inbuf); d->inbuf = NULL; }
     if(d->cover_data){ heap_caps_free(d->cover_data); d->cover_data = NULL; d->cover_size = 0; }
+    if(d->lyrics){ heap_caps_free(d->lyrics); d->lyrics = NULL; d->lyrics_len = 0; }
     d->in     = NULL;
     d->in_off = 0;
     d->in_len = 0;
@@ -339,6 +412,12 @@ static uint32_t mp3_get_position(audio_decoder_t *iface)
     if (!d->in) return 0;
     long pos = d->in->tell(d->in);
     return pos > 0 ? (uint32_t)pos : 0;
+}
+
+/* 音频数据起点 (ID3 标签之后): 进度/歌词时间要扣掉它, 否则大封面会让歌词提前几十秒 */
+static uint32_t mp3_get_data_offset(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->audio_start;
 }
 
 /* seek 后按真实帧边界重定位 (避免落在帧中间被随机字节误判出假帧头/错误采样率).
@@ -401,6 +480,11 @@ static const char *mp3_get_artist(audio_decoder_t *iface)
     return ((decoder_mp3_t *)iface)->artist;
 }
 
+static const char *mp3_get_lyrics(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->lyrics;
+}
+
 static const uint8_t *mp3_get_cover_data(audio_decoder_t *iface)
 {
     return ((decoder_mp3_t *)iface)->cover_data;
@@ -435,9 +519,11 @@ audio_decoder_t *decoder_mp3_create(void)
     d->iface.get_bitrate     = mp3_get_bitrate;
     d->iface.get_file_size   = mp3_get_file_size;
     d->iface.get_position    = mp3_get_position;
+    d->iface.get_data_offset = mp3_get_data_offset;
     d->iface.seek            = mp3_seek;
     d->iface.get_title       = mp3_get_title;
     d->iface.get_artist      = mp3_get_artist;
+    d->iface.get_lyrics      = mp3_get_lyrics;
     d->iface.get_cover_data  = mp3_get_cover_data;
     d->iface.get_cover_size  = mp3_get_cover_size;
     d->iface.take_cover      = mp3_take_cover;

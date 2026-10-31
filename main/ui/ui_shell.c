@@ -320,3 +320,8 @@ void ui_shell_on_mode_changed(void)
     s_vol_idle = 0;
     vol_popup_sync();   /* 同步为目标模式当前值 (含量程), 避免切换后立刻误弹/残留 */
 }
+
+bool ui_shell_volume_visible(void)
+{
+    return s_vol_cont && !lv_obj_has_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
+}

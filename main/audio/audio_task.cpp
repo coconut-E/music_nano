@@ -234,6 +234,12 @@ static size_t          s_out_bytes = 0;      /* 当前块转换输出字节数 *
 static bool            s_info_done = false;  /* 歌曲信息是否已解析完成 */
 static SemaphoreHandle_t s_info_mux = NULL;  /* 保护 g_song_info 的成组写入/快照读取 (防撕裂) */
 
+/* 当前歌曲歌词副本 (解码器 USLT → UTF-8), 供 UI 按曲目哈希取用.
+ * 不直接暴露解码器指针, 避免切歌/关闭解码器时 UI 读到已释放内存. */
+static char     *s_lyrics_buf = NULL;
+static size_t    s_lyrics_len = 0;
+static uint32_t  s_lyrics_hash = 0;
+
 static uint64_t s_total_decoded = 0;   /* 累计解码字节数 (统计用) */
 static uint64_t s_total_sent    = 0;   /* 累计发送字节数 (统计用) */
 static int64_t  s_play_start_us = 0;   /* 本次播放开始时刻 (统计耗时用) */
@@ -324,9 +330,22 @@ static void update_duration_elapsed_locked(void)
     uint32_t bps  = kbps * 125;   /* kbps → 字节每秒 */
     if (bps == 0) bps = 128 * 125;   /* 未知码率按 128kbps 兜底 */
 
+    /* MP3/FLAC 的 file_size/position 含 ID3/元数据; 扣掉后进度和歌词才对得上.
+     * 本目录大封面标签可达 1.5MB, 不扣会让歌词提前几十秒. */
+    uint32_t off = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
+    uint32_t fsz = s_decoder->get_file_size(s_decoder);
+    uint32_t asz = (fsz > off) ? (fsz - off) : fsz;
+    uint32_t pos = s_decoder->get_position(s_decoder);
+    if (pos < off) pos = off;
+
+    uint64_t dur_ms = (uint64_t)asz * 1000 / bps;   /* 音频数据字节 / 码率 */
+    uint64_t el_ms  = (uint64_t)(pos - off) * 1000 / bps;
+    if (el_ms > dur_ms) el_ms = dur_ms;
+
     g_song_info.bitrate_kbps = kbps ? kbps : 128;
-    g_song_info.duration_sec = s_decoder->get_file_size(s_decoder) / bps;   /* 文件大小/码率=时长 */
-    g_song_info.elapsed_sec  = s_decoder->get_position(s_decoder) / bps;    /* 已解码字节/码率 */
+    g_song_info.duration_sec = (uint32_t)(dur_ms / 1000);
+    g_song_info.elapsed_ms   = (uint32_t)el_ms;
+    g_song_info.elapsed_sec  = g_song_info.elapsed_ms / 1000;
 }
 
 /* 独立调用版本: 自行加锁 (decode 循环里周期性更新进度) */
@@ -370,6 +389,24 @@ static void fill_song_info(void)
     g_song_info.channels     = s_decoder->get_channels(s_decoder);
     g_song_info.bits_per_sample = (s_decoder->get_bits ? s_decoder->get_bits(s_decoder) : 16);
     g_song_info.path_hash    = song_hash32(s_current_path, strlen(s_current_path));   /* 曲目身份: 供 UI 过滤上一首残留快照 */
+
+    /* 复制歌词到全局缓冲 (不直接暴露解码器指针, 防切歌/关闭时悬空) */
+    s_lyrics_len  = 0;
+    s_lyrics_hash = 0;
+    const char *ly = (s_decoder->get_lyrics) ? s_decoder->get_lyrics(s_decoder) : NULL;
+    if (ly && ly[0] && s_lyrics_buf) {
+        size_t n = strlen(ly);
+        if (n >= LYRICS_BUF_MAX) n = LYRICS_BUF_MAX - 1;
+        if (n) {
+            memcpy(s_lyrics_buf, ly, n);
+            s_lyrics_buf[n] = '\0';
+            s_lyrics_len  = n;
+            s_lyrics_hash = g_song_info.path_hash;
+        }
+    }
+    printf("[歌词] 缓存: len=%u hash=%08x buf=%p\n",
+           (unsigned)s_lyrics_len, (unsigned)s_lyrics_hash, (void *)s_lyrics_buf);
+
     update_duration_elapsed_locked();   /* 已持锁, 用 _locked 版本避免重复加锁 */
 
     atomic_store_bool(&g_song_info_valid, true);   /* 最后才置有效位 (先写字段后发信号) */
@@ -390,6 +427,23 @@ extern "C" bool song_info_snapshot(song_info_t *out)
     if (valid) *out = g_song_info;   /* 整体拷贝 (含字符串数组), 保证一致 */
     if (s_info_mux) xSemaphoreGive(s_info_mux);
     return valid;
+}
+
+/* 取当前歌曲歌词: 与 fill_song_info 的写入互斥. path_hash 不符则返回 0 */
+extern "C" size_t audio_lyrics_copy(uint32_t path_hash, char *dst, size_t cap)
+{
+    if (!dst || cap < 2) return 0;
+    dst[0] = '\0';
+    size_t n = 0;
+    if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
+    if ((path_hash == 0 || path_hash == s_lyrics_hash) &&
+        s_lyrics_len && s_lyrics_buf) {
+        n = (s_lyrics_len < cap - 1) ? s_lyrics_len : (cap - 1);
+        memcpy(dst, s_lyrics_buf, n);
+        dst[n] = '\0';
+    }
+    if (s_info_mux) xSemaphoreGive(s_info_mux);
+    return n;
 }
 
 /* 启动播放: 需要则切换解码器; 失败则发 FILE_NOT_FOUND 并停在 IDLE.
@@ -504,14 +558,17 @@ static void audio_task(void *arg)
                 case AUDIO_CMD_SEEK:
                     if (s_decoder && s_decoder->seek) {
                         uint32_t fsz = s_decoder->get_file_size(s_decoder);
-                        uint32_t target = (uint64_t)fsz * cmd.param / 1000;   /* param=千分比 → 字节偏移 */
+                        uint32_t off = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
+                        uint32_t asz = (fsz > off) ? (fsz - off) : fsz;
+                        uint32_t target = off + (uint32_t)((uint64_t)asz * cmd.param / 1000);
                         s_decoder->seek(s_decoder, target);
                         xStreamBufferReset(s_pcm_stream);
                         s_pending_pcm = false;
                         s_pcm_offset = 0;
                         if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
-                        g_song_info.elapsed_sec =   /* 同步进度显示 (与快照读取互斥) */
-                            (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                        uint32_t ms = (uint32_t)((uint64_t)g_song_info.duration_sec * cmd.param);
+                        g_song_info.elapsed_ms  = ms;   /* 同步进度/歌词 (与快照读取互斥) */
+                        g_song_info.elapsed_sec = ms / 1000;
                         if (s_info_mux) xSemaphoreGive(s_info_mux);
                     }
                     break;
@@ -650,11 +707,14 @@ static void audio_task(void *arg)
             case AUDIO_CMD_SEEK:
                 if (s_decoder && s_decoder->seek) {
                     uint32_t fsz = s_decoder->get_file_size(s_decoder);
-                    uint32_t target = (uint64_t)fsz * cmd.param / 1000;
+                    uint32_t off = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
+                    uint32_t asz = (fsz > off) ? (fsz - off) : fsz;
+                    uint32_t target = off + (uint32_t)((uint64_t)asz * cmd.param / 1000);
                     s_decoder->seek(s_decoder, target);
                     if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
-                    g_song_info.elapsed_sec =
-                        (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                    uint32_t ms = (uint32_t)((uint64_t)g_song_info.duration_sec * cmd.param);
+                    g_song_info.elapsed_ms  = ms;
+                    g_song_info.elapsed_sec = ms / 1000;
                     if (s_info_mux) xSemaphoreGive(s_info_mux);
                 }
                 break;
@@ -695,6 +755,15 @@ extern "C" void audio_task_init(const audio_task_params_t *params)
         printf("[音频] FATAL: PCM/OUT 缓冲分配失败\n");
         return;
     }
+
+    /* 当前歌曲歌词副本 (解码任务写, UI 读) */
+    s_lyrics_buf = (char *)heap_caps_malloc(LYRICS_BUF_MAX, MALLOC_CAP_SPIRAM);
+    if (!s_lyrics_buf) {
+        s_lyrics_buf = (char *)heap_caps_malloc(LYRICS_BUF_MAX,
+                                                MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    if (!s_lyrics_buf) printf("[音频] 歌词缓冲分配失败, 歌词功能不可用\n");
+
     xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 1, &s_task, 0);
 }
 

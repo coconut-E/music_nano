@@ -12,7 +12,7 @@ extern "C" {
  * power_mgr_early_init 在 app_main 第一行调用 (LCD 前半段之前, 开启外设供电);
  * power_mgr_init 在 LVGL 任务中调用; 按键由 vol_key 定时器复用, 10ms 采样调 power_mgr_poll_key.
  * 无操作自动熄屏: 触摸/按键经 power_mgr_notify_activity 续期, 超时后执行与睡眠键短按
- * 相同的动作 (由蓝牙状态自动选择只熄屏或深睡) */
+ * 相同的动作 (由蓝牙状态自动选择只熄屏或深睡). 音乐封面 1 分钟 / 歌词页 3 分钟 / 小说 3 分钟 */
 void power_mgr_early_init(void);
 void power_mgr_init(void);
 
@@ -39,6 +39,10 @@ void power_mgr_set_cur_bri(uint8_t v);
  * 触摸层在每次读到触点时调用 (含空容器/无效区), 按键在按下沿/步进时调用.
  * 仅可在 LVGL 任务上下文调用 (与内部 idle 定时器同任务) */
 void power_mgr_notify_activity(void);
+
+/* 设置歌词页是否显示: true=歌词页 (无操作 3 分钟熄屏), false=音乐封面 (1 分钟).
+ * 由音乐 UI 在进入/退出歌词页、销毁音乐组时调用 */
+void power_mgr_set_lyrics_active(bool active);
 
 /* 按键电平上报 (调用方每 10ms 上报一次当前电平).
  * 短按(松手时): 息屏/亮屏或深睡 (原逻辑); 长按(>=800ms): 切换音乐/小说模式.

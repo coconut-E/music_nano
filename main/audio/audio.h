@@ -18,6 +18,9 @@ extern "C" {
 #define SONG_ARTIST_MAX  128   /* 歌手最大长度 */
 #define SONG_FORMAT_MAX  16    /* 格式名最大长度 */
 
+/* 内嵌歌词 UTF-8 缓冲上限 (单首实测最大约 20KB, 32KB 留余量) */
+#define LYRICS_BUF_MAX   32768
+
 /* 当前歌曲信息 (解码任务写入, UI 只读) */
 typedef struct {
     char     title[SONG_TITLE_MAX];    /* 歌名 */
@@ -29,6 +32,7 @@ typedef struct {
     uint32_t bitrate_kbps;             /* 码率 (kbps) */
     uint32_t duration_sec;             /* 总时长 (秒) */
     uint32_t elapsed_sec;              /* 已播放时长 (秒) */
+    uint32_t elapsed_ms;               /* 已播放时长 (毫秒, 已扣除 ID3/元数据偏移) */
     uint32_t path_hash;                /* 当前文件路径的 xxHash32: 供 UI 确认快照属于哪首歌 */
 } song_info_t;
 
@@ -67,13 +71,20 @@ typedef struct audio_decoder_s {
     uint32_t  (*get_bitrate)(struct audio_decoder_s *self);             /* 码率 */
     uint32_t  (*get_file_size)(struct audio_decoder_s *self);           /* 文件大小 (字节) */
     uint32_t  (*get_position)(struct audio_decoder_s *self);            /* 当前解码位置 (字节); FLAC 为文件读游标, 含预读 */
+    uint32_t  (*get_data_offset)(struct audio_decoder_s *self);         /* 音频数据起点 (ID3/元数据长度), 无则 0 */
     bool      (*seek)(struct audio_decoder_s *self, uint32_t byte_offset);  /* 按字节偏移 seek, 成功返回 true */
     const char *(*get_title)(struct audio_decoder_s *self);             /* 歌名 (无则 NULL) */
     const char *(*get_artist)(struct audio_decoder_s *self);            /* 歌手 (无则 NULL) */
+    const char *(*get_lyrics)(struct audio_decoder_s *self);            /* 内嵌歌词 UTF-8 (无则 NULL) */
     const uint8_t *(*get_cover_data)(struct audio_decoder_s *self);     /* 内嵌封面 JPEG 数据指针 (无则 NULL) */
     size_t         (*get_cover_size)(struct audio_decoder_s *self);     /* 封面数据大小 */
     void           (*take_cover)(struct audio_decoder_s *self);         /* 转移封面数据所有权 (释放后置空, 防止重复释放) */
 } audio_decoder_t;
+
+/* 取当前歌曲内嵌歌词 (UTF-8, NUL 结尾).
+ * path_hash=调用方认为的曲目哈希; 与当前曲目不符时返回 0, 避免切歌窗口取到上一首.
+ * dst/cap=输出缓冲. 返回拷贝的字节数 (0=无歌词/曲目不符). */
+size_t audio_lyrics_copy(uint32_t path_hash, char *dst, size_t cap);
 
 /* 各格式解码器工厂函数 */
 audio_decoder_t *decoder_mp3_create(void);

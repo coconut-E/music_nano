@@ -308,6 +308,13 @@ static uint32_t wav_get_position(audio_decoder_t *iface)
     return ((decoder_wav_t *)iface)->data_pos;
 }
 
+/* WAV 的 get_file_size/get_position 已经相对 data 区, 偏移为 0 */
+static uint32_t wav_get_data_offset(audio_decoder_t *iface)
+{
+    (void)iface;
+    return 0;
+}
+
 /* 按字节偏移 seek: byte_offset=相对 data 区起始的偏移 */
 static bool wav_seek(audio_decoder_t *iface, uint32_t byte_offset)
 {
@@ -351,6 +358,7 @@ audio_decoder_t *decoder_wav_create(void)
     d->iface.get_bitrate     = wav_get_bitrate;
     d->iface.get_file_size   = wav_get_file_size;
     d->iface.get_position    = wav_get_position;
+    d->iface.get_data_offset = wav_get_data_offset;
     d->iface.seek            = wav_seek;
     d->iface.get_title       = wav_get_title;
     d->iface.get_artist      = wav_get_artist;

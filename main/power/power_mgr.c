@@ -59,9 +59,10 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 /* 长按判定: 按住超过此值切换到另一模式 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
-/* 无操作自动熄屏: 音乐 1 分钟 / 小说 3 分钟 (阅读时停留更久).
+/* 无操作自动熄屏: 音乐封面 1 分钟 / 小说 3 分钟 / 歌词页 3 分钟.
  * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡. */
 #define PWR_IDLE_MUSIC_US    (60LL * 1000 * 1000)
+#define PWR_IDLE_LYRICS_US   (3LL * 60 * 1000 * 1000)
 #define PWR_IDLE_NOVEL_US    (3LL * 60 * 1000 * 1000)
 #define PWR_IDLE_POLL_MS     1000
 
@@ -81,6 +82,7 @@ static bool        s_key_long_fired = false; /* 本次长按已处理 */
 static uint8_t     s_cur_bri = 0;          /* 当前实际背光亮度 */
 static int         s_fade_dummy = 0;       /* 动画变量占位 (值由 bri_fade_exec 使用) */
 static int64_t     s_last_activity_us = 0; /* 最近一次用户操作时刻 (us), 无操作熄屏用 */
+static bool        s_lyrics_active = false; /* 音乐模式下当前是否显示歌词页 (3 分钟超时) */
 
 /* 模式切换状态 */
 static bool  s_mode_switching = false;     /* 切换过渡中: 屏蔽按键/蓝牙轮询 */
@@ -107,6 +109,15 @@ void power_mgr_set_cur_bri(uint8_t v)
 void power_mgr_notify_activity(void)
 {
     s_last_activity_us = esp_timer_get_time();
+}
+
+/* 歌词页显示状态: true=歌词页 (3 分钟), false=封面 (1 分钟).
+ * 由 UI 在进入/退出歌词页及销毁音乐组时调用, 与 idle 定时器同任务. */
+void power_mgr_set_lyrics_active(bool active)
+{
+    if (s_lyrics_active == active) return;
+    s_lyrics_active = active;
+    power_mgr_notify_activity();   /* 模式变化后重新计时 */
 }
 
 /* 淡入/淡出时长: 变化幅度 diff → 50~400ms 线性映射 (diff=0 不淡).
@@ -248,7 +259,10 @@ static void idle_poll_cb(lv_timer_t *timer)
     if (s_mode_switching) return;
     if (s_state != PWR_ACTIVE) return;
 
-    int64_t timeout_us = app_mode_is_novel() ? PWR_IDLE_NOVEL_US : PWR_IDLE_MUSIC_US;
+    int64_t timeout_us;
+    if (app_mode_is_novel()) timeout_us = PWR_IDLE_NOVEL_US;
+    else if (s_lyrics_active) timeout_us = PWR_IDLE_LYRICS_US;
+    else timeout_us = PWR_IDLE_MUSIC_US;
     int64_t now = esp_timer_get_time();
     if (now - s_last_activity_us < timeout_us) return;
 

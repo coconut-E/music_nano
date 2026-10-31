@@ -1,6 +1,8 @@
 #ifndef __UI_SHELL_H__
 #define __UI_SHELL_H__
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,6 +16,9 @@ void ui_shell_init(void);
 
 /* 模式切换后调用: 复位弹窗量程/状态并隐藏弹窗 */
 void ui_shell_on_mode_changed(void);
+
+/* 音量/亮度弹窗当前是否可见 (截图合成动画用来决定是否保留右侧弹窗) */
+bool ui_shell_volume_visible(void);
 
 #ifdef __cplusplus
 }

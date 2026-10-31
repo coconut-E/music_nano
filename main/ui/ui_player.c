@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "lvgl.h"
@@ -16,6 +17,8 @@
 #include "atomic_utils.h"
 #include "ui_core.h"
 #include "ui_player.h"
+#include "ui_lyrics.h"
+#include "ui_shell.h"
 #include "menu.h"
 #include "menu_like.h"
 #include "menu_mode.h"
@@ -104,6 +107,18 @@ static lv_obj_t *s_play_icon;       /* 播放/暂停图标 */
 static lv_obj_t *s_mode_icon;       /* 播放模式图标 */
 static lv_obj_t *s_icon_bt;         /* 顶部蓝牙图标 (已连接时变淡蓝) */
 static int       s_icon_bt_state = -1;  /* 蓝牙图标当前着色状态 (-1=未知, 0=未连, 1=已连) */
+
+/* 歌词页切换用的控件句柄 (封面页/歌词页共用) */
+static lv_obj_t *s_panel = NULL;    /* 底部模式/参数面板 */
+static lv_obj_t *s_play_btn = NULL; /* 播放/暂停按钮 */
+static lv_obj_t *s_prev_btn = NULL; /* 上一首 */
+static lv_obj_t *s_next_btn = NULL; /* 下一首 */
+static bool      s_lyrics_mode = false;  /* 当前是否歌词页 */
+static bool      s_lyr_busy = false;     /* 截图切换动画进行中 */
+
+static void lyrics_enter(void);
+static void lyrics_exit(void);
+static void lyrics_back_cb(void);
 
 /* 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) */
 static char s_pl_group[FS_GROUP_MAX];   /* 当前播放列表所在分组 */
@@ -247,6 +262,16 @@ static void album_art_long_press_cb(lv_event_t *e)
 {
     (void)e;
     album_art_long_press();
+}
+
+/* 封面短按: 切到歌词页.
+ * 用 SHORT_CLICKED 而不是 CLICKED: LVGL 长按后松手仍会发 CLICKED,
+ * 会和"长按弹出喜欢/删除"冲突. */
+static void album_art_short_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!atomic_load_bool(&g_song_info_valid)) return;
+    lyrics_enter();
 }
 
 /* 按索引播放 (索引自动取模回绕), 解析路径并投递 AUDIO_CMD_PLAY */
@@ -1075,6 +1100,365 @@ static void bri_draw_create(void)
 
 /* ── 主界面构建 ── */
 /* 构建音乐组界面 (仅当未构建时调用): 恢复设置, 建控件, 建信息定时器 */
+/* ════════════════════════════════════════════════════════════════
+ *  封面页 / 歌词页 切换
+ *  动画不用实时控件渲染: 先把两页截图到 PSRAM, 裁成 6 层图片,
+ *  在 lv_layer_top 上按帧移动/淡入淡出, 手动 lv_refr_now.
+ *  这样每帧只有图片搬运和透明度混合, 不触发文字布局/重绘.
+ * ════════════════════════════════════════════════════════════════ */
+#define LYR_ANIM_MS       280
+#define LYR_ANIM_TICK_MS  20
+#define SCR_BYTES         (TFT_HOR_RES * TFT_VER_RES * 2)
+
+typedef struct {
+    lv_img_dsc_t dsc;
+    uint8_t     *buf;
+    lv_obj_t    *img;
+    int          w, h;
+} lyr_layer_t;
+
+enum {
+    LL_TOPBAR = 0,
+    LL_COVER,
+    LL_INFO,
+    LL_PANEL,
+    LL_LYRICS,
+    LL_CONTROLS,
+    LL_BRIGHT,
+    LL_VOLUME,
+    LL_NUM
+};
+
+/* 裁剪区域: x, y, w, h */
+static const int k_lyr_rect[LL_NUM][4] = {
+    {  0,   0, 172,  36 },   /* 顶栏 (只到状态栏下沿, 给歌词区让出空间) */
+    { 35,  40, 100, 100 },   /* 封面 */
+    {  8, 148, 156,  40 },   /* 歌名 + 作者 */
+    {  4, 272, 164,  46 },   /* 模式/参数面板 */
+    {  0,  36, 172, 204 },   /* 歌词区: y=36..240, 一直顶到状态栏下沿 */
+    {  0, 190, 172,  70 },   /* 进度条 + 时间 + 按钮 */
+    {  0,  45,   6,  90 },   /* 左侧亮度条 (只取可见的 5px 条) */
+    { 140, 45,  32, 110 },   /* 右侧音量/亮度弹窗 */
+};
+
+static lyr_layer_t s_lyr_layers[LL_NUM];
+static lv_obj_t   *s_lyr_anim_bg = NULL;
+static lv_timer_t *s_lyr_anim_timer = NULL;
+static int64_t     s_lyr_anim_t0 = 0;
+static bool        s_lyr_anim_enter = true;
+static bool        s_lyr_vol_visible = false;
+static uint8_t    *s_lyr_layer_buf = NULL;
+static uint8_t    *s_lyr_snap_a = NULL;
+static uint8_t    *s_lyr_snap_b = NULL;
+
+/* 暂停/恢复 LVGL 自动刷新 (动画期间由定时器手动刷) */
+static void display_refresh_pause(void)
+{
+    lv_timer_t *r = _lv_disp_get_refr_timer(lv_disp_get_default());
+    if (r) {
+        lv_timer_pause(r);
+        lv_timer_set_period(r, 1000);
+    }
+}
+
+static void display_refresh_resume(void)
+{
+    lv_timer_t *r = _lv_disp_get_refr_timer(lv_disp_get_default());
+    if (r) {
+        lv_timer_set_period(r, LV_DISP_DEF_REFR_PERIOD);
+        lv_timer_resume(r);
+    }
+}
+
+/* 底部控件在封面页/歌词页的纵向位置 */
+static void chrome_apply_layout(bool lyrics)
+{
+    if (s_progress_slider) lv_obj_set_y(s_progress_slider, lyrics ? 244 : 194);
+    if (s_time_current)    lv_obj_set_y(s_time_current,    lyrics ? 254 : 204);
+    if (s_time_total)      lv_obj_set_y(s_time_total,      lyrics ? 254 : 204);
+    if (s_play_btn)        lv_obj_set_y(s_play_btn,        lyrics ? 262 : 212);
+    if (s_prev_btn)        lv_obj_set_y(s_prev_btn,        lyrics ? 256 : 206);
+    if (s_next_btn)        lv_obj_set_y(s_next_btn,        lyrics ? 256 : 206);
+}
+
+static void chrome_set_visible(bool show)
+{
+    lv_obj_t *objs[] = { s_album_art, s_title_label, s_artist_label, s_panel };
+    for (size_t i = 0; i < sizeof(objs) / sizeof(objs[0]); i++) {
+        if (!objs[i]) continue;
+        if (show) lv_obj_clear_flag(objs[i], LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(objs[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void page_set_cover(void)
+{
+    chrome_apply_layout(false);
+    chrome_set_visible(true);
+    lyrics_view_hide();
+}
+
+static void page_set_lyrics(void)
+{
+    lyrics_view_show();
+    chrome_apply_layout(true);
+    chrome_set_visible(false);
+}
+
+static bool lyr_full_snapshot(uint8_t *buf)
+{
+    lv_img_dsc_t dsc;
+    return lv_snapshot_take_to_buf(lv_scr_act(), LV_IMG_CF_TRUE_COLOR,
+                                   &dsc, buf, SCR_BYTES) == LV_RES_OK;
+}
+
+static void lyr_crop(const uint8_t *src, int idx, uint8_t *dst)
+{
+    int x = k_lyr_rect[idx][0], y = k_lyr_rect[idx][1];
+    int w = k_lyr_rect[idx][2], h = k_lyr_rect[idx][3];
+    for (int r = 0; r < h; r++) {
+        memcpy(dst + (size_t)r * w * 2,
+               src + ((size_t)(y + r) * TFT_HOR_RES + x) * 2,
+               (size_t)w * 2);
+    }
+}
+
+/* A=封面页, B=歌词页; 固定按这两个来源裁层 */
+static bool lyr_crop_layers(void)
+{
+    size_t total = 0;
+    for (int i = 0; i < LL_NUM; i++) {
+        total += (size_t)k_lyr_rect[i][2] * k_lyr_rect[i][3] * 2;
+    }
+    s_lyr_layer_buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!s_lyr_layer_buf) return false;
+    if (!s_lyr_snap_a || !s_lyr_snap_b) return false;
+
+    uint8_t *p = s_lyr_layer_buf;
+    for (int i = 0; i < LL_NUM; i++) {
+        int w = k_lyr_rect[i][2], h = k_lyr_rect[i][3];
+        s_lyr_layers[i].buf = p;
+        s_lyr_layers[i].w = w;
+        s_lyr_layers[i].h = h;
+        /* 顶栏只裁到 y=40: 封面从 y=40 开始, 若裁到 56 会把封面顶部 16px
+         * 固化在静态顶栏里. 顶栏从歌词页 B 裁, 避免把封面阴影也固化;
+         * 歌词层也从 B 裁. */
+        const uint8_t *src = (i == LL_LYRICS || i == LL_TOPBAR)
+                             ? s_lyr_snap_b : s_lyr_snap_a;
+        lyr_crop(src, i, p);
+
+        memset(&s_lyr_layers[i].dsc, 0, sizeof(lv_img_dsc_t));
+        s_lyr_layers[i].dsc.header.always_zero = 0;
+        s_lyr_layers[i].dsc.header.w = (uint32_t)w;
+        s_lyr_layers[i].dsc.header.h = (uint32_t)h;
+        s_lyr_layers[i].dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+        s_lyr_layers[i].dsc.data_size = (uint32_t)(w * h * 2);
+        s_lyr_layers[i].dsc.data = p;
+        p += (size_t)w * h * 2;
+    }
+    return true;
+}
+
+static void lyr_anim_cleanup(void)
+{
+    if (s_lyr_anim_timer) {
+        lv_timer_del(s_lyr_anim_timer);
+        s_lyr_anim_timer = NULL;
+    }
+    for (int i = 0; i < LL_NUM; i++) {
+        if (s_lyr_layers[i].img) {
+            lv_obj_del(s_lyr_layers[i].img);
+            s_lyr_layers[i].img = NULL;
+        }
+    }
+    if (s_lyr_anim_bg) {
+        lv_obj_del(s_lyr_anim_bg);
+        s_lyr_anim_bg = NULL;
+    }
+    if (s_lyr_layer_buf) {
+        heap_caps_free(s_lyr_layer_buf);
+        s_lyr_layer_buf = NULL;
+    }
+    if (s_lyr_snap_a) { heap_caps_free(s_lyr_snap_a); s_lyr_snap_a = NULL; }
+    if (s_lyr_snap_b) { heap_caps_free(s_lyr_snap_b); s_lyr_snap_b = NULL; }
+}
+
+/* p: 0=封面页, 256=歌词页 */
+static void lyr_anim_apply(int p)
+{
+    if (p < 0) p = 0;
+    if (p > 256) p = 256;
+    int q = 256 - p;
+
+    if (s_lyr_layers[LL_COVER].img) {
+        lv_obj_set_style_img_opa(s_lyr_layers[LL_COVER].img, (lv_opa_t)(255 * q / 256), 0);
+    }
+    if (s_lyr_layers[LL_INFO].img) {
+        lv_obj_set_y(s_lyr_layers[LL_INFO].img, 148 + 52 * p / 256);
+        lv_obj_set_style_img_opa(s_lyr_layers[LL_INFO].img, (lv_opa_t)(255 * q / 256), 0);
+    }
+    if (s_lyr_layers[LL_PANEL].img) {
+        lv_obj_set_y(s_lyr_layers[LL_PANEL].img, 272 + 68 * p / 256);
+        lv_obj_set_style_img_opa(s_lyr_layers[LL_PANEL].img, (lv_opa_t)(255 * q / 256), 0);
+    }
+    if (s_lyr_layers[LL_CONTROLS].img) {
+        lv_obj_set_y(s_lyr_layers[LL_CONTROLS].img, 190 + 50 * p / 256);
+    }
+    if (s_lyr_layers[LL_LYRICS].img) {
+        lv_obj_set_style_img_opa(s_lyr_layers[LL_LYRICS].img, (lv_opa_t)(255 * p / 256), 0);
+    }
+}
+
+static void lyr_anim_finish(void)
+{
+    lyr_anim_cleanup();
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
+    display_refresh_resume();
+    lv_refr_now(lv_disp_get_default());
+
+    s_lyrics_mode = s_lyr_anim_enter;
+    power_mgr_set_lyrics_active(s_lyrics_mode);
+    s_lyr_busy = false;
+}
+
+static void lyr_anim_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    int64_t el = (esp_timer_get_time() - s_lyr_anim_t0) / 1000;
+    if (el < 0) el = 0;
+    if (el > LYR_ANIM_MS) el = LYR_ANIM_MS;
+
+    float t = (float)el / (float)LYR_ANIM_MS;
+    float e = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);   /* ease-out */
+    int step = (int)(e * 256.0f);
+    int p = s_lyr_anim_enter ? step : (256 - step);
+    lyr_anim_apply(p);
+    lv_refr_now(lv_disp_get_default());
+
+    if (el >= LYR_ANIM_MS) lyr_anim_finish();
+}
+
+/* 截图 + 建层 + 启动动画. 返回 false 时调用方走无动画降级. */
+static bool lyrics_anim_start(bool enter)
+{
+    s_lyr_snap_a = (uint8_t *)heap_caps_malloc(SCR_BYTES, MALLOC_CAP_SPIRAM);
+    s_lyr_snap_b = (uint8_t *)heap_caps_malloc(SCR_BYTES, MALLOC_CAP_SPIRAM);
+    if (!s_lyr_snap_a || !s_lyr_snap_b) goto fail;
+
+    s_lyr_vol_visible = ui_shell_volume_visible();
+
+    display_refresh_pause();
+
+    if (enter) {
+        page_set_cover();
+        lv_obj_update_layout(lv_scr_act());
+        if (!lyr_full_snapshot(s_lyr_snap_a)) goto fail;
+
+        page_set_lyrics();
+        lyrics_view_refresh_now();
+        lv_obj_update_layout(lv_scr_act());
+        if (!lyr_full_snapshot(s_lyr_snap_b)) goto fail;
+    } else {
+        page_set_lyrics();
+        lyrics_view_refresh_now();
+        lv_obj_update_layout(lv_scr_act());
+        if (!lyr_full_snapshot(s_lyr_snap_b)) goto fail;
+
+        page_set_cover();
+        lv_obj_update_layout(lv_scr_act());
+        if (!lyr_full_snapshot(s_lyr_snap_a)) goto fail;
+    }
+
+    if (!lyr_crop_layers()) goto fail;
+    heap_caps_free(s_lyr_snap_a); s_lyr_snap_a = NULL;
+    heap_caps_free(s_lyr_snap_b); s_lyr_snap_b = NULL;
+
+    /* 真实界面先隐藏, 顶层只显示截图 */
+    lv_obj_add_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
+
+    s_lyr_anim_bg = lv_obj_create(lv_layer_top());
+    lv_obj_set_pos(s_lyr_anim_bg, 0, 0);
+    lv_obj_set_size(s_lyr_anim_bg, TFT_HOR_RES, TFT_VER_RES);
+    lv_obj_set_style_bg_color(s_lyr_anim_bg, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_lyr_anim_bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_lyr_anim_bg, 0, 0);
+    lv_obj_set_style_radius(s_lyr_anim_bg, 0, 0);
+    lv_obj_set_style_pad_all(s_lyr_anim_bg, 0, 0);
+    lv_obj_clear_flag(s_lyr_anim_bg, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 顶栏/左右侧栏最后建, 压在封面和歌词图之上.
+     * 右侧音量弹窗只在它当时可见时才保留, 否则会裁出一块黑图盖住歌词右缘. */
+    static const int order[] = { LL_COVER, LL_INFO, LL_PANEL,
+                                 LL_LYRICS, LL_CONTROLS, LL_TOPBAR,
+                                 LL_BRIGHT, LL_VOLUME };
+    for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
+        int i = order[k];
+        if (i == LL_VOLUME && !s_lyr_vol_visible) continue;
+        lv_obj_t *img = lv_img_create(lv_layer_top());
+        lv_img_set_src(img, &s_lyr_layers[i].dsc);
+        lv_obj_set_pos(img, k_lyr_rect[i][0], k_lyr_rect[i][1]);
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+        s_lyr_layers[i].img = img;
+    }
+    if (s_lyr_layers[LL_TOPBAR].img) {
+        lv_obj_set_style_img_opa(s_lyr_layers[LL_TOPBAR].img, LV_OPA_COVER, 0);
+    }
+
+    s_lyr_anim_enter = enter;
+    lyr_anim_apply(enter ? 0 : 256);
+    lv_refr_now(lv_disp_get_default());
+
+    s_lyr_anim_t0 = esp_timer_get_time();
+    s_lyr_anim_timer = lv_timer_create(lyr_anim_timer_cb, LYR_ANIM_TICK_MS, NULL);
+    if (!s_lyr_anim_timer) goto fail;
+    return true;
+
+fail:
+    lyr_anim_cleanup();
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
+    display_refresh_resume();
+    return false;
+}
+
+static void lyrics_enter(void)
+{
+    if (s_lyrics_mode || s_lyr_busy) return;
+    power_mgr_set_lyrics_active(true);   /* 歌词页: 3 分钟自动熄屏 */
+    s_lyr_busy = true;
+    if (!lyrics_anim_start(true)) {
+        page_set_lyrics();
+        s_lyrics_mode = true;
+        s_lyr_busy = false;
+    }
+}
+
+static void lyrics_exit(void)
+{
+    if (!s_lyrics_mode || s_lyr_busy) return;
+    power_mgr_set_lyrics_active(false);  /* 回封面: 1 分钟自动熄屏 */
+    s_lyr_busy = true;
+    if (!lyrics_anim_start(false)) {
+        page_set_cover();
+        s_lyrics_mode = false;
+        s_lyr_busy = false;
+    }
+}
+
+static void lyrics_back_cb(void)
+{
+    lyrics_exit();
+}
+
+/* 模式销毁/异常时中止未完成的切换动画 */
+static void lyrics_anim_abort(void)
+{
+    if (!s_lyr_anim_timer && !s_lyr_busy) return;
+    lyr_anim_cleanup();
+    lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
+    display_refresh_resume();
+    s_lyr_busy = false;
+}
+
 static void player_build(void)
 {
     play_mode_t m;
@@ -1181,6 +1565,8 @@ static void player_build(void)
     lv_obj_clear_flag(s_album_art, LV_OBJ_FLAG_SCROLLABLE);
     /* 长按封面容器: 触发一次 (默认阈值 400ms) */
     lv_obj_add_event_cb(s_album_art, album_art_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+    /* 短按封面: 切歌词页 */
+    lv_obj_add_event_cb(s_album_art, album_art_short_click_cb, LV_EVENT_SHORT_CLICKED, NULL);
 
     lv_obj_t *album_icon = lv_label_create(s_album_art);
     lv_label_set_text(album_icon, LV_SYMBOL_AUDIO);
@@ -1188,6 +1574,7 @@ static void player_build(void)
     lv_obj_set_style_text_opa(album_icon, LV_OPA_40, 0);
     lv_obj_set_style_text_font(album_icon, &lv_font_montserrat_20, 0);
     lv_obj_center(album_icon);
+    lv_obj_clear_flag(album_icon, LV_OBJ_FLAG_CLICKABLE);
     s_album_icon = album_icon;
 
     /* 封面 img: 只指向解码任务写好的 PSRAM RGB565, LVGL 不拷贝 */
@@ -1201,6 +1588,7 @@ static void player_build(void)
     s_album_img = lv_img_create(s_album_art);
     lv_obj_set_pos(s_album_img, 0, 0);
     lv_obj_set_size(s_album_img, 100, 100);
+    lv_obj_clear_flag(s_album_img, LV_OBJ_FLAG_CLICKABLE);
     lv_img_set_src(s_album_img, NULL);
     lv_obj_add_flag(s_album_img, LV_OBJ_FLAG_HIDDEN);
 
@@ -1263,6 +1651,7 @@ static void player_build(void)
     /* ── 播放控制按钮 ── */
     /* 播放 / 暂停 */
     lv_obj_t *play_btn = lv_btn_create(scr);
+    s_play_btn = play_btn;
     lv_obj_set_pos(play_btn, 63, 212);
     lv_obj_set_size(play_btn, 46, 46);
     lv_obj_set_style_radius(play_btn, LV_RADIUS_CIRCLE, 0);
@@ -1282,6 +1671,7 @@ static void player_build(void)
 
     /* 上一首 (透明点击区放大到 60x64, 符号位置不变) */
     lv_obj_t *prev_btn = lv_btn_create(scr);
+    s_prev_btn = prev_btn;
     lv_obj_set_pos(prev_btn, 0, 206);
     lv_obj_set_size(prev_btn, 60, 64);
     lv_obj_set_style_radius(prev_btn, LV_RADIUS_CIRCLE, 0);
@@ -1299,6 +1689,7 @@ static void player_build(void)
 
     /* 下一首 (透明点击区放大到 60x64, 符号位置不变) */
     lv_obj_t *next_btn = lv_btn_create(scr);
+    s_next_btn = next_btn;
     lv_obj_set_pos(next_btn, 112, 206);
     lv_obj_set_size(next_btn, 60, 64);
     lv_obj_set_style_radius(next_btn, LV_RADIUS_CIRCLE, 0);
@@ -1316,6 +1707,7 @@ static void player_build(void)
 
     /* ── 底部面板 ── */
     lv_obj_t *panel = lv_obj_create(scr);
+    s_panel = panel;
     lv_obj_set_pos(panel, 4, 272);
     lv_obj_set_size(panel, 164, 46);
     lv_obj_set_style_radius(panel, 16, 0);
@@ -1375,6 +1767,7 @@ static void player_build(void)
     lv_label_set_text(s_bit_val, "");
 
     s_info_timer = lv_timer_create(song_info_monitor_cb, 500, NULL);
+    lyrics_view_init(scr, lyrics_back_cb);
     bri_draw_create();
 }
 
@@ -1393,6 +1786,9 @@ void player_show(void)
 /* 销毁音乐组: 删控件 + 重置所有静态变量, 避免遗留 */
 void player_destroy(void)
 {
+    lyrics_anim_abort();
+    lyrics_view_destroy();
+
     if (s_info_timer) { lv_timer_del(s_info_timer); s_info_timer = NULL; }
 
     /* 亮度抽屉的透明遮罩挂在屏幕上, 需单独删除 */
@@ -1413,6 +1809,10 @@ void player_destroy(void)
     s_play_icon = s_mode_icon = NULL;
     s_icon_bt = NULL;
     s_icon_bt_state = -1;
+    s_panel = s_play_btn = s_prev_btn = s_next_btn = NULL;
+    s_lyrics_mode = false;
+    s_lyr_busy = false;
+    power_mgr_set_lyrics_active(false);
 
     /* 播放运行时状态复位 (切模式已断蓝牙, 保留无意义) */
     s_pl_count = 0;

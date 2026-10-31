@@ -525,13 +525,19 @@ static uint32_t flac_get_file_size(audio_decoder_t *iface)
     return ((decoder_flac_t *)iface)->file_size;
 }
 
-/* 当前文件读位置 (ftell; 含缓冲预读, 用于进度估算) */
+/* 当前文件读位置 (ftell; 扣掉解码器输入缓冲预读, 用逻辑消费位置) */
 static uint32_t flac_get_position(audio_decoder_t *iface)
 {
     decoder_flac_t *d = (decoder_flac_t *)iface;
     if (!d->in) return 0;
-    long pos = d->in->tell(d->in);
+    long pos = d->in->tell(d->in) - (long)d->in_len;
     return pos > 0 ? (uint32_t)pos : 0;
+}
+
+/* FLAC 音频数据起点 (元数据块之后) */
+static uint32_t flac_get_data_offset(audio_decoder_t *iface)
+{
+    return ((decoder_flac_t *)iface)->audio_start;
 }
 
 /* 按字节偏移 seek: 目标 = 字节比例 → 采样号.
@@ -641,6 +647,7 @@ audio_decoder_t *decoder_flac_create(void)
     d->iface.get_bitrate     = flac_get_bitrate;
     d->iface.get_file_size   = flac_get_file_size;
     d->iface.get_position    = flac_get_position;
+    d->iface.get_data_offset = flac_get_data_offset;
     d->iface.seek            = flac_seek;
     d->iface.get_title       = flac_get_title;
     d->iface.get_artist      = flac_get_artist;

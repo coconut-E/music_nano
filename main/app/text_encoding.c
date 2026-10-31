@@ -236,7 +236,8 @@ int text_to_utf8(const uint8_t *in, size_t n,
 static uint32_t sanitize_cp(uint32_t cp)
 {
     if (cp == 0x00A0 || cp == 0x0098) return ' ';
-    if (cp < 0x20 && cp != '\t') return ' ';
+    /* 保留换行/回车: 内嵌歌词 (USLT) 依赖 \n 分行; 普通标题里出现换行也无害 */
+    if (cp < 0x20 && cp != '\t' && cp != '\n' && cp != '\r') return ' ';
     if (cp == 0x7F) return ' ';
     return cp;
 }
