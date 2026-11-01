@@ -61,6 +61,10 @@ void sys_monitor_init(void);    /* 启动系统监视任务 (电池/温度采样
 void music_scan_init(void);   /* 扫描 /sdcard/音乐 */
 void novel_scan_init(void);   /* 扫描 /sdcard/小说 */
 
+/* 取走"本次扫描结果"的内存版 (PSRAM, 所有权转移, 取走后置空).
+ * 返回 NULL = 本次没有重扫; 调用方才需要去读 SD 上的索引文件. */
+fs_cache_t *media_scan_take_cache(bool novel);
+
 /* 强制全量扫描标志: 置位后对应 scan_init 忽略空间阈值, 用完自动清除 */
 extern volatile bool g_music_scan_force;
 extern volatile bool g_novel_scan_force;

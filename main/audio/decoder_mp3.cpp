@@ -40,6 +40,8 @@ typedef struct {
     char     artist[SONG_ARTIST_MAX];    /* 歌手 (ID3 TPE1) */
     uint32_t file_size;                  /* 文件大小 */
     uint32_t audio_start;                /* MP3 音频数据起点 (ID3 标签之后) */
+    uint32_t duration_ms;                /* 精确总时长 (Xing 帧数推导), 0=未知 */
+    uint32_t avg_kbps;                   /* Xing 平均码率, 0=用实时值 */
 
     char    *lyrics;                     /* USLT 歌词 UTF-8 (PSRAM), 无则 NULL */
     size_t   lyrics_len;                 /* 歌词字节数 */
@@ -125,6 +127,47 @@ static bool mp3_hdr_parse(const uint8_t *p, size_t avail,
     if (ch)        *ch = (ch_mode == 0x03) ? 1 : 2;
     if (frame_len) *frame_len = len;
     return true;
+}
+
+/* 解析首帧内的 Xing/Info 头: 帧数 + 音频字节数 → 精确总时长与平均码率.
+ * VBR 文件每帧码率都不同, 只有这里得到的是全曲平均值 (时长也只跟帧数有关). */
+static void mp3_parse_xing(const uint8_t *hdr, size_t n,
+                           uint32_t *dur_ms, uint32_t *avg_kbps)
+{
+    *dur_ms   = 0;
+    *avg_kbps = 0;
+
+    size_t i = 0;                                  /* 找首个合法帧头 */
+    while (i + 4 < n) {
+        if (hdr[i] == 0xFF && (hdr[i + 1] & 0xE0) == 0xE0 &&
+            mp3_hdr_parse(hdr + i, n - i, NULL, NULL, NULL)) break;
+        i++;
+    }
+    if (i + 4 >= n) return;
+
+    uint8_t ver     = (hdr[i + 1] >> 3) & 0x03;
+    uint8_t ch_mode = (hdr[i + 3] >> 6) & 0x03;
+    bool    mpeg1   = (ver == 0x03);
+    size_t  side    = mpeg1 ? ((ch_mode == 0x03) ? 17 : 32)
+                            : ((ch_mode == 0x03) ? 9 : 17);
+    size_t  xi      = i + 4 + side;
+    if (xi + 8 > n) return;
+    if (memcmp(hdr + xi, "Xing", 4) != 0 && memcmp(hdr + xi, "Info", 4) != 0) return;
+
+    uint32_t flags = be32(hdr + xi + 4);
+    size_t   p     = xi + 8;
+    uint32_t frames = 0;
+    uint32_t bytes  = 0;
+    if ((flags & 0x1) && p + 4 <= n) { frames = be32(hdr + p); p += 4; }
+    if ((flags & 0x2) && p + 4 <= n) { bytes  = be32(hdr + p); }
+
+    uint32_t sr = 0;
+    mp3_hdr_parse(hdr + i, n - i, &sr, NULL, NULL);
+    if (frames && sr) {
+        uint64_t ms = (uint64_t)frames * (mpeg1 ? 1152u : 576u) * 1000u / sr;
+        *dur_ms = (uint32_t)ms;
+        if (bytes && ms) *avg_kbps = (uint32_t)((uint64_t)bytes * 8u / ms);   /* kbps = 字节×8 ÷ 毫秒 */
+    }
 }
 
 /* 解析 ID3v2 标签: 提取标题/歌手/封面/歌词.
@@ -284,6 +327,21 @@ static bool mp3_open(audio_decoder_t *iface, const char *path, audio_stream_t *i
     }
 
     in->seek(in, off, SEEK_SET);   /* 定位到 MP3 音频数据起始 */
+
+    /* 首帧里的 Xing/Info 头: 给出全曲精确时长与平均码率 (VBR 必需).
+     * 用解码器自己的输入缓冲, 不额外分配; 解析完把读位置复位. */
+    d->duration_ms = 0;
+    d->avg_kbps    = 0;
+    if (d->inbuf) {
+        size_t n = in->read(in, d->inbuf, MP3_INPUT_CHUNK_SIZE);
+        if (n > 0) mp3_parse_xing(d->inbuf, n, &d->duration_ms, &d->avg_kbps);
+        in->seek(in, off, SEEK_SET);
+    }
+    if (d->duration_ms) {
+        printf("[MP3] Xing: 时长=%" PRIu32 "ms, 平均码率=%" PRIu32 "kbps\n",
+               d->duration_ms, d->avg_kbps);
+    }
+
     d->eof  = false;
     d->info_done = false;
     d->in_off = 0;
@@ -397,7 +455,15 @@ static uint8_t mp3_get_bits(audio_decoder_t *iface)
 static uint32_t mp3_get_bitrate(audio_decoder_t *iface)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    /* 有 Xing 平均码率就用它: 逐帧码率在 VBR 里每帧都变, 会让时长/进度跳动 */
+    if (d->avg_kbps) return d->avg_kbps;
     return d->mp3 ? d->mp3->get_bitrate() : 0;
+}
+
+/* 精确总时长 (毫秒), 无 Xing 头则返回 0 由调用方回退估算 */
+static uint32_t mp3_get_duration_ms(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->duration_ms;
 }
 
 static uint32_t mp3_get_file_size(audio_decoder_t *iface)
@@ -517,6 +583,7 @@ audio_decoder_t *decoder_mp3_create(void)
     d->iface.get_channels    = mp3_get_channels;
     d->iface.get_bits        = mp3_get_bits;
     d->iface.get_bitrate     = mp3_get_bitrate;
+    d->iface.get_duration_ms = mp3_get_duration_ms;
     d->iface.get_file_size   = mp3_get_file_size;
     d->iface.get_position    = mp3_get_position;
     d->iface.get_data_offset = mp3_get_data_offset;

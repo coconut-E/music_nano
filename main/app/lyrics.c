@@ -46,47 +46,6 @@ static bool parse_tag_time(const char *tag, size_t len, uint32_t *out_ms)
     return true;
 }
 
-/* 忽略大小写的前缀匹配 */
-static bool starts_with_ci(const char *s, const char *prefix)
-{
-    size_t n = strlen(prefix);
-    return strncasecmp(s, prefix, n) == 0;
-}
-
-/* 制作信息行: 只在开头 3 秒内过滤, 避免误伤正常歌词 */
-static bool is_credit_line(const char *t)
-{
-    static const char *cn[] = {
-        "制作人", "作词", "作曲", "编曲", "制作", "出品", "监制",
-        "混音", "母带", "录音", "和声", "配唱", NULL
-    };
-    static const char *en[] = {
-        "lyrics", "composed", "produced", "written", "music",
-        "arranged", "mixed", "mastered", "producer", "songwriter", NULL
-    };
-
-    for (int i = 0; cn[i]; i++) {
-        size_t n = strlen(cn[i]);
-        if (strncmp(t, cn[i], n) == 0) {
-            const char *p = t + n;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == ':' || *p == '：') return true;
-        }
-    }
-    for (int i = 0; en[i]; i++) {
-        size_t n = strlen(en[i]);
-        if (starts_with_ci(t, en[i])) {
-            const char *p = t + n;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == ':' || *p == '：') return true;
-            if ((p[0] == 'b' || p[0] == 'B') &&
-                (p[1] == 'y' || p[1] == 'Y') &&
-                (p[2] == ' ' || p[2] == '\t')) return true;
-        }
-    }
-    return false;
-}
-
 int lyrics_parse(char *text, lyric_entry_t *out, int max_entries)
 {
     if (!text || !out || max_entries <= 0) return 0;
@@ -152,10 +111,9 @@ int lyrics_parse(char *text, lyric_entry_t *out, int max_entries)
 
         const char *lyric = q;
         while (*lyric == ' ' || *lyric == '\t') lyric++;
-        if (!*lyric) continue;
 
-        if (times[0] < 3000u && is_credit_line(lyric)) continue;
-
+        /* 只有时间戳、没有文字的行 (空行/占位行) 也要保留: UI 用它做段落间距,
+         * 同时作词/作曲等制作信息行不再过滤, 让用户看到完整内容. */
         size_t len = strlen(lyric);
         if (len > 0xFFFFu) len = 0xFFFFu;
 

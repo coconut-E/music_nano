@@ -296,6 +296,15 @@ static uint32_t wav_get_bitrate(audio_decoder_t *iface)
     return (uint32_t)((uint64_t)d->sample_rate * d->channels * d->bits_per_sample / 1000);
 }
 
+/* 精确总时长 (毫秒): PCM 数据字节 ÷ 每秒字节数 */
+static uint32_t wav_get_duration_ms(audio_decoder_t *iface)
+{
+    decoder_wav_t *d = (decoder_wav_t *)iface;
+    uint32_t bps = d->sample_rate * d->channels * (d->bits_per_sample / 8);
+    if (!bps || !d->data_size) return 0;
+    return (uint32_t)((uint64_t)d->data_size * 1000 / bps);
+}
+
 /* 只报告 PCM 数据字节数 → duration_sec/elapsed_sec 精确 */
 static uint32_t wav_get_file_size(audio_decoder_t *iface)
 {
@@ -356,6 +365,7 @@ audio_decoder_t *decoder_wav_create(void)
     d->iface.get_channels    = wav_get_channels;
     d->iface.get_bits        = wav_get_bits;
     d->iface.get_bitrate     = wav_get_bitrate;
+    d->iface.get_duration_ms = wav_get_duration_ms;
     d->iface.get_file_size   = wav_get_file_size;
     d->iface.get_position    = wav_get_position;
     d->iface.get_data_offset = wav_get_data_offset;

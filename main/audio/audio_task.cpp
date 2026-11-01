@@ -242,6 +242,7 @@ static uint32_t  s_lyrics_hash = 0;
 
 static uint64_t s_total_decoded = 0;   /* 累计解码字节数 (统计用) */
 static uint64_t s_total_sent    = 0;   /* 累计发送字节数 (统计用) */
+static uint64_t s_played_samples = 0;  /* 累计已解码样本数 (每声道), 进度按它算, 与码率无关 */
 static int64_t  s_play_start_us = 0;   /* 本次播放开始时刻 (统计耗时用) */
 
 /* ── 辅助函数 ── */
@@ -255,6 +256,7 @@ static void close_decoder(void)
         astream_close();    /* 关闭底层文件 + 清占用标志 (内部持 sd_fs_lock) */
         free(d);            /* 释放对象本体 */
     }
+    s_played_samples = 0;   /* 进度归零 */
 }
 
 /* 按扩展名选择解码器并打开文件: path=文件路径, 成功返回 true.
@@ -291,6 +293,7 @@ static bool open_decoder(const char *path)
     }
     strncpy(s_current_path, path, sizeof(s_current_path) - 1);   /* 记住当前路径 */
     s_current_path[sizeof(s_current_path) - 1] = '\0';
+    s_played_samples = 0;   /* 新曲目: 进度从 0 开始累计 */
 
     /* 有封面则交给解码任务 (所有权移交, 解码完成后释放) */
     const uint8_t *cd = s_decoder->get_cover_data ? s_decoder->get_cover_data(s_decoder) : NULL;
@@ -323,26 +326,45 @@ static void set_format_from_path(const char *path)
     g_song_info.format[SONG_FORMAT_MAX - 1] = '\0';
 }
 
-/* 更新码率/总时长/已播时长 (按平均码率估算). 要求调用方已持有 s_info_mux */
+/* 更新码率/总时长/已播时长. 要求调用方已持有 s_info_mux
+ *
+ * 总时长: 优先用解码器给的精确值 (MP3 Xing 帧数 / FLAC 总采样数 / WAV 数据长度);
+ *         没有才退回"音频字节 ÷ 平均码率"的估算.
+ * 已播时长: 一律按"累计已解码样本数 ÷ 采样率"算 —— 与码率无关, VBR 也不会跳. */
 static void update_duration_elapsed_locked(void)
 {
-    uint32_t kbps = s_decoder->get_bitrate(s_decoder);
-    uint32_t bps  = kbps * 125;   /* kbps → 字节每秒 */
-    if (bps == 0) bps = 128 * 125;   /* 未知码率按 128kbps 兜底 */
+    uint32_t sr = s_decoder->get_sample_rate ? s_decoder->get_sample_rate(s_decoder) : 0;
 
-    /* MP3/FLAC 的 file_size/position 含 ID3/元数据; 扣掉后进度和歌词才对得上.
-     * 本目录大封面标签可达 1.5MB, 不扣会让歌词提前几十秒. */
-    uint32_t off = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
-    uint32_t fsz = s_decoder->get_file_size(s_decoder);
-    uint32_t asz = (fsz > off) ? (fsz - off) : fsz;
-    uint32_t pos = s_decoder->get_position(s_decoder);
-    if (pos < off) pos = off;
+    uint64_t dur_ms = 0;
+    if (s_decoder->get_duration_ms) dur_ms = s_decoder->get_duration_ms(s_decoder);
 
-    uint64_t dur_ms = (uint64_t)asz * 1000 / bps;   /* 音频数据字节 / 码率 */
-    uint64_t el_ms  = (uint64_t)(pos - off) * 1000 / bps;
+    if (dur_ms == 0) {   /* 回退: 按平均码率估算 (无 Xing 的老 MP3 走这里) */
+        uint32_t kbps = s_decoder->get_bitrate(s_decoder);
+        uint32_t bps  = kbps * 125;   /* kbps → 字节每秒 */
+        if (bps == 0) bps = 128 * 125;   /* 未知码率按 128kbps 兜底 */
+
+        /* MP3/FLAC 的 file_size 含 ID3/元数据; 扣掉后才能和时长对上 */
+        uint32_t off = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
+        uint32_t fsz = s_decoder->get_file_size(s_decoder);
+        uint32_t asz = (fsz > off) ? (fsz - off) : fsz;
+        dur_ms = (uint64_t)asz * 1000 / bps;
+    }
+
+    uint64_t el_ms = 0;
+    if (sr) {
+        el_ms = s_played_samples * 1000 / sr;
+    } else {   /* 极早期 (采样率未知) 才用文件位置兜底 */
+        uint32_t kbps = s_decoder->get_bitrate(s_decoder);
+        uint32_t bps  = kbps ? kbps * 125 : 128 * 125;
+        uint32_t off  = s_decoder->get_data_offset ? s_decoder->get_data_offset(s_decoder) : 0;
+        uint32_t pos  = s_decoder->get_position(s_decoder);
+        if (pos < off) pos = off;
+        el_ms = (uint64_t)(pos - off) * 1000 / bps;
+    }
     if (el_ms > dur_ms) el_ms = dur_ms;
 
-    g_song_info.bitrate_kbps = kbps ? kbps : 128;
+    uint32_t kbps_now = s_decoder->get_bitrate(s_decoder);
+    g_song_info.bitrate_kbps = kbps_now ? kbps_now : 128;
     g_song_info.duration_sec = (uint32_t)(dur_ms / 1000);
     g_song_info.elapsed_ms   = (uint32_t)el_ms;
     g_song_info.elapsed_sec  = g_song_info.elapsed_ms / 1000;
@@ -567,6 +589,8 @@ static void audio_task(void *arg)
                         s_pcm_offset = 0;
                         if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
                         uint32_t ms = (uint32_t)((uint64_t)g_song_info.duration_sec * cmd.param);
+                        uint32_t sr0 = s_decoder->get_sample_rate(s_decoder);
+                        s_played_samples = sr0 ? ((uint64_t)ms * sr0 / 1000) : 0;   /* 进度基准重置 */
                         g_song_info.elapsed_ms  = ms;   /* 同步进度/歌词 (与快照读取互斥) */
                         g_song_info.elapsed_sec = ms / 1000;
                         if (s_info_mux) xSemaphoreGive(s_info_mux);
@@ -620,6 +644,7 @@ static void audio_task(void *arg)
                 /* 用解码器输出的采样率/声道配置转换层 (固定转 44.1k/16bit/stereo) */
                 uint32_t rate = s_decoder->get_sample_rate(s_decoder);
                 uint8_t  ch   = s_decoder->get_channels(s_decoder);
+                if (ch) s_played_samples += s_pcm_bytes / (2u * ch);   /* 累计已解码样本 (每声道) */
                 if (!s_pipeline) {
                     s_pipeline = pcm_pipeline_create();
                     if (!s_pipeline) {
@@ -713,6 +738,8 @@ static void audio_task(void *arg)
                     s_decoder->seek(s_decoder, target);
                     if (s_info_mux) xSemaphoreTake(s_info_mux, portMAX_DELAY);
                     uint32_t ms = (uint32_t)((uint64_t)g_song_info.duration_sec * cmd.param);
+                    uint32_t sr0 = s_decoder->get_sample_rate(s_decoder);
+                    s_played_samples = sr0 ? ((uint64_t)ms * sr0 / 1000) : 0;   /* 进度基准重置 */
                     g_song_info.elapsed_ms  = ms;
                     g_song_info.elapsed_sec = ms / 1000;
                     if (s_info_mux) xSemaphoreGive(s_info_mux);

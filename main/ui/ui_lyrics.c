@@ -27,6 +27,10 @@ extern const lv_font_t lv_font_global_16;
 #define LYR_DISP_MAX    65536                /* 折行显示缓冲 (PSRAM) */
 #define LYR_TOTAL_MAX   30000                /* lv_coord_t 上限内 */
 #define LYR_LATENCY_MS  250                  /* 蓝牙/PCM 缓冲补偿, 实测可调 */
+#define LYR_MERGE_MS    50                   /* 时间戳差在此范围内视为同一句的多语言行, 合并显示 */
+#define LYR_BLANK_H     12                   /* 空行/占位行占的高度 (半行), 用作段落间距 */
+#define LYR_MAX_SEGS    4                    /* 一句最多按文字体系拆成几行 */
+#define LYR_MAX_BLOCK_ROWS 12                /* 一个显示块最多几行 (防止极端歌词撑爆) */
 
 /* 透明点击层比歌词区略小, 避免边缘误触/挡住左右侧栏 */
 #define LYR_OVL_X       16
@@ -95,93 +99,67 @@ static int utf8_next(const char *s, uint32_t *cp)
     return 1;
 }
 
-static bool is_cjk(uint32_t c)
+/* ── 文字体系分类 ──
+ * 中/日/韩/英/俄 要能分别成行, 所以不能只分 "CJK / 拉丁".
+ * 日文是汉字+假名混排, 归为同一段; 中文与韩文/英文/俄文之间会切开. */
+enum { SCR_OTHER = 0, SCR_HAN, SCR_KANA, SCR_HANGUL, SCR_LATIN, SCR_CYR, SCR_GREEK };
+
+static int script_of(uint32_t c)
 {
-    return (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||
-           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x3040 && c <= 0x30FF) ||
-           (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF) ||
-           (c >= 0xAC00 && c <= 0xD7AF);
+    if ((c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||
+        (c >= 0xF900 && c <= 0xFAFF)) return SCR_HAN;
+    if (c >= 0x3040 && c <= 0x30FF) return SCR_KANA;
+    if ((c >= 0xAC00 && c <= 0xD7AF) || (c >= 0x1100 && c <= 0x11FF) ||
+        (c >= 0x3130 && c <= 0x318F)) return SCR_HANGUL;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= 0x00C0 && c <= 0x024F) || (c >= 0x1E00 && c <= 0x1EFF)) return SCR_LATIN;
+    if (c >= 0x0400 && c <= 0x04FF) return SCR_CYR;
+    if (c >= 0x0370 && c <= 0x03FF) return SCR_GREEK;
+    return SCR_OTHER;
 }
 
-static bool is_latin(uint32_t c)
+/* 汉字与假名算同一类 (日文), 其余各自一类 */
+static int script_class(int s)
 {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-           (c >= 0x00C0 && c <= 0x024F) || (c >= 0x1E00 && c <= 0x1EFF);
+    return (s == SCR_HAN || s == SCR_KANA) ? 100 : s;
 }
 
-static bool is_cyrillic(uint32_t c)
-{
-    return c >= 0x0400 && c <= 0x04FF;
-}
+typedef struct { int off; int len; } seg_t;
 
-/* 找“原文 + 中文翻译”的语言边界.
- * 返回 true 时 a_len=前半段长度, b_off=后半段起点 (原文在前/中文在前都支持). */
-static bool find_split(const char *s, int len, int *a_len, int *b_off)
+/* 把一条歌词按文字体系切成若干段 (最多 max_segs 段), 返回段数.
+ * 数字/标点/空格不参与切换, 自动跟随当前段. */
+static int split_scripts(const char *s, int len, seg_t *segs, int max_segs)
 {
+    int n = 0;
     int i = 0;
-    int first_cjk = -1;
-    int letters_before = 0;
+    int seg_start = 0;
+    int cur = -1;
 
     while (i < len) {
         uint32_t cp;
-        int n = utf8_next(s + i, &cp);
-        if (is_cjk(cp)) { first_cjk = i; break; }
-        if (is_latin(cp) || is_cyrillic(cp)) letters_before++;
-        i += n;
-    }
+        int step = utf8_next(s + i, &cp);
+        int scls = script_of(cp);
 
-    if (first_cjk > 0) {
-        int cjk = 0;
-        i = first_cjk;
-        while (i < len) {
-            uint32_t cp;
-            int n = utf8_next(s + i, &cp);
-            if (is_cjk(cp)) cjk++;
-            i += n;
-        }
-        if (letters_before >= 2 && cjk >= 2) {
-            int e = first_cjk;
-            while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t')) e--;
-            if (e > 0) {
-                *a_len = e;
-                *b_off = first_cjk;
-                return true;
+        if (scls != SCR_OTHER) {          /* 只有语言字符才决定切换 */
+            int rc = script_class(scls);
+            if (cur < 0) {
+                cur = rc;
+            } else if (rc != cur && n + 1 < max_segs) {
+                segs[n].off = seg_start;
+                segs[n].len = i - seg_start;
+                n++;
+                cur = rc;
+                seg_start = i;
             }
         }
-        return false;
+        i += step;
     }
-
-    /* 中文在前: 找到一段 >=2 个拉丁/西里尔字母 */
-    if (first_cjk == 0) {
-        int cjk = 0;
-        int run_start = -1;
-        int run = 0;
-        i = 0;
-        while (i < len) {
-            uint32_t cp;
-            int n = utf8_next(s + i, &cp);
-            if (is_cjk(cp)) {
-                cjk++;
-                run = 0;
-                run_start = -1;
-            } else if (is_latin(cp) || is_cyrillic(cp)) {
-                if (run == 0) run_start = i;
-                run++;
-                if (run >= 2 && cjk >= 2) {
-                    int e = run_start;
-                    while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t')) e--;
-                    *a_len = e;
-                    *b_off = run_start;
-                    return true;
-                }
-            } else {
-                run = 0;
-                run_start = -1;
-            }
-            i += n;
-        }
+    if (n < max_segs) {
+        segs[n].off = seg_start;
+        segs[n].len = len - seg_start;
+        n++;
     }
-    return false;
+    return n;
 }
 
 /* 把一段 UTF-8 按 156px 折行追加到 s_disp. first=该条是否还没有输出行.
@@ -362,32 +340,53 @@ static void lyrics_load(uint32_t hash)
 
     int total = 0;
     int built = 0;
-    for (int i = 0; i < s_count; i++) {
-        if (s_disp_used + 2 >= LYR_DISP_MAX) break;
-        s_doff[i] = (uint32_t)s_disp_used;
+    int i = 0;
+    while (i < s_count && built < LYRICS_MAX_ENTRIES) {
+        if (s_disp_used + 4 >= LYR_DISP_MAX) break;
+
+        /* 同一时间戳 (差 ≤LYR_MERGE_MS) 的连续条目 = 同一个显示块:
+         * LRC 里"原文一行 + 译文一行"用的是同一个时间戳, 必须合并成一句,
+         * 否则会显示成两条独立歌词、高亮来回跳. */
+        int j = i;
+        while (j + 1 < s_count &&
+               s_entries[j + 1].t_ms <= s_entries[i].t_ms + LYR_MERGE_MS) {
+            j++;
+        }
+
+        s_doff[built] = (uint32_t)s_disp_used;
+        s_entries[built].t_ms = s_entries[i].t_ms;   /* 压缩后的时间轴 (built <= i, 安全) */
 
         int first = 1;
         int rows = 0;
-        int a_len = 0, b_off = 0;
-        if (find_split(s_entries[i].text, (int)s_entries[i].len, &a_len, &b_off)) {
-            int r1 = wrap_segment(s_entries[i].text, a_len, &first);
-            if (r1 < 0) break;
-            int r2 = wrap_segment(s_entries[i].text + b_off,
-                                  (int)s_entries[i].len - b_off, &first);
-            if (r2 < 0) break;
-            rows = r1 + r2;
-        } else {
-            int r = wrap_segment(s_entries[i].text, (int)s_entries[i].len, &first);
-            if (r < 0) break;
-            rows = r;
+        int blank_h = 0;
+        int fail = 0;
+
+        for (int k = i; k <= j && !fail; k++) {
+            if (s_entries[k].len == 0) {          /* 空行/占位行: 半行间距 */
+                blank_h += LYR_BLANK_H;
+                continue;
+            }
+            seg_t segs[LYR_MAX_SEGS];
+            int ns = split_scripts(s_entries[k].text, (int)s_entries[k].len,
+                                   segs, LYR_MAX_SEGS);
+            for (int si = 0; si < ns; si++) {
+                int r = wrap_segment(s_entries[k].text + segs[si].off, segs[si].len, &first);
+                if (r < 0) { fail = 1; break; }
+                rows += r;
+                if (rows >= LYR_MAX_BLOCK_ROWS) { rows = LYR_MAX_BLOCK_ROWS; break; }
+            }
         }
-        if (rows <= 0) rows = 1;
+        if (fail) break;
+
+        int h = rows * LYR_LINE_H + blank_h;
+        if (h <= 0) h = LYR_LINE_H;
 
         s_disp[s_disp_used++] = '\0';
-        s_h[i] = (uint16_t)(rows * LYR_LINE_H);
-        s_y[i] = (uint16_t)total;
-        total += s_h[i] + LYR_GAP;
+        s_h[built] = (uint16_t)h;
+        s_y[built] = (uint16_t)total;
+        total += s_h[built] + LYR_GAP;
         built++;
+        i = j + 1;
         if (total > LYR_TOTAL_MAX) break;
     }
 

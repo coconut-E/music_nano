@@ -13,7 +13,9 @@
 
 #define FLAC_INPUT_CHUNK_SIZE       8192     /* 每次读入的压缩数据块大小 */
 #define FLAC_MAX_PICTURE_SIZE       (512 * 1024)  /* 元数据块: PICTURE 上限 */
-#define FLAC_MAX_COMMENT_SIZE       4096     /* 元数据块: VORBIS_COMMENT 上限 */
+/* 元数据块: VORBIS_COMMENT 上限. 必须够大: 超限的块会被 micro-flac 整块丢弃
+ * (标题/歌手/歌词全没了), 而带内嵌歌词的 FLAC 注释块普遍 5~15KB */
+#define FLAC_MAX_COMMENT_SIZE       32768
 #define FLAC_MAX_SEEKTABLE_SIZE     16384    /* 元数据块: SEEKTABLE 上限 */
 #define FLAC_SERVE_FRAMES           1152   /* 每次最多交给 pipeline 的帧数(与 MAX_IN_FRAMES 一致) */
 
@@ -50,6 +52,8 @@ typedef struct {
 
     char                      title[SONG_TITLE_MAX];     /* 标题 (Vorbis 注释) */
     char                      artist[SONG_ARTIST_MAX];   /* 歌手 */
+    char                     *lyrics;       /* 内嵌歌词 UTF-8 (PSRAM), 无则 NULL */
+    size_t                    lyrics_len;   /* 歌词字节数 */
 
     uint8_t                  *cover_data;    /* PICTURE 图片字节 (PSRAM), 未移交时由 close 释放 */
     size_t                    cover_size;    /* 封面大小 */
@@ -90,13 +94,19 @@ static uint32_t le32(const uint8_t *p)
 }
 
 /* ── Vorbis 注释解析 (原生 FLAC 内为小端) ──
- * 提取 TITLE=/ARTIST= 到输出缓冲 (ALBUM 仅打印日志, 不输出) */
+ * 提取 TITLE=/ARTIST= 到输出缓冲 (ALBUM 仅打印日志, 不输出);
+ * 歌词键 (LYRICS / UNSYNCEDLYRICS / "UNSYNCED LYRICS" / LYRIC) 转 UTF-8 后
+ * 另存到 PSRAM, 只取第一条非空值 */
 static void parse_vorbis_comments(const uint8_t *data, size_t len,
                                   char *title, size_t title_size,
-                                  char *artist, size_t artist_size)
+                                  char *artist, size_t artist_size,
+                                  char **lyrics_out, size_t *lyrics_len_out)
 {
     const uint8_t *p = data;
     const uint8_t *end = data + len;
+
+    if (lyrics_out) *lyrics_out = NULL;
+    if (lyrics_len_out) *lyrics_len_out = 0;
 
     if (end - p < 4) return;
     uint32_t vlen = le32(p); p += 4;   /* vendor 字符串长度 */
@@ -116,7 +126,7 @@ static void parse_vorbis_comments(const uint8_t *data, size_t len,
             size_t klen = (size_t)(eq - p);   /* 键长 */
             const uint8_t *val = eq + 1;
             size_t vlen2 = clen - klen - 1;   /* 值长 */
-            char key[16];
+            char key[24];   /* 够放 "unsynced lyrics" (15) 等长键 */
             size_t kl = klen < sizeof(key) - 1 ? klen : sizeof(key) - 1;
             memcpy(key, p, kl);
             key[kl] = '\0';
@@ -134,6 +144,29 @@ static void parse_vorbis_comments(const uint8_t *data, size_t len,
                 char buf[96];
                 text_tag_to_utf8(val, vlen2, -1, buf, sizeof(buf));
                 printf("[FLAC] 专辑: %s\n", buf);
+            } else if (lyrics_out && !*lyrics_out && vlen2 > 0 &&
+                       (strcmp(key, "lyrics") == 0 ||
+                        strcmp(key, "lyric") == 0 ||
+                        strcmp(key, "unsyncedlyrics") == 0 ||
+                        strcmp(key, "unsynced lyrics") == 0)) {
+                /* 歌词: 按 GBK→UTF-8 最坏膨胀 1.5 倍预留, 上限与 UI 侧缓冲一致 */
+                size_t cap = vlen2 + vlen2 / 2 + 4;
+                if (cap > LYRICS_BUF_MAX) cap = LYRICS_BUF_MAX;
+                char *buf = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+                if (!buf) {
+                    buf = (char *)heap_caps_malloc(cap,
+                                                   MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+                }
+                if (buf) {
+                    int out = text_tag_to_utf8(val, vlen2, -1, buf, cap);
+                    if (out > 0) {
+                        *lyrics_out = buf;
+                        if (lyrics_len_out) *lyrics_len_out = (size_t)out;
+                        printf("[FLAC] 歌词: %d bytes (key=%s)\n", out, key);
+                    } else {
+                        heap_caps_free(buf);
+                    }
+                }
             }
         }
         p += clen;
@@ -227,6 +260,8 @@ static void flac_free_state(decoder_flac_t *d)
     if (d->out32) { heap_caps_free(d->out32); d->out32 = NULL; }
     if (d->cover_data) { heap_caps_free(d->cover_data); d->cover_data = NULL; d->cover_size = 0; }
     if (d->seekpts) { heap_caps_free(d->seekpts); d->seekpts = NULL; d->seek_count = 0; }
+    if (d->lyrics) { heap_caps_free(d->lyrics); d->lyrics = NULL; }
+    d->lyrics_len = 0;
     d->title[0]  = '\0';   /* 清掉上一首的标签, 防止无注释文件沿用旧标题 */
     d->artist[0] = '\0';
     d->in_off = 0;
@@ -246,7 +281,8 @@ static void flac_free_state(decoder_flac_t *d)
 static bool flac_parse_header(decoder_flac_t *d)
 {
     int guard = 0;
-    while (guard++ < 64) {   /* 最多 64 轮防呆 */
+    /* 每轮最多消费一个 8KB 输入块, 256 轮 ≈ 2MB 元数据, 够 512KB 封面 + 32KB 注释 */
+    while (guard++ < 256) {
         if (d->in_len == 0) {
             d->in_len = d->in->read(d->in, d->inbuf, FLAC_INPUT_CHUNK_SIZE);   /* 读入数据 */
             if (d->in_len == 0) return false;
@@ -344,7 +380,8 @@ static bool flac_open(audio_decoder_t *iface, const char *path, audio_stream_t *
         flac->get_metadata_block(micro_flac::FLAC_METADATA_TYPE_VORBIS_COMMENT);
     if (vc) {
         parse_vorbis_comments(vc->data, vc->length, d->title, sizeof(d->title),
-                              d->artist, sizeof(d->artist));
+                              d->artist, sizeof(d->artist),
+                              &d->lyrics, &d->lyrics_len);
     }
     const micro_flac::FLACMetadataBlock *pic =
         flac->get_metadata_block(micro_flac::FLAC_METADATA_TYPE_PICTURE);
@@ -516,7 +553,19 @@ static uint32_t flac_get_bitrate(audio_decoder_t *iface)
     if (!d->sample_rate) return 0;
     uint32_t dur = (uint32_t)(d->total_samples / d->sample_rate);   /* 总时长秒数 */
     if (dur == 0) return 0;
-    return (uint32_t)(((uint64_t)d->file_size * 8) / dur / 1000);   /* 位/秒 → kbps */
+    /* 只算音频数据: 整文件含封面/注释会把码率算高, 下游据此估时长就会偏短
+     * (160KB 封面+注释 ≈ 1.5s; 1.5MB 大封面能差十几秒) */
+    uint32_t bytes = d->file_size;
+    if (d->audio_start && d->audio_start < bytes) bytes -= d->audio_start;
+    return (uint32_t)(((uint64_t)bytes * 8) / dur / 1000);   /* 位/秒 → kbps */
+}
+
+/* 精确总时长 (毫秒): STREAMINFO 里的总采样数 (与码率/元数据无关) */
+static uint32_t flac_get_duration_ms(audio_decoder_t *iface)
+{
+    decoder_flac_t *d = (decoder_flac_t *)iface;
+    if (!d->sample_rate || !d->total_samples) return 0;
+    return (uint32_t)(d->total_samples * 1000ull / d->sample_rate);
 }
 
 /* 文件大小 (整文件字节数) */
@@ -547,9 +596,14 @@ static bool flac_seek(audio_decoder_t *iface, uint32_t byte_offset)
     decoder_flac_t *d = (decoder_flac_t *)iface;
     if (!d->in || !d->flac || d->total_samples == 0) return false;
 
-    /* 字节偏移 → 目标采样号 (按文件长度线性换算) */
+    /* 字节偏移 → 目标采样号: 只按音频区比例换算, 元数据(封面/注释)不计入,
+     * 否则大封面 FLAC 拖进度条会系统性偏后 */
     uint32_t fsz = d->file_size ? d->file_size : 1;
-    uint64_t target = ((uint64_t)byte_offset * d->total_samples) / fsz;
+    uint32_t off = d->audio_start < fsz ? d->audio_start : 0;   /* 异常时退回整文件口径 */
+    uint32_t asz = fsz - off;
+    uint32_t rel = (byte_offset > off) ? (byte_offset - off) : 0;
+    if (rel >= asz) rel = asz - 1;
+    uint64_t target = ((uint64_t)rel * d->total_samples) / asz;
     if (target >= d->total_samples) target = d->total_samples - 1;
 
     /* 清空待输出/输入状态 */
@@ -611,6 +665,12 @@ static const char *flac_get_artist(audio_decoder_t *iface)
     return ((decoder_flac_t *)iface)->artist;
 }
 
+/* 内嵌歌词 UTF-8 (无则 NULL) */
+static const char *flac_get_lyrics(audio_decoder_t *iface)
+{
+    return ((decoder_flac_t *)iface)->lyrics;
+}
+
 /* 内嵌封面数据指针 (无则 NULL) */
 static const uint8_t *flac_get_cover_data(audio_decoder_t *iface)
 {
@@ -645,12 +705,14 @@ audio_decoder_t *decoder_flac_create(void)
     d->iface.get_channels    = flac_get_channels;
     d->iface.get_bits        = flac_get_bits;
     d->iface.get_bitrate     = flac_get_bitrate;
+    d->iface.get_duration_ms = flac_get_duration_ms;
     d->iface.get_file_size   = flac_get_file_size;
     d->iface.get_position    = flac_get_position;
     d->iface.get_data_offset = flac_get_data_offset;
     d->iface.seek            = flac_seek;
     d->iface.get_title       = flac_get_title;
     d->iface.get_artist      = flac_get_artist;
+    d->iface.get_lyrics      = flac_get_lyrics;
     d->iface.get_cover_data  = flac_get_cover_data;
     d->iface.get_cover_size  = flac_get_cover_size;
     d->iface.take_cover      = flac_take_cover;

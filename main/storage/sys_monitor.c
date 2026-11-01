@@ -152,8 +152,8 @@ static fs_cache_t *sd_load_cache_bin(const char *path)
 
     if (got != size || cache->magic != FS_CACHE_MAGIC ||
         cache->count < 0 || cache->pool_size > size) {
-        ESP_LOGW(TAG_SDMMC, "索引校验失败 (magic=%08x count=%d)",
-                 (unsigned)cache->magic, cache->count);
+        ESP_LOGW(TAG_SDMMC, "索引校验失败 (magic=%08x count=%d got=%zu size=%zu errno=%d)",
+                 (unsigned)cache->magic, cache->count, got, size, errno);
         heap_caps_free(cache);
         return NULL;
     }
@@ -297,8 +297,19 @@ void sdmmc_disk_init(void)
     music_scan_init();         /* 扫描/加载音乐缓存 (/sdcard/音乐) */
     novel_scan_init();         /* 扫描/加载小说缓存 (/sdcard/小说) */
 
-    s_fs_cache_owned    = sd_load_cache_bin(FS_CACHE_BIN_PATH);      /* 音乐 index.bin */
-    s_novel_cache_owned = sd_load_cache_bin(NOVEL_CACHE_BIN_PATH);   /* 小说 novel.bin */
+    /* 本次重扫过 → 直接用扫描结果的内存版, 完全不回读 SD 上的索引文件
+     * (实测"刚写完立刻回读"偶发校验失败, 音乐/小说只坏一个);
+     * 只有命中缓存、本次没扫描时才去读盘. */
+    s_fs_cache_owned    = media_scan_take_cache(false);
+    s_novel_cache_owned = media_scan_take_cache(true);
+
+    if (!s_fs_cache_owned) {
+        vTaskDelay(pdMS_TO_TICKS(50));   /* 读盘前留点余量, 防止控制器还在落盘 */
+        s_fs_cache_owned = sd_load_cache_bin(FS_CACHE_BIN_PATH);      /* 音乐 index.bin */
+    }
+    if (!s_novel_cache_owned) {
+        s_novel_cache_owned = sd_load_cache_bin(NOVEL_CACHE_BIN_PATH); /* 小说 novel.bin */
+    }
     g_fs_cache    = s_fs_cache_owned;
     g_novel_cache = s_novel_cache_owned;
     atomic_store_bool(&g_sd_ready, true);

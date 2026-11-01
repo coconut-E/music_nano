@@ -1,4 +1,4 @@
-﻿#include <string.h>
+#include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
@@ -507,6 +507,64 @@ static void scan_one_dir(scan_ctx_t *ctx, const char *dir_path)
     closedir(dir);
 }
 
+/* 最近一次扫描结果的内存版 (PSRAM): 挂载时直接发布给 UI, 不再回读 SD 上的索引文件.
+ * 实测"刚写完索引立刻回读"偶发校验失败 (音乐/小说都写, 只有其中一个失败),
+ * 因此扫描路径完全不依赖落盘结果; 磁盘索引只作为下次开机的快路径. */
+static fs_cache_t *s_built_music = NULL;
+static fs_cache_t *s_built_novel = NULL;
+
+/* 把构建器结果打包成可直接使用的 fs_cache_t (header + dirs + files + 字符串池),
+ * 条目里的池内偏移修正为绝对指针 (与 sd_load_cache_bin 加载后的格式一致).
+ * 失败返回 NULL (调用方回退为读盘). */
+static fs_cache_t *builder_to_cache(cache_builder_t *b)
+{
+    int count = b->n_dirs + b->n_files;
+    if (count <= 0) return NULL;
+
+    size_t size = sizeof(fs_cache_t)
+                + (size_t)count * sizeof(fs_entry_t)
+                + b->pool_used;
+    fs_cache_t *c = (fs_cache_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    if (!c) return NULL;
+
+    c->magic     = FS_CACHE_MAGIC;
+    c->count     = count;
+    c->pool_size = b->pool_used;
+
+    fs_entry_t *e = c->entries;
+    if (b->n_dirs) {
+        memcpy(e, b->dirs, (size_t)b->n_dirs * sizeof(fs_entry_t));
+    }
+    if (b->n_files) {
+        memcpy(e + b->n_dirs, b->files, (size_t)b->n_files * sizeof(fs_entry_t));
+    }
+    char *pool = (char *)(c->entries + count);
+    if (b->pool_used) {
+        memcpy(pool, b->pool, b->pool_used);
+    }
+
+    for (int i = 0; i < count; i++) {   /* 池内偏移 → 绝对指针 */
+        uintptr_t noff = (uintptr_t)e[i].name;
+        uintptr_t goff = (uintptr_t)e[i].group;
+        if (noff >= c->pool_size || goff >= c->pool_size) {
+            heap_caps_free(c);
+            return NULL;
+        }
+        e[i].name  = pool + noff;
+        e[i].group = pool + goff;
+    }
+    return c;
+}
+
+/* 取走本次扫描结果的内存版 (所有权转移). 返回 NULL = 本次没有扫描, 调用方去读盘 */
+fs_cache_t *media_scan_take_cache(bool novel)
+{
+    fs_cache_t *c = novel ? s_built_novel : s_built_music;
+    if (novel) s_built_novel = NULL;
+    else       s_built_music = NULL;
+    return c;
+}
+
 /* 执行一次全量扫描: 清缓存 → 迭代扫目录 → 写索引 + 空间快照 */
 static void media_scan_run(void)
 {
@@ -548,6 +606,19 @@ static void media_scan_run(void)
     bool wrote = false;
     if (scan_ok) {
         wrote = write_index_bin(&ctx.b);
+
+        /* 内存版: 给本次挂载直接用, 不依赖磁盘回读 */
+        fs_cache_t *c = builder_to_cache(&ctx.b);
+        if (c) {
+            if (s_cfg == &s_music_cfg) {
+                if (s_built_music) heap_caps_free(s_built_music);
+                s_built_music = c;
+            } else {
+                if (s_built_novel) heap_caps_free(s_built_novel);
+                s_built_novel = c;
+            }
+            ESP_LOGI(TAG_MEDIA_SCAN, "内存索引已就绪: %d 条目 (PSRAM)", c->count);
+        }
     } else {
         ESP_LOGW(TAG_MEDIA_SCAN, "扫描未完成(内存不足), 跳过写索引, 下次开机重扫");
     }

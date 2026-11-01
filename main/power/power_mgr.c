@@ -59,11 +59,11 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 /* 长按判定: 按住超过此值切换到另一模式 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
-/* 无操作自动熄屏: 音乐封面 1 分钟 / 小说 3 分钟 / 歌词页 3 分钟.
+/* 无操作自动熄屏: 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
  * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡. */
-#define PWR_IDLE_MUSIC_US    (60LL * 1000 * 1000)
-#define PWR_IDLE_LYRICS_US   (3LL * 60 * 1000 * 1000)
-#define PWR_IDLE_NOVEL_US    (3LL * 60 * 1000 * 1000)
+#define PWR_IDLE_MUSIC_US    (2LL * 60 * 1000 * 1000)
+#define PWR_IDLE_LYRICS_US   (5LL * 60 * 1000 * 1000)
+#define PWR_IDLE_NOVEL_US    (5LL * 60 * 1000 * 1000)
 #define PWR_IDLE_POLL_MS     1000
 
 /* 电源状态机 */
@@ -252,7 +252,7 @@ static void power_short_press_action(void)
 }
 
 /* 无操作熄屏轮询 (1s): 亮屏且超过时限时, 执行与睡眠键短按相同的动作.
- * 音乐 1 分钟 / 小说 3 分钟; 息屏、深睡淡出、模式切换过渡中均不处理. */
+ * 音乐 2 分钟 / 歌词与小说 5 分钟; 息屏、深睡淡出、模式切换过渡中均不处理. */
 static void idle_poll_cb(lv_timer_t *timer)
 {
     (void)timer;

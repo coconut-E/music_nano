@@ -68,7 +68,8 @@ typedef struct audio_decoder_s {
     uint32_t  (*get_sample_rate)(struct audio_decoder_s *self);         /* 采样率 */
     uint8_t   (*get_channels)(struct audio_decoder_s *self);            /* 声道数 */
     uint8_t   (*get_bits)(struct audio_decoder_s *self);                /* 位深 */
-    uint32_t  (*get_bitrate)(struct audio_decoder_s *self);             /* 码率 */
+    uint32_t  (*get_bitrate)(struct audio_decoder_s *self);             /* 码率 (kbps, 有 Xing 时返回平均值) */
+    uint32_t  (*get_duration_ms)(struct audio_decoder_s *self);         /* 精确总时长 (毫秒), 0=未知; 可为 NULL */
     uint32_t  (*get_file_size)(struct audio_decoder_s *self);           /* 文件大小 (字节) */
     uint32_t  (*get_position)(struct audio_decoder_s *self);            /* 当前解码位置 (字节); FLAC 为文件读游标, 含预读 */
     uint32_t  (*get_data_offset)(struct audio_decoder_s *self);         /* 音频数据起点 (ID3/元数据长度), 无则 0 */
