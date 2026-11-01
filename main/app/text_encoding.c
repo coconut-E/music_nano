@@ -232,10 +232,13 @@ int text_to_utf8(const uint8_t *in, size_t n,
 
 /* ─────────────────── 媒体标签文本 (ID3v2 / FLAC / WAV) ─────────────────── */
 
-/* 过滤标签里不应显示的码点: NBSP 归一化为空格, 控制字符替换为空格 */
+/* 过滤标签里不应显示的码点: NBSP 归一化为空格, 控制字符替换为空格,
+ * 零宽字符/字节序标记返回 0, 由调用方直接跳过 */
 static uint32_t sanitize_cp(uint32_t cp)
 {
     if (cp == 0x00A0 || cp == 0x0098) return ' ';
+    /* 零宽空格/零宽非连接符/零宽连接符/词连接符/BOM: 字库里没有字形, 会显示成方框 */
+    if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0x2060 || cp == 0xFEFF) return 0;
     /* 保留换行/回车: 内嵌歌词 (USLT) 依赖 \n 分行; 普通标题里出现换行也无害 */
     if (cp < 0x20 && cp != '\t' && cp != '\n' && cp != '\r') return ' ';
     if (cp == 0x7F) return ' ';
@@ -281,6 +284,7 @@ static size_t utf16_to_utf8(const uint8_t *in, size_t n, int be,
 
         if (cp == 0xFEFF) continue;   /* BOM */
         cp = sanitize_cp(cp);
+        if (cp == 0) continue;        /* 零宽字符等: 直接跳过 */
         if (!put_utf8(out, cap, &o, cp)) break;
     }
 
@@ -298,6 +302,7 @@ static size_t cp1251_to_utf8(const uint8_t *in, size_t n, char *out, size_t cap)
         uint32_t cp = (in[i] < 0x80) ? in[i] : cp1251_high[in[i] - 0x80];
         if (cp == 0) break;
         cp = sanitize_cp(cp);
+        if (cp == 0) continue;        /* 零宽字符等: 直接跳过 */
         if (!put_utf8(out, cap, &o, cp)) break;
     }
 
@@ -470,6 +475,7 @@ static size_t ansi_to_utf8(const uint8_t *in, size_t n, char *out, size_t cap)
     size_t lo = 0;
     for (size_t i = 0; i < n; i++) {
         uint32_t cp = sanitize_cp(in[i]);
+        if (cp == 0) continue;        /* 零宽字符等: 直接跳过 */
         if (!put_utf8(out, cap, &lo, cp)) break;
     }
     out[lo < cap ? lo : (cap - 1)] = '\0';
@@ -518,6 +524,24 @@ int text_tag_to_utf8(const uint8_t *in, size_t n, int enc,
         }
         size_t prefix = 0;
         if (utf8_check(p, len, &prefix) == 1) {
+            if (len + 1 <= cap) {
+                /* 装得下: 逐字节拷贝, 顺便剔除零宽字符 (E2 80 8B/8C/8D) 与 BOM */
+                size_t w = 0;
+                for (size_t i = 0; i < len; i++) {
+                    if (i + 2 < len && p[i] == 0xE2 && p[i + 1] == 0x80 &&
+                        (p[i + 2] == 0x8B || p[i + 2] == 0x8C || p[i + 2] == 0x8D)) {
+                        i += 2;
+                        continue;
+                    }
+                    if (i + 2 < len && p[i] == 0xEF && p[i + 1] == 0xBB && p[i + 2] == 0xBF) {
+                        i += 2;
+                        continue;
+                    }
+                    out[w++] = (char)p[i];
+                }
+                out[w] = '\0';
+                return (int)w;
+            }
             len = utf8_clip_len(p, len, cap - 1);
             memcpy(out, p, len);
             out[len] = '\0';

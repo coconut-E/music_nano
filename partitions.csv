@@ -1,5 +1,7 @@
-# Name,   Type, SubType, Offset,  Size, Flags
+# Name,   Type, SubType, Offset,   Size,     Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-nvs,      data, nvs,     ,        0x6000,
-phy_init, data, phy,     ,        0x1000,
-factory,  app,  factory, ,        4M,
+# 8MB flash 布局: app 分区起点需 64KB 对齐, 故整体上移到 0x20000,
+# 前面的 0x9000-0x20000 给 nvs(24KB→88KB) + phy_init.
+nvs,      data, nvs,     0x9000,   0x16000,
+phy_init, data, phy,     0x1F000,  0x1000,
+factory,  app,  factory, 0x20000,  0x7E0000,
