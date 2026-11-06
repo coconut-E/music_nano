@@ -472,6 +472,9 @@ void lyrics_view_init(lv_obj_t *parent, void (*back_cb)(void))
     lv_obj_set_style_radius(s_area, 0, 0);
     lv_obj_clear_flag(s_area, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_area, LV_SCROLLBAR_MODE_OFF);
+    /* 容器本身不接收点击: 普通 lv_obj 默认带 CLICKABLE, 歌词区空白处会静默
+     * 吞掉触摸(没挂事件, 点了没反应), 压住下方进度条的判定带. 只保留 s_overlay. */
+    lv_obj_clear_flag(s_area, LV_OBJ_FLAG_CLICKABLE);
 
     s_content = lv_obj_create(s_area);
     lv_obj_set_pos(s_content, 0, 0);
@@ -482,6 +485,7 @@ void lyrics_view_init(lv_obj_t *parent, void (*back_cb)(void))
     lv_obj_set_style_radius(s_content, 0, 0);
     lv_obj_clear_flag(s_content, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(s_content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_content, LV_OBJ_FLAG_CLICKABLE);   /* 同上: 内容层也不吃点击 */
     lv_obj_add_flag(s_content, LV_OBJ_FLAG_HIDDEN);
 
     for (int i = 0; i < LYR_NLABELS; i++) {

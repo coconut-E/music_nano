@@ -1177,8 +1177,8 @@ static void chrome_apply_layout(bool lyrics)
     if (s_time_current)    lv_obj_set_y(s_time_current,    lyrics ? 254 : 204);
     if (s_time_total)      lv_obj_set_y(s_time_total,      lyrics ? 254 : 204);
     if (s_play_btn)        lv_obj_set_y(s_play_btn,        lyrics ? 262 : 212);
-    if (s_prev_btn)        lv_obj_set_y(s_prev_btn,        lyrics ? 256 : 206);
-    if (s_next_btn)        lv_obj_set_y(s_next_btn,        lyrics ? 256 : 206);
+    if (s_prev_btn)        lv_obj_set_y(s_prev_btn,        lyrics ? 265 : 215);
+    if (s_next_btn)        lv_obj_set_y(s_next_btn,        lyrics ? 265 : 215);
 }
 
 static void chrome_set_visible(bool show)
@@ -1203,6 +1203,9 @@ static void page_set_lyrics(void)
     lyrics_view_show();
     chrome_apply_layout(true);
     chrome_set_visible(false);
+    /* 进度条压到歌词容器之上: 判定带上沿(230..239)落在歌词区内,
+     * 不置顶会被 s_area 先命中吞掉, 表现为"点不到进度条". */
+    lv_obj_move_foreground(s_progress_slider);
 }
 
 static bool lyr_full_snapshot(uint8_t *buf)
@@ -1629,6 +1632,12 @@ static void player_build(void)
     lv_obj_set_style_pad_all(s_progress_slider, 0, LV_PART_KNOB);
     lv_obj_set_style_transform_width(s_progress_slider, 2, LV_PART_KNOB);
     lv_obj_set_style_transform_height(s_progress_slider, 2, LV_PART_KNOB);
+    /* 判定带 144×4 → 172×32: 4px 的条手指根本点不中, 上下左右各扩 14px,
+     * 只改命中区不改绘制. 歌词页 y=230..261, 封面页 y=180..211.
+     * 上沿落在不可点的文字区(歌词最后一行下半部 / 作者行下沿), 相当于只加上方;
+     * 上沿 230..239 落在歌词容器里, 所以 page_set_lyrics() 必须把它提到歌词之上;
+     * 下沿 261 距 prev/next 的 265 还有 3px, 且与播放键(262)相邻, 再加就会压住按钮. */
+    lv_obj_set_ext_click_area(s_progress_slider, 14);
     lv_slider_set_range(s_progress_slider, 0, 1000);
     lv_slider_set_value(s_progress_slider, 0, LV_ANIM_OFF);
     lv_obj_add_event_cb(s_progress_slider, progress_slider_cb, LV_EVENT_RELEASED, NULL);
@@ -1669,11 +1678,11 @@ static void player_build(void)
     lv_obj_center(s_play_icon);
     lv_obj_add_event_cb(play_btn, play_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 上一首 (透明点击区放大到 60x64, 符号位置不变) */
+    /* 上一首 (透明点击区 60x46, 与播放键同高; 符号位置不变: 215+(46-16)/2 = 206+(64-16)/2 = 230) */
     lv_obj_t *prev_btn = lv_btn_create(scr);
     s_prev_btn = prev_btn;
-    lv_obj_set_pos(prev_btn, 0, 206);
-    lv_obj_set_size(prev_btn, 60, 64);
+    lv_obj_set_pos(prev_btn, 0, 215);
+    lv_obj_set_size(prev_btn, 60, 46);
     lv_obj_set_style_radius(prev_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(prev_btn, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(prev_btn, LV_OPA_0, 0);
@@ -1687,11 +1696,11 @@ static void player_build(void)
     lv_obj_align(prev_icon, LV_ALIGN_CENTER, 13, 0);   /* 偏移补偿放大: 符号仍在 (43,238) */
     lv_obj_add_event_cb(prev_btn, player_prev_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 下一首 (透明点击区放大到 60x64, 符号位置不变) */
+    /* 下一首 (透明点击区 60x46, 与播放键同高; 符号位置不变, 同上) */
     lv_obj_t *next_btn = lv_btn_create(scr);
     s_next_btn = next_btn;
-    lv_obj_set_pos(next_btn, 112, 206);
-    lv_obj_set_size(next_btn, 60, 64);
+    lv_obj_set_pos(next_btn, 112, 215);
+    lv_obj_set_size(next_btn, 60, 46);
     lv_obj_set_style_radius(next_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(next_btn, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(next_btn, LV_OPA_0, 0);
