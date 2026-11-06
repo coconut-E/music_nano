@@ -1,12 +1,12 @@
 # 生成 16x21 RGB565 粉色爱心图标 (与 icon_file 参数一致, 可直接替换)
-# 运行: C:\Python314\python.exe tools\gen_heart_icon.py
+# 运行: python tools\gen_heart_icon.py
 import os
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 16, 21                       # 与 icon_file 每帧一致
 BG = (255, 255, 255)                # 白底 (列表也是白底)
 PINK = (255, 92, 138)               # 粉色爱心
-FONT = r"D:\Fonts\seguisym.ttf"     # 含 U+2665 的字体
+FONT = r"C:\Windows\Fonts\seguisym.ttf"   # 含 U+2665 的字体 (Windows 自带)
 CH = "\u2665"
 
 OUT = os.path.normpath(os.path.join(

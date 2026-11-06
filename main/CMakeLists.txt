@@ -7,6 +7,7 @@ idf_component_register(SRCS "main.c"
                             "app/likes.c"
                             "app/lyrics.c"
                             "app/app_mode.c"
+                            "app/ota.c"
                             "audio/audio_task.cpp"
                             "audio/decoder_mp3.cpp"
                             "audio/decoder_flac.cpp"
@@ -38,5 +39,14 @@ idf_component_register(SRCS "main.c"
                             "resources/icon_novel.c"
                             "resources/lv_font_global_16.c"
                             "resources/lv_font_heart_44.c"
-                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
+                            "resources/font_part.c"
+                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_partition app_update
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
+
+# 测试开关 (build.ps1 -TestCrash): 编译一版"一启动就 abort"的固件,
+# 用来验证 OTA 回退 (镜像能过校验, 但跑不起来).
+# 由 build.ps1 每次都显式传 0/1, 避免 CMake 缓存把上一次的值带过来。
+if(TEST_CRASH_ON_BOOT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE TEST_CRASH_ON_BOOT=1)
+    message(STATUS "main: 测试固件 TEST_CRASH_ON_BOOT=1 (启动即崩)")
+endif()

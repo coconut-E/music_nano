@@ -13,3 +13,7 @@ managed_components/
 Thumbs.db
 firmware/
 
+
+# flash_tool build output
+tools/flash_tool/out/
+tools/flash_tool/tmp/

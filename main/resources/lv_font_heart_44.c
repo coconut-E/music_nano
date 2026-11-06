@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 44 px
  * Bpp: 4
- * Opts: --font C:/Windows/Fonts/seguisym.ttf -r 0x2665 --size 44 --bpp 4 --format lvgl --force-fast-kern-format --lv-font-name lv_font_heart_44 -o E:\music_nano\music_nano\main\resources\lv_font_heart_44.c
+ * Opts: --font C:/Windows/Fonts/seguisym.ttf -r 0x2665 --size 44 --bpp 4 --format lvgl --force-fast-kern-format --lv-font-name lv_font_heart_44 -o lv_font_heart_44.c
  ******************************************************************************/
 
 #ifdef __has_include

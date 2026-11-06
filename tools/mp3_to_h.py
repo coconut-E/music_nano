@@ -2,8 +2,13 @@ import subprocess
 import sys
 import os
 
-MP3_PATH = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\123\Music\mp3\Rick Astley - Never Gonna Give You Up.mp3"
-OUT_H    = sys.argv[2] if len(sys.argv) > 2 else r"E:\music_nano\music_nano\main\music_data.h"
+if len(sys.argv) < 2:
+    print("用法: python mp3_to_h.py <输入.mp3> [输出.h] [截取秒数]")
+    sys.exit(2)
+
+MP3_PATH = sys.argv[1]
+OUT_H    = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "main", "music_data.h")
 MAX_SEC  = float(sys.argv[3]) if len(sys.argv) > 3 else 25
 
 print(f"Input:  {MP3_PATH}")

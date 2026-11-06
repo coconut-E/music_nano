@@ -1,7 +1,9 @@
 ﻿param(
     [switch]$Clean,
     [string]$IdfPath,        # 可选: 手动指定 ESP-IDF 根目录 (含 export.ps1)
-    [string]$IdfToolsPath    # 可选: 手动指定 IDF 工具安装目录 (IDF_TOOLS_PATH)
+    [string]$IdfToolsPath,   # 可选: 手动指定 IDF 工具安装目录 (IDF_TOOLS_PATH)
+    [string]$Ver,            # 可选: 手动指定固件版本 (如 0.7.1); 默认 0.7.<本阶段提交数>
+    [switch]$TestCrash       # 可选: 编测试固件 (启动即 abort), 验证 OTA 回退
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,7 +99,16 @@ function Import-IdfEnvironment {
 
     $exportScript = Join-Path $resolved.Idf "export.ps1"
     Write-Host "== 导入 ESP-IDF 环境: $($resolved.Idf) ==" -ForegroundColor Cyan
-    . $exportScript
+    # export.ps1 里的 python 会往 stderr 打一行 "Activating ESP-IDF x.y" 横幅,
+    # 在 $ErrorActionPreference='Stop' 下会被当成致命错误直接把脚本打断
+    # (非交互会话里 python 的输出不再是 TTY, 更容易触发)。这里临时放宽。
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        . $exportScript
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
     return (Test-IdfReady)
 }
 
@@ -116,17 +127,58 @@ if (-not (Test-IdfReady)) {
 $PROJ_DIR  = $PSScriptRoot
 $BUILD_DIR = Join-Path $PROJ_DIR "build"
 
+# ── 固件版本: <大版本>.<第三位> ──
+# version.txt 只写大版本 (如 "0.7"), 换阶段时手工改一行, 第三位自动清零;
+# 第三位 = 自从 version.txt 上次被改动以来的提交数, 所以同一个阶段内
+# 0.7.0 → 0.7.1 → 0.7.2 ... 线性递增, 跨阶段重新从 0 开始。
+#   0     = 未正式发布 (1.0 留给量产)
+#   7     = 第 7 个功能阶段 (OTA: 双槽 + 字库分区 + 校验窗口)
+#   第三位 = 本阶段提交数
+# 不落额外文件: 直接把 -DPROJECT_VER 传给 cmake。
+if (-not $Ver) {
+    $base = ""
+    $vt = Join-Path $PROJ_DIR "version.txt"
+    if (Test-Path $vt) { $base = (Get-Content $vt -Raw).Trim() }
+
+    $n = 0
+    try {
+        # 最近一次改动 version.txt 的提交; 该提交本身不计入第三位
+        $ref = & git -C $PROJ_DIR log -1 --format=%H -- version.txt 2>$null
+        if ($ref) {
+            $out = & git -C $PROJ_DIR rev-list --count "$ref..HEAD" 2>$null
+            if ($out) { $n = [int]$out }
+        } else {
+            # version.txt 还没进版本库 (本阶段第一次构建): 第三位从 0 算起
+            $n = 0
+        }
+    } catch { $n = 0 }
+
+    if ($base) { $Ver = "$base.$n" }
+}
+if (-not $Ver) {
+    Write-Host "警告: 取不到版本号 (缺 version.txt 或 git), 回落到 git describe" -ForegroundColor Yellow
+}
+
 if ($Clean -and (Test-Path $BUILD_DIR)) {
     Write-Host "=== 清空 build/ ===" -ForegroundColor Cyan
     Remove-Item -Recurse -Force $BUILD_DIR
 }
 
 Write-Host "=== 开始编译 ($PROJ_DIR) ===" -ForegroundColor Cyan
+if ($Ver) { Write-Host "=== 固件版本: $Ver ===" -ForegroundColor Cyan }
+if ($TestCrash) { Write-Host "=== 测试固件: 启动即崩 (验证 OTA 回退) ===" -ForegroundColor Yellow }
 
 $code = 1
 Push-Location $PROJ_DIR
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'   # idf.py 的 stderr 不能当致命错误
 try {
-    & idf.py build 2>&1 | ForEach-Object {
+    $idfArgs = @()
+    if ($Ver) { $idfArgs += "-DPROJECT_VER=$Ver" }
+    # 每次都显式传 0/1, 避免 CMake 缓存把上一次的 -TestCrash 带进普通构建
+    if ($TestCrash) { $idfArgs += "-DTEST_CRASH_ON_BOOT=1" } else { $idfArgs += "-DTEST_CRASH_ON_BOOT=0" }
+    $idfArgs += "build"
+    & idf.py @idfArgs 2>&1 | ForEach-Object {
         $line = $_
         if ($line -match "error:|fatal error|undefined reference|cannot find|FAILED|ninja: build stopped") {
             Write-Host $line -ForegroundColor Red
@@ -140,6 +192,7 @@ try {
     }
     $code = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $oldEap
     Pop-Location
 }
 

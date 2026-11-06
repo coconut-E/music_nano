@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -13,6 +14,8 @@
 #include "cover.h"
 #include "likes.h"
 #include "app_mode.h"
+#include "font_part.h"
+#include "ota.h"
 
 /* 系统级消息队列句柄 (跨模块共享) */
 static QueueHandle_t s_app_cmd_queue  = NULL;   /* 应用命令队列: console→app 层(扫描/连接/播放等) */
@@ -23,6 +26,13 @@ static QueueHandle_t s_audio_rsp_queue = NULL;  /* 音频应答队列: 音频任
  * 所有任务由子系统 init 内部创建, 本函数最后把自己挂起, 只保留各任务在跑. */
 void app_main(void)
 {
+#ifdef TEST_CRASH_ON_BOOT
+    /* 测试专用 (build.ps1 -TestCrash): 模拟"能通过镜像校验, 但一启动就崩"的坏固件,
+     * 用来验证 OTA 回退: bootloader 判 ABORTED 并退回上一个槽 */
+    printf("\n[TEST] 故意在启动最早期崩溃 (TEST_CRASH_ON_BOOT)\n");
+    abort();
+#endif
+
     vTaskDelay(pdMS_TO_TICKS(80));//I (53) HOOK: RST released (GPIO25)->I (92) main_task: Calling app_main() only 39ms but The LCD needs at least 120ms stabilization time after power-on or reset, hence an 80ms delay here.
     /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝.
      * 这样把 LCD 上电时序 "藏" 进后续初始化时间里, 减少用户可见的启动延迟. */
@@ -35,6 +45,10 @@ void app_main(void)
     power_mgr_boot_battery_check();
 
     nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
+
+    /* 字库分区: 把 3.27MB 字形数据从独立分区 mmap 进来填 font_dsc。
+     * 必须在任何文字绘制之前; 失败会自动退化为 ASCII 字体 (不崩, 中文空白)。*/
+    font_part_init();
 
     /* 读取上次睡眠时的应用模式, 供 UI 决定启动构建哪一组 (只建一组, 加快启动) */
     app_mode_t boot_mode = app_mode_read_saved();
@@ -89,6 +103,10 @@ void app_main(void)
     }
 
     printf("系统就绪\n");
+
+    /* OTA: 如果本次运行的是刚升级上来还没打标的固件, 起 15 秒校验窗口
+     * (全屏遮罩 + 禁止睡眠), 走完自动 mark_valid; 期间断电则 bootloader 自动退回 */
+    ota_init();
 
     vTaskSuspend(NULL);   /* 入口任务不再需要, 永久挂起*/
 }

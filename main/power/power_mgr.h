@@ -40,6 +40,12 @@ void power_mgr_set_cur_bri(uint8_t v);
  * 仅可在 LVGL 任务上下文调用 (与内部 idle 定时器同任务) */
 void power_mgr_notify_activity(void);
 
+/* 睡眠抑制开关: OTA 新固件校验窗口期间置位.
+ * 置位后电源键短按/长按与无操作熄屏全部失效 (触摸/音量键不受影响),
+ * 目的是防止用户在"请勿断电"窗口里误触导致新固件来不及打标就被回退 */
+void power_mgr_set_sleep_inhibit(bool inhibit);
+bool power_mgr_sleep_inhibited(void);
+
 /* 设置歌词页是否显示: true=歌词页 (无操作 3 分钟熄屏), false=音乐封面 (1 分钟).
  * 由音乐 UI 在进入/退出歌词页、销毁音乐组时调用 */
 void power_mgr_set_lyrics_active(bool active);

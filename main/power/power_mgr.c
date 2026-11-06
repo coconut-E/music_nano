@@ -73,6 +73,11 @@ typedef enum {
     PWR_FAKE_OFF,     /* 淡出中(即将深睡), 忽略按键 */
 } pwr_state_t;
 
+/* 睡眠抑制: OTA 新固件校验窗口期间置位.
+ * 窗口内电源键短按/长按、无操作熄屏全部被拦下 —— 用户只会看到遮罩上的
+ * "请勿断电", 按什么都没反应, 避免误触导致新固件来不及打标就被回退. */
+static volatile bool s_sleep_inhibit = false;
+
 static pwr_state_t s_state = PWR_ACTIVE;   /* 当前电源状态 */
 static bool        s_key_prev = false;     /* 上次按键电平 (用于检测沿) */
 static int64_t     s_key_last_us = 0;      /* 上次按键沿的时刻 (us), 用于冷却 */
@@ -109,6 +114,21 @@ void power_mgr_set_cur_bri(uint8_t v)
 void power_mgr_notify_activity(void)
 {
     s_last_activity_us = esp_timer_get_time();
+}
+
+/* 睡眠抑制开关 (OTA 校验窗口用): inhibit=true 时三个睡眠入口全部失效.
+ * 只拦"睡眠/熄屏"这类主动动作, 触摸/音量键不受影响. */
+void power_mgr_set_sleep_inhibit(bool inhibit)
+{
+    if (s_sleep_inhibit == inhibit) return;
+    s_sleep_inhibit = inhibit;
+    ESP_LOGI(TAG, "睡眠抑制 %s", inhibit ? "开启" : "解除");
+    if (!inhibit) power_mgr_notify_activity();   /* 解除时重新计时, 避免立刻熄屏 */
+}
+
+bool power_mgr_sleep_inhibited(void)
+{
+    return s_sleep_inhibit;
 }
 
 /* 歌词页显示状态: true=歌词页 (3 分钟), false=封面 (1 分钟).
@@ -231,6 +251,10 @@ static void screen_on(void)
 /* 执行与之前相同的短按动作 (息屏/亮屏/深睡) */
 static void power_short_press_action(void)
 {
+    if (s_sleep_inhibit) {          /* OTA 校验窗口: 按键直接吞掉 */
+        ESP_LOGW(TAG, "新固件校验中, 忽略睡眠键");
+        return;
+    }
     switch (s_state) {
     case PWR_ACTIVE:
         if (bt_a2dp_get_state() != BT_STATE_DISCONNECTED) {
@@ -257,6 +281,7 @@ static void idle_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (s_mode_switching) return;
+    if (s_sleep_inhibit) return;    /* OTA 校验窗口: 不做无操作熄屏 */
     if (s_state != PWR_ACTIVE) return;
 
     int64_t timeout_us;
@@ -277,6 +302,10 @@ static void idle_poll_cb(lv_timer_t *timer)
 void power_mgr_poll_key(bool level)
 {
     if (s_mode_switching) return;   /* 切换过渡中: 忽略 */
+    if (s_sleep_inhibit) {          /* OTA 校验窗口: 吞掉按键, 但仍跟踪电平避免解锁后误判边沿 */
+        s_key_prev = level;
+        return;
+    }
 
     int64_t now = esp_timer_get_time();
     bool rising  = level && !s_key_prev;

@@ -1,7 +1,19 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
-# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-# 8MB flash 布局: app 分区起点需 64KB 对齐, 故整体上移到 0x20000,
-# 前面的 0x9000-0x20000 给 nvs(24KB→88KB) + phy_init.
-nvs,      data, nvs,     0x9000,   0x16000,
-phy_init, data, phy,     0x1F000,  0x1000,
-factory,  app,  factory, 0x20000,  0x7E0000,
+# 8MB flash / OTA 双槽布局.
+#   nvs      位置不变 (0x9000, 88KB): 换分区表不清用户设置
+#   otadata  8KB, 占原 phy_init 的位置, 换表时必须擦掉 0x1F000-0x22000
+#   ota_0/1  各 2.19MB, 装 1.75MB 的 app (剩 24%)
+#   font     3.25MB, 装 3.11MB 字库 (剩 4%), 开工时 mmap 进 DROM 窗口
+#
+# 注意:
+#   1) app 分区必须 64KB 对齐, 所以 ota_0 只能从 0x40000 起;
+#      0x22000-0x40000 这 120KB 是对齐留下的空洞, 无法利用.
+#   2) 去掉 factory: 烧录后 otadata 为空时 bootloader 会自动选 ota_0
+#      并写入 {seq=1, state=VALID}, 不需要应用参与.
+#   3) font 是自定义 data 子类型 0x40, 只读, 由 font_part.c mmap.
+nvs,      data, nvs,   0x9000,   0x16000,
+otadata,  data, ota,   0x1F000,  0x2000,
+phy_init, data, phy,   0x21000,  0x1000,
+ota_0,    app,  ota_0, 0x40000,  0x230000,
+ota_1,    app,  ota_1, 0x270000, 0x230000,
+font,     data, 0x40,  0x4A0000, 0x340000,

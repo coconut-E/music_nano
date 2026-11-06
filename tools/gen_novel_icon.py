@@ -1,14 +1,11 @@
 # 生成 16x21 RGB565 小说(TXT)文件图标 (与 icon_file/icon_heart 参数一致, 可直接用于列表)
-# 运行: C:\Python314\python.exe tools\gen_novel_icon.py [源图路径]
-# 默认源图: E:\播放器\手表\代码\图标\文件\IMG_20260502_235932.png
+# 运行: python tools/gen_novel_icon.py <源图路径>
 import os
 import sys
 from PIL import Image
 
 W, H = 16, 21                       # 与 icon_file/icon_heart 每帧一致
 BG = (255, 255, 255)                # 白底 (列表也是白底)
-
-SRC_DEFAULT = r"E:\播放器\手表\代码\图标\文件\IMG_20260502_235932.png"
 
 OUT = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "main", "resources", "icon_novel.c"))
@@ -60,7 +57,10 @@ def emit_c(img):
 
 
 if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else SRC_DEFAULT
+    if len(sys.argv) < 2:
+        print("用法: python tools/gen_novel_icon.py <源图路径>")
+        sys.exit(2)
+    src = sys.argv[1]
     img = render(src)
     here = os.path.dirname(os.path.abspath(__file__))
     img.save(os.path.join(here, "novel_icon_preview.png"))

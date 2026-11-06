@@ -6,7 +6,7 @@
     python tools/font_check.py <曲库目录或zip> [更多路径...]
     python tools/font_check.py --font <字体C文件> <路径...>
 
-    python tools/font_check.py "C:\\Users\\123\\Music" "C:\\Users\\123\\Downloads\\music4.2.zip"
+    python tools/font_check.py "<曲库目录>" "<曲库压缩包>"
 
 退出码: 0 = 没有缺字; 1 = 有缺字(需要补字符源重新取模).
 

@@ -17,7 +17,12 @@
 #include "xtensa_context.h"
 #include "nvs.h"
 #include "app.h"
+#include "ota.h"
+#include "font_part.h"
 #include "sys_monitor.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 #define LINE_BUF_SIZE 64   /* 串口命令行缓冲长度 */
 
@@ -286,6 +291,36 @@ static void cmd_taskmem(const char *name)
     free(snap);
 }
 
+/* version 命令: 当前运行的固件版本 + 所在分区 */
+static void cmd_version(void)
+{
+    const esp_app_desc_t *d = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    printf("[版本] %s  %s @0x%05lx  编译 %s %s  IDF %s\n",
+           d->version, run ? run->label : "?",
+           run ? (unsigned long)run->address : 0UL,
+           d->date, d->time, d->idf_ver);
+}
+
+/* font 命令: 手动全量校验字库分区 (启动路径上不做, 见 font_part.c) */
+static void cmd_font(void)
+{
+    int st = font_part_state();
+    if (st == FONT_PART_OK) {
+        printf("[字库] 映射正常\n");
+    } else {
+        printf("[字库] 不可用 (state=%d): %s\n", st, font_part_err());
+        return;
+    }
+    uint32_t got = 0;
+    int r = font_part_verify_crc(&got);
+    if (r == 0) {
+        printf("[字库] 全量 CRC 通过\n");
+    } else {
+        printf("[字库] 全量 CRC 不匹配 (flash=0x%08x)\n", (unsigned)got);
+    }
+}
+
 /* 控制台任务: 非阻塞读串口, 逐字符拼行, 回车后解析执行 */
 static void console_task(void *arg)
 {
@@ -293,6 +328,7 @@ static void console_task(void *arg)
 
     printf("\n=== 音乐播放器 ===\n");
     printf("系统命令: stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名]\n");
+    printf("升级命令: version | ota | ota boot <0|1> | font crc\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     //printf("命令> ");
 
@@ -329,6 +365,14 @@ static void console_task(void *arg)
                         cmd_taskmem(NULL);
                     } else if (strncmp(line, "taskmem ", 8) == 0) {   /* "taskmem <任务名>" */
                         cmd_taskmem(line + 8);
+                    } else if (strcmp(line, "version") == 0) {
+                        cmd_version();
+                    } else if (strcmp(line, "ota") == 0) {
+                        ota_report();
+                    } else if (strcmp(line, "font crc") == 0) {
+                        cmd_font();
+                    } else if (strncmp(line, "ota boot ", 9) == 0) {   /* "ota boot 0/1" */
+                        ota_switch(atoi(line + 9));
                     } else {
                         /* ── 应用命令 (封包后发到 app 队列, 由 UI 消费) ── */
                         app_cmd_t cmd;

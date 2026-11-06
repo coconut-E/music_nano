@@ -19,6 +19,7 @@
 #include "menu.h"
 #include "app_mode.h"
 #include "power_mgr.h"
+#include "ota.h"
 
 #define LVGL_TAG "LVGL"
 
@@ -62,6 +63,9 @@ void ui_loop_task(void *arg)
 
     while (1) {
         lv_timer_handler();   /* LVGL 渲染/动画/定时器 */
+
+        /* 兼作 OTA 校验窗口的"UI 还活着"心跳: 卡死就不打标, 断电后会自然退回 */
+        ota_notify_ui_alive();
 
         /* 分步预建文件浏览器: 每轮最多 10ms, 建完返回 false 后调用几乎零开销.
          * 放在渲染之后, 让背光渐入动画每轮都先推进一帧, 再吃掉这一小片 CPU */

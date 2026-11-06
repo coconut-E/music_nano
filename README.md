@@ -39,6 +39,7 @@ PCB 与 3D 外壳已在立创开源硬件平台开源：
 - **设置持久化**：音量、亮度、上次播放歌曲、播放模式掉电保存（NVS）
 - **系统监视**：实时显示电池电压与 CPU 温度
 - **电源管理**：背光渐变、一键息屏（蓝牙保持连接）、深度睡眠
+- **OTA 双槽**：`ota_0` / `ota_1` + otadata 选槽，新固件首次启动跑 15 秒校验窗口，未确认就崩溃/断电由 bootloader 自动退回旧槽
 - **串口控制台**：内置命令可直接操作扫描/连接/播放/调试
 
 ## 硬件平台
@@ -114,7 +115,13 @@ ESP32 无 FPU，所有解码与重采样均为纯整数定点实现，音频最�
 - `main/power/` 电源管理
 - `main/storage/` SD 卡与音乐扫描
 - `main/drivers/` 显示屏驱动
-- `main/app/` 设置持久化与串口控制台
+- `main/app/` 设置持久化、串口控制台、OTA 校验窗口
+- `main/resources/font_part.c` 字库分区加载（mmap 进 DROM 窗口）
+- `tools/flash_tool/` 一键烧录器（Windows x86-64，MinGW 编译）
+- `tools/flash_step.ps1` 分步烧录脚本（首次全量 / 只写某槽 / 只擦某段）
+- `tools/serial_cmd.ps1` 串口助手（给设备控制台发命令）
+- `tools/reset_log.ps1` 复位并抓启动日志
+- `tools/make_variants.ps1` 批量生成 OTA 测试用的版本变体
 
 ## 构建说明
 
@@ -129,7 +136,56 @@ idf.py -p COMx flash monitor
 
 本仓库还提供 `build.ps1`（过滤噪声的构建包装脚本）与 `mem-analyze.ps1`（ELF 内存占用分析），详见 [BUILD.md](BUILD.md)。
 
+## 烧录与升级
+
+两者是分开的两条链路，不要混用：
+
+| 用途 | 手段 |
+| --- | --- |
+| 芯片全空 / 换分区表 | 线烧全量：`tools\flash_step.ps1 once`（bootloader + 分区表 + ota_0 + 字库） |
+| 保留设置的重新烧录 | `tools\flash_step.ps1 base`（同上去掉字库，可加 `-NoFont`） |
+| 日常升级 | OTA（写备用槽，见下） |
+| 调试 | `app2 -Slot 0\|1` 写指定槽 / `erase` 只擦一段 / `raw` 单文件单地址 |
+
+分区表（8MB，OTA 双槽）：
+
+```
+nvs     0x9000  88KB      otadata 0x1F000 8KB       phy_init 0x21000 4KB
+ota_0   0x40000 2.19MB    ota_1   0x270000 2.19MB   font     0x4A0000 3.25MB
+```
+
+> `0x22000-0x40000` 是 64KB 对齐留下的空洞，**没有分区**。烧录器现在会拦截任何
+> 落进这段的地址——旧版 `flash_args`（app 曾经在 `0x20000`）会被直接拒绝，
+> 而不是像以前那样写进去、回读 MD5 还全对、重启才发现设备起不来。
+
+字库单独占一个 3.25MB 的只读分区，开机 mmap 进 DROM 窗口（50 页）。它**只由
+烧录器全量烧写时写入**，OTA 不碰它，所以换字库必须线烧。
+
+> 所有自己写的脚本都在 `tools/` 下，**不要放进 `build/`**：那是编译目录，
+> `idf.py fullclean` 或 IDE 的清理会整个删掉。
+
 ## 更新日志
+
+### 2026.11.6
+
+> ⚠️ 本版分区表改成 **OTA 双槽**（`ota_0 @0x40000` / `ota_1 @0x270000` / `font @0x4A0000`），
+> 从旧版升上来必须先整片擦除重烧一次（`tools\flash_step.ps1 once`），旧 NVS 设置会被清空。
+
+**新增**
+- OTA 双槽：新增 `otadata`，`ota_0` / `ota_1` 各 2.19MB，按 `(seq-1)%2` 选槽启动
+- 首启校验窗口：新固件第一次启动时盖一层**系统层**全屏遮罩（`lv_layer_sys`）+ 15 秒倒计时，期间禁止睡眠；走完自动 `esp_ota_mark_app_valid_cancel_rollback()` 打标
+- 启动失败自动回退：不做任何处理，未打标的镜像在下次重启被判 `ABORTED`，bootloader 自己退回旧槽
+- 字库拆到独立 3.25MB 分区（`font`，data 子类型 `0x40`），开机 `esp_partition_mmap` 进 DROM 窗口，app 从 5,013,280 B 瘦到 1,765,136 B（槽占 23%）
+- 串口命令：`version` / `ota` / `ota boot <0|1>` / `font crc`
+- 烧录器：写大文件按 1MB 分段 + 末段补齐 16KB，修掉 2MB 以上单段写坏末尾几百字节的问题；新增地址白名单拦截（见"烧录与升级"）
+
+**优化**
+- 冷启动不做字库全量校验。原先在"OTA 后首启"跑一次 3.27MB CRC（271ms），但 OTA 根本不写字库分区，时机是反的；改成手动命令 `font crc`，启动路径只留纯内存校验（magic / 长度 / 偏移 / mmap / `glyph_dsc` 首末抽检）
+- 同槽 `ota boot` 直接拒绝，不再写一条指向"正在运行的分区"的 otadata
+
+**修复**
+- `flash_step.ps1` 的 `$src` 与镜像源哈希表 `$SRC` 撞名（PowerShell 变量不区分大小写），不带 `-App2` 时参数解析成空
+- `build.ps1` 导入 ESP-IDF 时，`export.ps1` 里 python 往 stderr 打的横幅被 `$ErrorActionPreference='Stop'` 当成致命错误
 
 ### 2026.11.1
 
