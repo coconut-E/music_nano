@@ -51,8 +51,8 @@ bool power_mgr_sleep_inhibited(void);
 void power_mgr_set_lyrics_active(bool active);
 
 /* 按键电平上报 (调用方每 10ms 上报一次当前电平).
- * 短按(松手时): 息屏/亮屏或深睡 (原逻辑); 长按(>=800ms): 切换音乐/小说模式.
- * level=按键当前电平 (true=按下) */
+ * 短按(松手时): 息屏/亮屏或深睡 (原逻辑); 长按(>=800ms): 进入主菜单
+ * (已在菜单里则无反应). level=按键当前电平 (true=按下) */
 void power_mgr_poll_key(bool level);
 
 /* 模式切换黑屏过渡: 淡出到纯黑 → 调用 work() (清理+构建) → 淡入.

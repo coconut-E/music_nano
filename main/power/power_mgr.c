@@ -56,11 +56,14 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 
 /* 按键冷却: 吞机械抖动产生的二次上升沿 */
 #define PWR_KEY_COOLDOWN_MS  200
-/* 长按判定: 按住超过此值切换到另一模式 */
+/* 长按判定: 按住超过此值进入主菜单 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
-/* 无操作自动熄屏: 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
- * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡. */
+/* 无操作自动熄屏: 菜单 30 秒 / 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
+ * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡.
+ * 菜单页里蓝牙任务已被 bt_a2dp_pause 挂起 (状态=断开), 因此 30 秒到点是
+ * "淡出后直接深睡"; 深睡前的清理收尾对这几秒没有副作用. */
+#define PWR_IDLE_MENU_US     (30LL * 1000 * 1000)
 #define PWR_IDLE_MUSIC_US    (2LL * 60 * 1000 * 1000)
 #define PWR_IDLE_LYRICS_US   (5LL * 60 * 1000 * 1000)
 #define PWR_IDLE_NOVEL_US    (5LL * 60 * 1000 * 1000)
@@ -285,9 +288,10 @@ static void idle_poll_cb(lv_timer_t *timer)
     if (s_state != PWR_ACTIVE) return;
 
     int64_t timeout_us;
-    if (app_mode_is_novel()) timeout_us = PWR_IDLE_NOVEL_US;
-    else if (s_lyrics_active) timeout_us = PWR_IDLE_LYRICS_US;
-    else timeout_us = PWR_IDLE_MUSIC_US;
+    if (app_mode_is_menu())        timeout_us = PWR_IDLE_MENU_US;
+    else if (app_mode_is_novel())  timeout_us = PWR_IDLE_NOVEL_US;
+    else if (s_lyrics_active)      timeout_us = PWR_IDLE_LYRICS_US;
+    else                           timeout_us = PWR_IDLE_MUSIC_US;
     int64_t now = esp_timer_get_time();
     if (now - s_last_activity_us < timeout_us) return;
 
@@ -298,7 +302,8 @@ static void idle_poll_cb(lv_timer_t *timer)
 }
 
 /* 按键电平上报 (复用 vol_key 10ms 定时器).
- * 上升沿只记时; 按住 >=800ms 在亮屏态触发模式切换; 松手未触发长按则执行短按动作. */
+ * 上升沿只记时; 按住 >=800ms 在亮屏态进入主菜单 (已在菜单则无反应);
+ * 松手未触发长按则执行短按动作. */
 void power_mgr_poll_key(bool level)
 {
     if (s_mode_switching) return;   /* 切换过渡中: 忽略 */
@@ -325,8 +330,8 @@ void power_mgr_poll_key(bool level)
         if (now - s_key_press_us >= PWR_KEY_LONG_US) {
             s_key_long_fired = true;
             s_key_pending    = false;
-            ESP_LOGI(TAG, "长按睡眠键: 切换模式");
-            app_mode_toggle();
+            ESP_LOGI(TAG, "长按睡眠键: 进入主菜单");
+            app_mode_request(APP_MODE_MENU);   /* 已在菜单里则被拦掉, 无反应 */
         }
         return;
     }
