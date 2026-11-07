@@ -43,3 +43,25 @@ CONFIG_SPIRAM_CACHE_LIBTIME_IN_IRAM=n
 # OTA 回退: 新固件首次启动是 PENDING_VERIFY, 应用确认健康后才打标;
 # 没打标就重启 → bootloader 判 ABORTED 并退回另一个槽 (见 main/app/ota.c)
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# ───────────────────────── 网络升级 (OTA over WiFi) 预备: 省 IRAM ─────────────────────────
+# 前提: BT_ENABLED + SPIRAM + esp32 时 IRAM 只剩 2.5KB, 而 WiFi 驱动要 ~30KB.
+# 下面两项 IDF 本来就对 "ESP32+蓝牙+PSRAM" 默认 n (esp_wifi/Kconfig 里
+#   default n if (BT_ENABLED && SPIRAM && IDF_TARGET_ESP32)),
+# 只是本工程的 sdkconfig 从更早版本继承成了 y. 关掉=恢复 IDF 默认, 只降 WiFi 吞吐.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# 只做 STA: 不开热点; 只连 WPA2 (或 WPA2/WPA3 混合), 不连 WPA3-only / OWE / 企业网.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+CONFIG_ESP_WIFI_ENABLE_SAE_PK=n
+CONFIG_ESP_WIFI_ENABLE_SAE_H2E=n
+CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
+# 再腾 ~8KB: 非 ISR 的 FreeRTOS 函数放 flash (IDF 官方给的手段, 只挪标了安全的那部分)
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# 网络升级不做 TLS: 走明文 http + 镜像 SHA256 校验 (HTTPS 会拉进 mbedtls TLS 栈和
+# 60KB 的 CA 证书包, app 分区放不下, 也用不上)
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+# 只用 IPv4; IPv6 在 lwip 里占 26KB flash
+CONFIG_LWIP_IPV6=n

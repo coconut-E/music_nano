@@ -8,6 +8,7 @@ idf_component_register(SRCS "main.c"
                             "app/lyrics.c"
                             "app/app_mode.c"
                             "app/ota.c"
+                            "net_probe.c"
                             "audio/audio_task.cpp"
                             "audio/decoder_mp3.cpp"
                             "audio/decoder_flac.cpp"
@@ -41,6 +42,7 @@ idf_component_register(SRCS "main.c"
                             "resources/lv_font_heart_44.c"
                             "resources/font_part.c"
                     PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_partition app_update
+                                  esp_wifi esp_event esp_netif lwip esp_http_client
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
 
 # 测试开关 (build.ps1 -TestCrash): 编译一版"一启动就 abort"的固件,

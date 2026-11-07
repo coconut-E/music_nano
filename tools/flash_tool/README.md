@@ -1,7 +1,7 @@
 # music_flash.exe — music_nano 专用烧录工具
 
-只服务本仓库这套固件（`bootloader@0x1000` / `分区表@0x8000` / `ota_0@0x40000` /
-`ota_1@0x270000` / `font@0x4A0000`，见仓库根 `partitions.csv`）。
+只服务本仓库这套固件（`bootloader@0x1000` / `分区表@0x8000` / `ota_0@0x30000` /
+`ota_1@0x280000` / `font@0x4D0000`，见仓库根 `partitions.csv`）。
 单文件 exe，不依赖 Python、不依赖 esptool、不依赖驱动以外的任何运行库。
 
 定位：**只做芯片全空时的首次全量烧录，以及测试**。日常升级走 OTA，不经过这里。

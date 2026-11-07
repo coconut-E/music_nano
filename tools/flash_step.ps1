@@ -11,7 +11,7 @@
 #   .\tools\flash_step.ps1 app2 -Slot 1 -App2 build\fw_bins\v0.7.1.bin   只写 ota_1
 #   .\tools\flash_step.ps1 font           只写字库分区
 #   .\tools\flash_step.ps1 raw -Addr 0x6A0000 -File build\fw\font_b.bin   调试: 单文件单地址
-#   .\tools\flash_step.ps1 erase -Addr 0x4A0000 -Len 0x10000              调试: 只擦一段 (T6 用)
+#   .\tools\flash_step.ps1 erase -Addr 0x4D0000 -Len 0x10000              调试: 只擦一段 (T6 用)
 #   .\tools\flash_step.ps1 probe          只连设备看信息, 不烧
 #
 # 注意: 这套脚本只做"首次全量烧录"和测试, 不是升级手段。
@@ -27,13 +27,13 @@ param(
 
     [string]$App2,                                                    # app2 镜像 (默认 build\music_nano.bin)
     [ValidateSet(0, 1)]
-    [int]$Slot = 1,                                                   # app2 目标槽: 0=ota_0(0x40000) 1=ota_1(0x270000)
+    [int]$Slot = 1,                                                   # app2 目标槽: 0=ota_0(0x30000) 1=ota_1(0x280000)
     [switch]$NoFont,                                                  # base 时跳过字库
     [string]$Exe = '',                                                  # 烧录器 (默认仓库内 tools\flash_tool)
     [switch]$Probe,                                                   # 只探测不烧
     [int]$Baud = 921600,
 
-    [string]$Addr = '0x4A0000',                                       # raw / erase 的地址
+    [string]$Addr = '0x4D0000',                                       # raw / erase 的地址
     [string]$Len = '0x10000',                                         # erase 擦除长度
     [string]$File                                                     # raw 步骤的文件
 )
@@ -88,8 +88,14 @@ $toolArgs = @('/nopause', '/baud', "$Baud")
 switch ($Step) {
 
     'probe' {
-        $toolArgs = @('/probe', '/baud', "$Baud")
+        # 探测模式也要摆一份"本地分区表": 烧录器拿它和设备里的分区表逐字节比对,
+        # 才能在 /probe 里报"一致 / 不同 (需要先擦除)"。只放这一个文件, 不碰 flash。
+        # (以前这里什么都不摆, 脚本后面读 flash_args 时会直接抛 PathNotFound)
+        # 这里直接覆盖整个数组, 别漏掉 /nopause —— 漏了 probe 会卡在"按任意键结束"
+        $toolArgs = @('/nopause', '/probe', '/baud', "$Baud")
         Write-Host "=== 只探测设备 ===" -ForegroundColor Cyan
+        Copy-Mirror $SRC.table 'partition-table.bin'
+        @('0x008000 partition-table.bin') | Set-Content (Join-Path $FW 'flash_args') -Encoding ASCII
     }
 
     'once' {
@@ -101,11 +107,11 @@ switch ($Step) {
         $lines = @(
             '0x001000 bootloader.bin',
             '0x008000 partition-table.bin',
-            '0x01F000 ota_data_initial.bin',
-            '0x040000 app.bin'
+            '0x02E000 ota_data_initial.bin',
+            '0x030000 app.bin'
         )
         Copy-Mirror $SRC.font 'font.bin'
-        $lines += '0x4A0000 font.bin'
+        $lines += '0x4D0000 font.bin'
         $lines | Set-Content (Join-Path $FW 'flash_args') -Encoding ASCII
         $toolArgs += '/erase'
     }
@@ -119,17 +125,18 @@ switch ($Step) {
         $lines = @(
             '0x001000 bootloader.bin',
             '0x008000 partition-table.bin',
-            '0x01F000 ota_data_initial.bin',
-            '0x040000 app.bin'
+            '0x02E000 ota_data_initial.bin',
+            '0x030000 app.bin'
         )
         if (-not $NoFont) {
             Copy-Mirror $SRC.font 'font.bin'
-        $lines += '0x4A0000 font.bin'
+        $lines += '0x4D0000 font.bin'
         } else {
             Write-Host "  (跳过字库分区)" -ForegroundColor DarkGray
         }
         $lines | Set-Content (Join-Path $FW 'flash_args') -Encoding ASCII
-        # /noerase: 分区表即便不同也不清 0x8000-0x20000, 保住用户设置
+        # /noerase: 分区表即便不同也不整片擦, 但会清 0x8000-0x9000 旧表 + 0x1F000-0x30000
+        # 的旧 otadata/phy_init, 0x9000-0x1F000 的 nvs 用户数据保留
         $toolArgs += '/noerase'
     }
 
@@ -138,7 +145,7 @@ switch ($Step) {
         # 镜像源哈希表 $SRC 撞名, 把整张表覆盖掉 (然后 $SRC.app 就是 null)
         $appImg = $App2
         if (-not $appImg) { $appImg = $SRC.app }
-        $target = if ($Slot -eq 0) { '0x040000' } else { '0x270000' }
+        $target = if ($Slot -eq 0) { '0x030000' } else { '0x280000' }
         Write-Host "=== 只写 ota_$Slot ($target) ===" -ForegroundColor Cyan
         Write-Host "  !! 这是测试用通道, 不是升级手段 (升级走网络 OTA)" -ForegroundColor Yellow
         Write-Host "  !! 目标槽若正是设备当前运行的槽, 会覆盖正在执行的代码, 当场崩溃" -ForegroundColor Yellow
@@ -158,9 +165,9 @@ switch ($Step) {
     }
 
     'font' {
-        Write-Host "=== 只写字库分区 (0x4A0000) ===" -ForegroundColor Cyan
+        Write-Host "=== 只写字库分区 (0x4D0000) ===" -ForegroundColor Cyan
         Copy-Mirror $SRC.font 'font.bin'
-        $lines = @('0x4A0000 font.bin')
+        $lines = @('0x4D0000 font.bin')
         $lines | Set-Content (Join-Path $FW 'flash_args') -Encoding ASCII
         $toolArgs += '/noerase'
     }

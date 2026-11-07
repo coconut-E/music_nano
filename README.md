@@ -147,24 +147,50 @@ idf.py -p COMx flash monitor
 | 日常升级 | OTA（写备用槽，见下） |
 | 调试 | `app2 -Slot 0\|1` 写指定槽 / `erase` 只擦一段 / `raw` 单文件单地址 |
 
-分区表（8MB，OTA 双槽）：
+分区表（8MB，OTA 双槽，0.7.1 起）：
 
 ```
-nvs     0x9000  88KB      otadata 0x1F000 8KB       phy_init 0x21000 4KB
-ota_0   0x40000 2.19MB    ota_1   0x270000 2.19MB   font     0x4A0000 3.25MB
+nvs     0x009000 144KB    phy_init 0x02D000 4KB     otadata 0x02E000 8KB
+ota_0   0x030000 2.31MB   ota_1    0x280000 2.31MB   font    0x4D0000 3.19MB
 ```
 
-> `0x22000-0x40000` 是 64KB 对齐留下的空洞，**没有分区**。烧录器现在会拦截任何
-> 落进这段的地址——旧版 `flash_args`（app 曾经在 `0x20000`）会被直接拒绝，
-> 而不是像以前那样写进去、回读 MD5 还全对、重启才发现设备起不来。
+> 决定 `ota_0` 起点的是"前面所有小分区的终点向上取整到 64KB"，而不是某个固定地址。
+> 旧表把 `phy_init` 放在 `0x21000`，终点越过 `0x20000`，`ota_0` 就只能退到 `0x40000`，
+> 白扔 `0x22000-0x40000` 这 120KB。现在 nvs 扩到 144KB 顶到 `0x2D000`，小分区终点
+> 正好 `0x30000`，**对齐空洞为 0，8MB 一字节不剩**。
+>
+> 烧录器会拦截任何落到 `0x30000` 以下、又不在白名单（`0x1000` bootloader /
+> `0x8000` 分区表 / `0x2D000` phy_init / `0x2E000` otadata）里的地址——旧版
+> `flash_args`（app 曾经在 `0x20000`，现在那里是 nvs）会被直接拒绝，而不是像以前
+> 那样写进去、回读 MD5 还全对、重启才发现设备起不来。
 
-字库单独占一个 3.25MB 的只读分区，开机 mmap 进 DROM 窗口（50 页）。它**只由
+字库单独占一个 3.19MB 的只读分区，开机 mmap 进 DROM 窗口（50 页）。它**只由
 烧录器全量烧写时写入**，OTA 不碰它，所以换字库必须线烧。
 
 > 所有自己写的脚本都在 `tools/` 下，**不要放进 `build/`**：那是编译目录，
 > `idf.py fullclean` 或 IDE 的清理会整个删掉。
 
 ## 更新日志
+
+### 2026.11.7
+
+> ⚠️ 分区表再改一次：`ota_0 @0x30000` / `ota_1 @0x280000` / `font @0x4D0000`。
+> 从任何旧版升上来都必须 `tools\flash_step.ps1 once` 整片擦除重烧。
+
+**分区**
+- app 槽 2.19MB → **2.31MB**（余量 1.07% → 6.42%），nvs 88KB → **144KB**
+- 吃掉两处浪费：`0x22000-0x40000` 对齐空洞 + 末尾闲置 128KB，**248KB 浪费归零**
+- 字库分区 3.25MB → 3.19MB（内容 3,266,026 B，余 2.3%），地址 `0x4A0000` → `0x4D0000`
+
+**为网络升级腾 IRAM**
+- `ESP_WIFI_IRAM_OPT` / `ESP_WIFI_RX_IRAM_OPT` 关掉（IDF 对 "ESP32+蓝牙+PSRAM" 这
+  个组合**本来就是默认关**，本工程是历史遗留的 `y`）
+- `FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y`
+- 只做 STA：`SOFTAP_SUPPORT` / `WPA3_SAE` / `SAE_PK` / `SAE_H2E` / `SOFTAP_SAE` /
+  `WPA3_OWE_STA` 全关
+- `LWIP_IPV6=n`；HTTP 不做 HTTPS，不带 CA 证书包
+- 结果：把完整 WiFi + HTTP + OTA 栈链进来后 `.iram0.text` 118,119 B，IRAM 余
+  **11.9KB**；改之前不带 WiFi 只剩 2,517 B，一加就爆 27,340 B
 
 ### 2026.11.6
 

@@ -1,19 +1,22 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
 # 8MB flash / OTA 双槽布局.
-#   nvs      位置不变 (0x9000, 88KB): 换分区表不清用户设置
-#   otadata  8KB, 占原 phy_init 的位置, 换表时必须擦掉 0x1F000-0x22000
-#   ota_0/1  各 2.19MB, 装 1.75MB 的 app (剩 24%)
-#   font     3.25MB, 装 3.11MB 字库 (剩 4%), 开工时 mmap 进 DROM 窗口
+#   nvs      0x9000, 144KB: 起点不变, 换分区表不动用户设置
+#   phy_init/otadata 紧随 nvs, 收在 0x9000-0x30000 这 0x27000 里, 不留空洞
+#   ota_0/1  各 2.3125MB (0x250000), 装 ~2.27MB 的 app (剩 6%)
+#   font     3.1875MB (0x330000), 装 3.11MB 字库 (剩 2.3%), 开工时 mmap 进 DROM 窗口
 #
 # 注意:
-#   1) app 分区必须 64KB 对齐, 所以 ota_0 只能从 0x40000 起;
-#      0x22000-0x40000 这 120KB 是对齐留下的空洞, 无法利用.
-#   2) 去掉 factory: 烧录后 otadata 为空时 bootloader 会自动选 ota_0
+#   1) app 分区必须 64KB 对齐 —— 决定 ota_0 起点的是"前面所有小分区的终点向上取整到
+#      64KB", 不是某个固定地址. 旧表把 phy_init 放在 0x21000, 终点越过 0x20000, 于是
+#      ota_0 只能退到 0x40000, 白扔 0x22000-0x40000 共 120KB(其中 56KB 因为不对齐永远
+#      用不上). 现在把 nvs 扩到 144KB 顶到 0x2D000, 小分区终点正好 0x30000, 空洞为 0.
+#   2) 表尾正好用完 8MB: ota_1 结束 0x4D0000 + font 0x330000 = 0x800000, 无剩余空间.
+#   3) 去掉 factory: 烧录后 otadata 为空时 bootloader 会自动选 ota_0
 #      并写入 {seq=1, state=VALID}, 不需要应用参与.
-#   3) font 是自定义 data 子类型 0x40, 只读, 由 font_part.c mmap.
-nvs,      data, nvs,   0x9000,   0x16000,
-otadata,  data, ota,   0x1F000,  0x2000,
-phy_init, data, phy,   0x21000,  0x1000,
-ota_0,    app,  ota_0, 0x40000,  0x230000,
-ota_1,    app,  ota_1, 0x270000, 0x230000,
-font,     data, 0x40,  0x4A0000, 0x340000,
+#   4) font 是自定义 data 子类型 0x40, 只读, 由 font_part.c mmap.
+nvs,      data, nvs,   0x9000,   0x24000,
+phy_init, data, phy,   0x2D000,  0x1000,
+otadata,  data, ota,   0x2E000,  0x2000,
+ota_0,    app,  ota_0, 0x30000,  0x250000,
+ota_1,    app,  ota_1, 0x280000, 0x250000,
+font,     data, 0x40,  0x4D0000, 0x330000,

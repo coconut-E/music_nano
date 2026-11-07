@@ -2,7 +2,7 @@
  * music_nano 烧录工具  (Windows x86-64 / MinGW-w64)
  *
  * 只服务本仓库这套固件 (分区布局见仓库根 partitions.csv):
- *   bootloader@0x1000 / 分区表@0x8000 / ota_0@0x40000 / ota_1@0x270000 / font@0x4A0000
+ *   bootloader@0x1000 / 分区表@0x8000 / ota_0@0x30000 / ota_1@0x280000 / font@0x4D0000
  *
  * 定位: 只做两件事
  *   (1) 芯片全空时的首次全量烧录 (bootloader + 分区表 + ota_0 + 字库)
@@ -60,11 +60,14 @@
 
 /* 固定布局 (partitions.csv). 这几个不是"默认值"而是硬约束:
  * 这个工程只有这一套合法布局, 写错地址会直接写成砖。 */
-#define APP0_ADDR           0x040000u   /* ota_0 */
-#define APP1_ADDR           0x270000u   /* ota_1 */
-#define FONT_ADDR           0x4A0000u   /* font (字库) */
-#define HOLE_BEGIN          0x022000u   /* 0x022000-0x040000 是 64KB 对齐留下的空洞, */
-#define HOLE_END            0x040000u   /* 没有任何分区, 写进去设备无法启动 */
+#define APP0_ADDR           0x030000u   /* ota_0 */
+#define APP1_ADDR           0x280000u   /* ota_1 */
+#define FONT_ADDR           0x4D0000u   /* font (字库) */
+/* 系统区上界: 0x030000 以下只有 bootloader/分区表/nvs/phy_init/otadata,
+ * 没有任何空隙可以写别的东西。旧布局这里还有 0x22000-0x40000 的 64KB 对齐空洞,
+ * nvs 扩到 144KB 之后空洞消失, 判定规则反而变简单了。 */
+#define SYS_END             0x030000u
+#define FLASH_END_ADDR      0x800000u   /* 8MB */
 
 #define STUB_RAM_BLOCK      0x1800
 #define FLASH_BLOCK_STUB    0x4000
@@ -495,7 +498,7 @@ static int load_manifest(void)
     if (g_nparts == 0) {
         /* 没有 flash_args: 按固定布局兜底。
          * 旧版本这里写的是 app@0x20000, 那是加入 OTA 双槽之前的老布局 ——
-         * 0x20000 现在落在 0x22000-0x40000 的空洞里, 照老地址写就是砖。 */
+         * 0x20000 现在落在 nvs 分区里 (nvs 0x9000-0x2D000), 照老地址写会清掉用户设置。 */
         static const char *fallback[3][2] = {
             {"bootloader/bootloader.bin", "bootloader.bin"},
             {"partition_table/partition-table.bin", "partition-table.bin"},
@@ -542,13 +545,13 @@ static const Part *part_at(uint32_t addr)
 
 /* 兜底闸门: 名单里的地址必须落在真实分区上。
  *
- * 0x0000-0x40000 这一段只允许四个起点 (ROM/分区表/otadata/phy_init)。
+ * 0x0000-0x30000 这一段只允许四个起点 (bootloader/分区表/phy_init/otadata)。
  * 其余一律拒绝, 因为:
  *   - 0x20000 是"加 OTA 双槽之前 app 的老地址", 旧 flash_args 会带它进来;
- *     而且它现在压在 otadata 第 2 扇区 + phy_init 上, 再往上就是
- *     0x22000-0x40000 的 64KB 对齐空洞 —— 写进去设备起不来。
+ *     现在它压在 nvs 里 (nvs 0x9000-0x2D000), 写进去就是清掉用户设置。
+ *   - 0x040000 是上一版布局的 ota_0, 现在是 ota_0 分区内部, 写进去会覆盖 app 前半段。
  *   - 这类错误最难查: 写入成功、回读 MD5 也对, 只有重启才会发现。 */
-static const uint32_t k_sys_starts[] = {0x1000u, PT_ADDR, 0x1F000u, 0x21000u};
+static const uint32_t k_sys_starts[] = {0x1000u, PT_ADDR, 0x2D000u, 0x2E000u};
 
 static int is_sys_start(uint32_t a)
 {
@@ -566,21 +569,22 @@ static int check_targets(void)
         uint32_t a = g_parts[i].addr;
         uint32_t e = a + (uint32_t)g_parts[i].size;   /* 开区间末端 */
 
-        if (a < HOLE_END && !is_sys_start(a)) {
-            if (a >= HOLE_BEGIN) {
-                snprintf(g_err, sizeof g_err,
-                         "%s -> 0x%05lX 落在空洞 0x22000-0x40000 里",
-                         g_parts[i].label, (unsigned long)a);
-            } else {
-                snprintf(g_err, sizeof g_err,
-                         "%s -> 0x%05lX 不是本布局里的分区起点 (旧版 app 在 0x20000)",
-                         g_parts[i].label, (unsigned long)a);
-            }
+        if (a < SYS_END && !is_sys_start(a)) {
+            snprintf(g_err, sizeof g_err,
+                     "%s -> 0x%05lX 不是本布局里的分区起点 (低于 0x30000 只允许 "
+                     "bootloader/分区表/phy_init/otadata)",
+                     g_parts[i].label, (unsigned long)a);
             return -1;
         }
-        if (a < HOLE_END && is_sys_start(a) && e > HOLE_END) {
+        if (a < SYS_END && is_sys_start(a) && e > SYS_END) {
             snprintf(g_err, sizeof g_err,
-                     "%s 从 0x%05lX 起长度 %lu 越过了 0x40000 (压到 ota_0)",
+                     "%s 从 0x%05lX 起长度 %lu 越过了 0x30000 (压到 ota_0)",
+                     g_parts[i].label, (unsigned long)a, (unsigned long)g_parts[i].size);
+            return -1;
+        }
+        if (e > FLASH_END_ADDR) {
+            snprintf(g_err, sizeof g_err,
+                     "%s 从 0x%05lX 起长度 %lu 越过了 8MB flash 末尾",
                      g_parts[i].label, (unsigned long)a, (unsigned long)g_parts[i].size);
             return -1;
         }
@@ -1890,12 +1894,22 @@ static int do_flash(Ser *s, int layout_known, int layout_diff)
             }
             OK_LINE("整片擦除完成");
         } else {
-            /* 0x8000-0x22000: 旧分区表 + 旧 nvs + 两个 otadata 扇区 + 旧 phy_init。
-             * 必须擦到 0x22000, 因为 otadata 占 0x1F000-0x21000 两个扇区:
-             * 只擦到 0x20000 会漏掉第二个扇区, 那条 seq 更大的旧记录会让
-             * bootloader 去启动一个根本没写的槽。 */
-            INFO_LINE("清除旧分区表/设置区/otadata (0x8000-0x22000) ...");
-            if (stub_erase_region(s, 0x8000u, 0x1A000u) != 0) {
+            /* 分两段擦, 中间留出 nvs 的用户数据:
+             *   0x8000-0x9000   旧分区表 (新表写下去就覆盖, 但旧表可能更长, 先清干净)
+             *   0x1F000-0x30000 旧 otadata(2 扇区) + 旧 phy_init + nvs 扩容新增的尾部。
+             * 为什么必须擦到 0x30000:
+             *   - otadata 现在在 0x2E000 两个扇区, 旧记录在 0x1F000; 旧的那条 seq 更大,
+             *     不清掉 bootloader 会去启动一个根本没写的槽;
+             *   - nvs 从 88KB 扩到 144KB 后, 新增的 0x1F000-0x2D000 原来躺着旧
+             *     otadata/phy_init 的字节, 不擦干净 NVS 会把它们当本分区的页去解析。
+             * 不擦 0x9000-0x1F000: 那是 nvs 现有的 88KB 用户数据。 */
+            INFO_LINE("清除旧分区表 (0x8000-0x9000) ...");
+            if (stub_erase_region(s, 0x8000u, 0x1000u) != 0) {
+                ERR_LINE("擦除失败: %s", g_err);
+                return -1;
+            }
+            INFO_LINE("清除旧 otadata/phy_init + nvs 扩展区 (0x1F000-0x30000) ...");
+            if (stub_erase_region(s, 0x1F000u, 0x11000u) != 0) {
                 ERR_LINE("擦除失败: %s", g_err);
                 return -1;
             }
@@ -1998,9 +2012,9 @@ int main(int argc, char **argv)
     }
     if (check_targets() != 0) {
         ERR_LINE("拒绝烧录: %s", g_err);
-        SAY("     0x22000-0x40000 是 64KB 对齐留出的空洞, 没有任何分区,\n");
-        SAY("     写进去设备无法启动。这份 flash_args 是旧分区布局留下的 (app 原在 0x20000)。\n");
-        SAY("     用 tools\\flash_step.ps1 重新摆镜像, 或直接用 idf.py flash 生成的那份。\n");
+        SAY("     低于 0x30000 只允许 bootloader(0x1000) / 分区表(0x8000) / phy_init(0x2D000)\n");
+        SAY("     / otadata(0x2E000); app 从 0x30000 起, 字库从 0x4D0000 起。\n");
+        SAY("     这份 flash_args 是旧分区布局留下的, 用 tools\\flash_step.ps1 重新摆镜像。\n");
         rc = 1;
         goto out;
     }
