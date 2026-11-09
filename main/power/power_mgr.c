@@ -59,11 +59,12 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 /* 长按判定: 按住超过此值进入主菜单 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
-/* 无操作自动熄屏: 菜单 30 秒 / 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
+/* 无操作自动熄屏: 菜单与设置 30 秒 / 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
  * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡.
- * 菜单页里蓝牙任务已被 bt_a2dp_pause 挂起 (状态=断开), 因此 30 秒到点是
+ * 菜单/设置里蓝牙任务已被 bt_a2dp_pause 挂起 (状态=断开), 因此 30 秒到点是
  * "淡出后直接深睡"; 深睡前的清理收尾对这几秒没有副作用. */
 #define PWR_IDLE_MENU_US     (30LL * 1000 * 1000)
+#define PWR_IDLE_SETTINGS_US (30LL * 1000 * 1000)
 #define PWR_IDLE_MUSIC_US    (2LL * 60 * 1000 * 1000)
 #define PWR_IDLE_LYRICS_US   (5LL * 60 * 1000 * 1000)
 #define PWR_IDLE_NOVEL_US    (5LL * 60 * 1000 * 1000)
@@ -279,7 +280,8 @@ static void power_short_press_action(void)
 }
 
 /* 无操作熄屏轮询 (1s): 亮屏且超过时限时, 执行与睡眠键短按相同的动作.
- * 音乐 2 分钟 / 歌词与小说 5 分钟; 息屏、深睡淡出、模式切换过渡中均不处理. */
+ * 菜单/设置 30 秒, 音乐 2 分钟, 歌词与小说 5 分钟; 息屏、深睡淡出、
+ * 模式切换过渡中均不处理. */
 static void idle_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -288,8 +290,9 @@ static void idle_poll_cb(lv_timer_t *timer)
     if (s_state != PWR_ACTIVE) return;
 
     int64_t timeout_us;
-    if (app_mode_is_menu())        timeout_us = PWR_IDLE_MENU_US;
-    else if (app_mode_is_novel())  timeout_us = PWR_IDLE_NOVEL_US;
+    if (app_mode_is_menu())          timeout_us = PWR_IDLE_MENU_US;
+    else if (app_mode_is_settings()) timeout_us = PWR_IDLE_SETTINGS_US;
+    else if (app_mode_is_novel())    timeout_us = PWR_IDLE_NOVEL_US;
     else if (s_lyrics_active)      timeout_us = PWR_IDLE_LYRICS_US;
     else                           timeout_us = PWR_IDLE_MUSIC_US;
     int64_t now = esp_timer_get_time();

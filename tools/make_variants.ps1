@@ -1,7 +1,7 @@
 ﻿# 批量生成 OTA 测试用的版本变体 (每条一个 .bin)
 #
 #   .\tools\make_variants.ps1                     默认生成 <大版本>.0/.1/.2 与 .99-crash
-#   .\tools\make_variants.ps1 -BaseVer 0.8
+#   .\tools\make_variants.ps1 -BaseVer 0.7
 #   .\tools\make_variants.ps1 -IdfPath <IDF目录> -IdfToolsPath <工具目录>
 #
 # 用途: 验证切槽 / 首启校验窗口 / 崩溃自动回退时需要"版本号不同、内容相同"的镜像。

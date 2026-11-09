@@ -166,6 +166,9 @@ static void media_monitor_cb(lv_timer_t *timer)
     int32_t v;
     int32_t vmin, vmax;
 
+    /* 设置页没有音量/亮度可调: 不弹窗 (白底上弹白窗也没意义) */
+    if (app_mode_is_settings()) return;
+
     if (app_mode_is_novel()) {
         v    = brightness_get();
         vmin = BRIGHTNESS_MIN;
@@ -215,6 +218,12 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
 {
     bool    level = (gpio_get_level(pin) == 1);   /* 高=按下 (外部下拉) */
     int64_t now   = esp_timer_get_time();
+
+    if (app_mode_is_settings()) {   /* 设置页: 音量/亮度都无处可调, 按键当没按 */
+        st->prev      = level;
+        st->repeating = false;
+        return;
+    }
 
     if (level) {
         bool step = false;

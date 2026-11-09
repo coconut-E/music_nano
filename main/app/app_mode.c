@@ -12,6 +12,7 @@
 #include "ui_player.h"
 #include "ui_novel.h"
 #include "ui_menu.h"
+#include "ui_settings.h"
 #include "ui_shell.h"
 #include "menu.h"
 #include "power_mgr.h"
@@ -58,6 +59,11 @@ bool app_mode_is_novel(void)
 bool app_mode_is_menu(void)
 {
     return s_mode == APP_MODE_MENU;
+}
+
+bool app_mode_is_settings(void)
+{
+    return s_mode == APP_MODE_SETTINGS;
 }
 
 /* 等待音频解码器释放 SD (切换挂起前必须确认, 避免挂死持锁任务) */
@@ -116,23 +122,35 @@ static void mode_novel_leave(void)
     ui_novel_destroy();
 }
 
+/* 进入设置: 白底设置页 (列表里目前只有「固件版本」一项) */
+static void mode_settings_enter(void)
+{
+    ui_settings_build();
+}
+
+/* 退出设置: 只删设置页 —— 它本身不持有音频/封面/蓝牙资源 */
+static void mode_settings_leave(void)
+{
+    ui_settings_destroy();
+}
+
 /* 实际切换工作: 在 power_mgr 黑场窗口内 (LVGL 任务上下文) 执行 */
 static void app_mode_switch_work(void)
 {
     /* 1) 退出当前模式 (只清理该模式自己持有的东西) */
     switch (s_mode) {
-    case APP_MODE_MUSIC:    mode_music_leave(); break;
-    case APP_MODE_NOVEL:    mode_novel_leave(); break;
-    case APP_MODE_SETTINGS: break;               /* 占位: 无资源可清 */
-    case APP_MODE_MENU:     ui_menu_destroy();  break;
+    case APP_MODE_MUSIC:    mode_music_leave();    break;
+    case APP_MODE_NOVEL:    mode_novel_leave();    break;
+    case APP_MODE_SETTINGS: mode_settings_leave(); break;
+    case APP_MODE_MENU:     ui_menu_destroy();     break;
     }
 
     /* 2) 进入目标模式 */
     switch (s_pending) {
-    case APP_MODE_MUSIC:    mode_music_enter(); break;
-    case APP_MODE_NOVEL:    mode_novel_enter(); break;
-    case APP_MODE_SETTINGS: break;               /* TODO: 设置页, 先留空 */
-    case APP_MODE_MENU:     ui_menu_build();    break;
+    case APP_MODE_MUSIC:    mode_music_enter();    break;
+    case APP_MODE_NOVEL:    mode_novel_enter();    break;
+    case APP_MODE_SETTINGS: mode_settings_enter(); break;
+    case APP_MODE_MENU:     ui_menu_build();       break;
     }
 
     s_mode = s_pending;

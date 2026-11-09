@@ -8,13 +8,13 @@ extern "C" {
 #endif
 
 /* 应用模式 (四种, 编号即菜单从上到下的顺序):
- *   0 音乐 / 1 小说 / 2 设置 (占位, 未实现) / 3 主菜单.
+ *   0 音乐 / 1 小说 / 2 设置 (白底设置页, 目前只有「固件版本」) / 3 主菜单.
  * 四组 UI 互斥: 切换时销毁旧组、构建新组, 切换过程由 power_mgr 用黑场过渡包裹.
  * 只有音乐(0)/小说(1) 会写进 NVS 作为下次启动模式; 设置和菜单永不落盘. */
 typedef enum {
     APP_MODE_MUSIC    = 0,   /* 音乐模式 */
     APP_MODE_NOVEL    = 1,   /* 小说模式 */
-    APP_MODE_SETTINGS = 2,   /* 设置模式: 占位, 菜单里留了入口但未实现 */
+    APP_MODE_SETTINGS = 2,   /* 设置模式: 白底 lv_list (目前只有「固件版本」) */
     APP_MODE_MENU     = 3,   /* 主菜单: 三图标页 (音乐/小说/设置) */
 } app_mode_t;
 
@@ -33,6 +33,7 @@ void app_mode_request(app_mode_t target);
 app_mode_t app_mode_get(void);          /* 当前模式 */
 bool       app_mode_is_novel(void);     /* 当前是否小说模式 */
 bool       app_mode_is_menu(void);      /* 当前是否主菜单页 */
+bool       app_mode_is_settings(void);  /* 当前是否设置页 (熄屏超时/弹窗开关要用) */
 
 #ifdef __cplusplus
 }

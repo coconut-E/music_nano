@@ -58,13 +58,6 @@ static void row_click_cb(lv_event_t *e)
     lv_async_call(menu_switch_async, (void *)(lv_uintptr_t)target);
 }
 
-/* 设置行: 只打日志, 不切任何页面 (功能未实现, 入口先留着) */
-static void settings_pressed_cb(lv_event_t *e)
-{
-    (void)e;
-    ESP_LOGI(TAG, "设置: 未实现 (点击无响应)");
-}
-
 /* 建一行: 透明底, 按下变 COLOR_CARD, 图标居中 */
 static lv_obj_t *make_row(int idx)
 {
@@ -115,7 +108,8 @@ void ui_menu_build(void)
                         (void *)(lv_uintptr_t)APP_MODE_MUSIC);
     lv_obj_add_event_cb(row_novel, row_click_cb, LV_EVENT_CLICKED,
                         (void *)(lv_uintptr_t)APP_MODE_NOVEL);
-    lv_obj_add_event_cb(row_set,   settings_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(row_set,   row_click_cb, LV_EVENT_CLICKED,
+                        (void *)(lv_uintptr_t)APP_MODE_SETTINGS);
 
     lv_obj_move_foreground(s_root);            /* 压住常驻的音量弹窗 */
     ESP_LOGI(TAG, "菜单页已构建");
