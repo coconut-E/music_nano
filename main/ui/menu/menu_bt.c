@@ -3,12 +3,24 @@
 #include "bt_a2dp.h"
 #include "menu.h"
 
-/* ── 蓝牙设备列表 ── */
-#define BT_W        135    /* 面板宽 */
-#define BT_H        220    /* 面板高 */
-#define BT_X        13     /* 面板左上角 X */
-#define BT_Y        3      /* 面板左上角 Y */
+/* ── 蓝牙设备列表 ──
+ *
+ * 面板比文件浏览器(135x220)窄一截也矮一截: 文件浏览器要一屏塞下目录+文件名,
+ * 蓝牙列表一般就附近那么几个接收设备, 而且列表本身是 lv_list (可滚动), 塞不下
+ * 就滚. 连接/连接中视图只有"设备名 + 断开按钮"两行, 更不需要 220 的高度.
+ * 右上角必须钉住: 面板是从顶部那个蓝牙按钮(中心约 x146,y25)弹出来的, 所以
+ * BT_X + BT_W 恒等于 148, BT_Y 恒等于 3; 只把左边和底边往里收. */
+#define BT_W        105    /* 面板宽 (原 135, 收窄 22%) */
+#define BT_H        155    /* 面板高 (原 220, 收短 30%) */
+#define BT_X        43     /* 面板左上角 X (=148-BT_W, 右缘不动) */
+#define BT_Y        3      /* 面板左上角 Y (顶边不动) */
 #define BT_ROW_H    36     /* 每行设备高度 */
+#define BT_LIST_Y   28     /* 列表顶 (标题下方) */
+#define BT_CARD_X   8      /* 连接卡片 X */
+#define BT_CARD_Y   34     /* 连接卡片 Y */
+#define BT_CARD_H   61     /* 连接卡片高 (原 72; 面板加高 5px 全给它, 和设备名/按钮挤紧) */
+#define BT_BTN_H    36     /* 操作按钮高 */
+#define BT_BTN_Y    (BT_H - 46)   /* 操作按钮 Y: 底部留 10, 与卡片间距 14 */
 #define BT_BUF_MAX  16     /* 设备列表缓冲上限 */
 #define COLOR_BT_BLUE  lv_color_hex(0x2196F3)   /* 连接中/操作色 */
 #define COLOR_BT_RED   lv_color_hex(0xE53935)   /* 断开色 */
@@ -207,10 +219,10 @@ static void bt_list_open(void)
     lv_label_set_long_mode(s_bt_title, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_bt_title, "Bluetooth");
 
-    /* 设备列表 */
+    /* 设备列表 (lv_list 本身可滚, 122 高 = 3 行 + 一点, 多了就滑) */
     s_bt_list = lv_list_create(s_bt_cont);
-    lv_obj_set_pos(s_bt_list, 0, 28);
-    lv_obj_set_size(s_bt_list, BT_W, BT_H - 28);
+    lv_obj_set_pos(s_bt_list, 0, BT_LIST_Y);
+    lv_obj_set_size(s_bt_list, BT_W, BT_H - BT_LIST_Y);
     lv_obj_set_style_bg_color(s_bt_list, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_bt_list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_bt_list, 0, 0);
@@ -219,8 +231,8 @@ static void bt_list_open(void)
 
     /* 连接状态卡片 */
     s_bt_card = lv_obj_create(s_bt_cont);
-    lv_obj_set_pos(s_bt_card, 12, 40);
-    lv_obj_set_size(s_bt_card, BT_W - 24, 72);
+    lv_obj_set_pos(s_bt_card, BT_CARD_X, BT_CARD_Y);
+    lv_obj_set_size(s_bt_card, BT_W - 2 * BT_CARD_X, BT_CARD_H);
     lv_obj_set_style_bg_color(s_bt_card, COLOR_BT_BLUE, 0);
     lv_obj_set_style_bg_opa(s_bt_card, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_bt_card, 12, 0);
@@ -229,17 +241,17 @@ static void bt_list_open(void)
     lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_SCROLLABLE);
 
     s_bt_card_name = lv_label_create(s_bt_card);
-    lv_obj_set_style_text_font(s_bt_card_name, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(s_bt_card_name, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_bt_card_name, lv_color_white(), 0);
     lv_label_set_long_mode(s_bt_card_name, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_bt_card_name, BT_W - 40);
+    lv_obj_set_width(s_bt_card_name, BT_W - 2 * BT_CARD_X - 16);
     lv_label_set_text(s_bt_card_name, "");
     lv_obj_align(s_bt_card_name, LV_ALIGN_CENTER, 0, 0);
 
     /* 底部操作按钮 (连接中/断开) */
     s_bt_action_btn = lv_btn_create(s_bt_cont);
-    lv_obj_set_pos(s_bt_action_btn, 12, BT_H - 48);
-    lv_obj_set_size(s_bt_action_btn, BT_W - 24, 36);
+    lv_obj_set_pos(s_bt_action_btn, BT_CARD_X, BT_BTN_Y);
+    lv_obj_set_size(s_bt_action_btn, BT_W - 2 * BT_CARD_X, BT_BTN_H);
     lv_obj_set_style_radius(s_bt_action_btn, 10, 0);
     lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
     lv_obj_set_style_bg_opa(s_bt_action_btn, LV_OPA_COVER, 0);
@@ -249,7 +261,8 @@ static void bt_list_open(void)
 
     s_bt_action_lbl = lv_label_create(s_bt_action_btn);
     lv_label_set_text(s_bt_action_lbl, "Connecting");
-    lv_obj_set_style_text_font(s_bt_action_lbl, &lv_font_montserrat_16, 0);
+    /* 14 号: 面板收窄后 "Disconnect" 在 16 号下会顶到按钮边 */
+    lv_obj_set_style_text_font(s_bt_action_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_bt_action_lbl, lv_color_white(), 0);
     lv_obj_center(s_bt_action_lbl);
 

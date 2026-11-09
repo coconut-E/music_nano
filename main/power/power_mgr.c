@@ -54,6 +54,11 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 #define BRI_FADE_TIME_MIN_MS  50
 #define BRI_FADE_TIME_MAX_MS  400
 
+/* 设置页进出: 背光淡出/淡入的时长. 和光圈动画的 150/180ms 对齐,
+ * 否则按亮度差映射会拉到 400ms 一程, 满亮度下整个切换 0.8s 太长 */
+#define MODE_FADE_OUT_MS      150
+#define MODE_FADE_IN_MS       180
+
 /* 按键冷却: 吞机械抖动产生的二次上升沿 */
 #define PWR_KEY_COOLDOWN_MS  200
 /* 长按判定: 按住超过此值进入主菜单 */
@@ -182,6 +187,55 @@ static void screen_fade(uint8_t target, lv_anim_ready_cb_t done)
     lv_anim_set_path_cb(&a, lv_anim_path_linear);             /* 线性插值 */
     if (done) lv_anim_set_ready_cb(&a, done);                 /* 完成回调 */
     lv_anim_start(&a);
+}
+
+/* ── 细步长背光淡化 (只给模式过渡用) ──
+ *
+ * 不用 lv_anim: 它的定时器是 LV_DISP_DEF_REFR_PERIOD(20ms) 一跳, 150ms 的过渡只有
+ * 7 步 —— 白底页面上每步约 13% 亮度, 看上去就是一档一档往上跳("闪")。
+ * 这里自己开 6ms 的定时器, 同样的总时长走 25 步, 每步 ~4%, 才是连续变暗。
+ * 步长只由"驱动频率 / 总时长"决定, 和亮度区间怎么切没关系 —— 所以把量程分一半
+ * 给软件淡化并不能让步长变短, 只会把分带接缝(那根灰线)重新引进来。 */
+#define BRI_STEP_MS  6
+
+static lv_timer_t *s_bri_timer = NULL;      /* 淡化驱动定时器 */
+static int         s_bri_from  = 0;         /* 起始亮度 */
+static int         s_bri_to    = 0;         /* 目标亮度 */
+static uint32_t    s_bri_ms    = 1;         /* 总时长 */
+static int64_t     s_bri_t0    = 0;         /* 起始时刻 (us) */
+static void      (*s_bri_done)(void) = NULL;/* 完成回调 */
+
+static void bri_step_cb(lv_timer_t *tmr)
+{
+    int el = (int)((esp_timer_get_time() - s_bri_t0) / 1000);   /* ms */
+    int p  = (s_bri_ms > 0) ? (int)((int64_t)el * 1000 / s_bri_ms) : 1000;
+    if (p > 1000) p = 1000;
+
+    int v = s_bri_from + (s_bri_to - s_bri_from) * p / 1000;
+    if (v != (int)s_cur_bri) {
+        s_cur_bri = (uint8_t)v;
+        lcd_set_brightness(s_cur_bri);
+    }
+
+    if (p < 1000) return;
+
+    lv_timer_del(tmr);
+    s_bri_timer = NULL;
+    void (*done)(void) = s_bri_done;
+    s_bri_done = NULL;
+    if (done) done();
+}
+
+/* 从当前亮度线性淡到 target; 走完调 done (可为 NULL). 重复调用会顶掉上一次 */
+static void bri_fade_start(int target, uint32_t ms, void (*done)(void))
+{
+    if (s_bri_timer) { lv_timer_del(s_bri_timer); s_bri_timer = NULL; }
+    s_bri_from = s_cur_bri;
+    s_bri_to   = target;
+    s_bri_ms   = ms ? ms : 1;
+    s_bri_t0   = esp_timer_get_time();
+    s_bri_done = done;
+    s_bri_timer = lv_timer_create(bri_step_cb, BRI_STEP_MS, NULL);
 }
 
 /* 实际执行深度睡眠: GPIO22 拉高+保持(切断外设供电), GPIO37 高电平唤醒 (不返回) */
@@ -352,29 +406,57 @@ void power_mgr_poll_key(bool level)
     }
 }
 
-static void mode_switch_light_done(lv_anim_t *a);
+static void mode_switch_finish(void);
 
-/* 淡出完成 (已纯黑): 执行切换工作, 再淡入 */
-static void mode_switch_dark_done(lv_anim_t *a)
+/* 把整屏刷成纯黑 (背光此时是 0, 看不见; 但能保证之后无论哪一帧漏画,
+ * 底下的 GRAM 都是黑的, 绝不会露出上一屏的白底) */
+static void panel_fill_black(void)
 {
-    (void)a;
+    enum { ROWS = 16, BYTES = 172 * ROWS * 2 };
+    uint8_t *buf = heap_caps_malloc(BYTES, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (!buf) {
+        ESP_LOGW(TAG, "黑场刷黑: 缓冲分配失败 (跳过)");
+        return;
+    }
+    memset(buf, 0, BYTES);
+    for (int y = 0; y < TFT_VER_RES; y += ROWS) {
+        int rows = (y + ROWS > TFT_VER_RES) ? (TFT_VER_RES - y) : ROWS;
+        lcd_draw_bitmap_sync(0, y, TFT_HOR_RES, y + rows, buf);
+    }
+    heap_caps_free(buf);
+}
+
+/* 淡出完成 (背光已到 0, 屏幕全黑): 清理旧界面 + 建新界面, 再淡入.
+ * 三个动作(刷黑/清理/建界面)全都发生在全黑期间 —— 背光在这里再显式写一次 0,
+ * 不依赖上一步"应该已经到 0"; 面板也显式刷黑一遍, 免得旧页的像素留在 GRAM 里. */
+static void mode_switch_dark_done(void)
+{
+    if (s_cur_bri != 0) {
+        s_cur_bri = 0;
+        lcd_set_brightness(0);
+    }
+    ESP_LOGI(TAG, "黑场: 开始刷黑/清理/建界面");
+
+    panel_fill_black();
     if (s_switch_work) s_switch_work();
-    /* 纯黑下先把新界面同步刷入帧缓冲, 再淡入.
-     * 否则亮屏首帧仍显示旧画面, 会闪一下. */
+
+    /* 全黑下把新界面同步推入帧缓冲, 否则亮起来的头一帧还是旧画面.
+     * (band 还在 SPI 上飞也无所谓, 这时候背光还是 0)
+     * 下面这行日志用来确认"待刷区域"确实覆盖整屏: 如果 inv_p=0 或面积不对,
+     * 就会有一块旧页(比如设置页的白底)留在 GRAM 里, 淡入时闪一下。 */
+    lv_disp_t *d = lv_disp_get_default();
+    if (d) {
+        ESP_LOGI(TAG, "黑场: 待刷区域 inv_p=%d 首块 (%d,%d)-(%d,%d)",
+                 d->inv_p, d->inv_areas[0].x1, d->inv_areas[0].y1,
+                 d->inv_areas[0].x2, d->inv_areas[0].y2);
+    }
     lv_refr_now(NULL);
-    screen_fade(brightness_get(), mode_switch_light_done);
+
+    ESP_LOGI(TAG, "黑场: 新界面已就绪, 开始淡入");
+    bri_fade_start(brightness_get(), MODE_FADE_IN_MS, mode_switch_finish);
 }
 
-/* 淡入完成: 解除切换屏蔽, 恢复触摸 */
-static void mode_switch_light_done(lv_anim_t *a)
-{
-    (void)a;
-    s_mode_switching = false;
-    ui_touch_set_enabled(true);
-    power_mgr_notify_activity();   /* 切换完成重新计时 */
-}
-
-/* 光圈动画结束回调 (非 lv_anim 版本) */
+/* 过渡结束: 解除切换屏蔽, 恢复触摸 (光圈路径和背光路径共用) */
 static void mode_switch_finish(void)
 {
     s_mode_switching = false;
@@ -382,19 +464,26 @@ static void mode_switch_finish(void)
     power_mgr_notify_activity();   /* 切换完成重新计时 */
 }
 
-/* 模式切换黑屏过渡入口: 优先"光圈缩放"合成动画, 资源不足时降级为淡黑 */
-void power_mgr_mode_transition(void (*work)(void))
+/* 模式切换过渡入口.
+ *
+ * backlight_fade=true: 背光淡出到 0 → 清理/建页 → 淡回当前亮度. 过渡期间屏幕上
+ *   没有一个像素在变, 所以分带写入的接缝根本无从出现 —— 这是"彻底没有撕裂"的
+ *   唯一办法. 设置页整屏大白底, 黑白交界最长, 连纯透明度淡化都能看见一根灰线在
+ *   Y 上乱跳(相邻两条带差一档亮度), 所以它走这条.
+ * backlight_fade=false: 光圈缩放合成动画 (菜单/音乐/小说); 它们的底色本来就黑,
+ *   接缝看不出来, 值得保留光圈的观感. 资源不足时同样降级到背光淡化. */
+void power_mgr_mode_transition(void (*work)(void), bool backlight_fade)
 {
     s_mode_switching = true;
     s_switch_work    = work;
     ui_touch_set_enabled(false);   /* 过渡期间关触摸, 避免误触 */
 
-    if (mode_anim_run(work, mode_switch_finish)) {
+    if (!backlight_fade && mode_anim_run(work, mode_switch_finish)) {
         return;   /* 已由动画接管, 结束后回调 mode_switch_finish */
     }
 
-    /* 降级: 背光淡出 → 切换 → 淡入 */
-    screen_fade(0, mode_switch_dark_done);
+    /* 背光淡出 → 黑场里切换 → 淡入 */
+    bri_fade_start(0, MODE_FADE_OUT_MS, mode_switch_dark_done);
 }
 
 /* 息屏期 BT 状态轮询 (1s): 从已连/连接中变为未连接 → 深睡 */

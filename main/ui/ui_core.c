@@ -119,6 +119,14 @@ void ui_core_display_init(void)
     s_disp_drv.draw_buf = &s_draw_buf_dsc;
     lv_disp_drv_register(&s_disp_drv);
 
+    /* 屏底色钉成近黑.
+     * LVGL 的默认浅色主题会把 scr 的底色设成白色 (LV_THEME_DEFAULT_DARK 0), 各页面
+     * 自己盖一层全屏不透明容器时看不出来; 但切模式的瞬间"旧页已删、新页还没建",
+     * 只要那一帧被刷出去, 露出的就是整屏白 —— 设置页切到菜单时那一闪白就是这么来的.
+     * 这里把 scr 的底色改成 COLOR_BG, 任何没被盖住的区域都只是黑的. */
+    lv_obj_set_style_bg_color(lv_scr_act(), COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+
     /* 触摸输入驱动 */
     lv_indev_drv_init(&s_indev_drv);
     s_indev_drv.type    = LV_INDEV_TYPE_POINTER;

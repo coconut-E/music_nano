@@ -166,13 +166,22 @@ static void app_mode_switch_work(void)
     s_switching = false;
 }
 
+/* 过渡形式: 设置页是整屏大白底, 黑白交界最长 —— 只要走像素过渡, 不管是缩放还是
+ * 纯透明度, 按带写入都会在带边界上留一道亮度台阶, 看起来就是"一根灰线在 Y 上乱跳".
+ * 所以涉及设置页的切换直接淡背光: 过渡期间屏幕上没有一个字节在变.
+ * 菜单/音乐/小说底色本来就是黑的, 接缝看不出来, 仍然走原来的光圈缩放. */
+static bool backlight_fade_transition(void)
+{
+    return s_mode == APP_MODE_SETTINGS || s_pending == APP_MODE_SETTINGS;
+}
+
 void app_mode_request(app_mode_t target)
 {
     if (s_switching) return;
     if (target == s_mode) return;   /* 已在该模式: 什么都不做 (菜单里再长按即无反应) */
     s_switching = true;
     s_pending   = target;
-    power_mgr_mode_transition(app_mode_switch_work);
+    power_mgr_mode_transition(app_mode_switch_work, backlight_fade_transition());
 }
 
 void app_mode_init(void)

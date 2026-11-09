@@ -18,6 +18,33 @@
  * 视觉端点 (对应 CSS keyframes):
  *   scale  1.0 ↔ 0.5      radius 0 ↔ 80px      opacity 1 ↔ 0
  *   退出 ease-in, 进入 ease-out; 黑底由合成图的黑色提供 (背光保持常亮)。
+ *
+ * ── 撕裂从哪来 (为什么缩放看得见, 纯淡化看不见) ──
+ * 面板按行扫描, 而我们只能按"带"往里推: 172x320 的整屏图被绘制缓冲切成 4 条
+ * (104 行一条, 各 35,776 B), 4 条带落在 4 个不同时刻。于是带边界上必然同时存在
+ * 两个时刻的画面, 缝有多明显取决于这两个时刻"差在哪个方向":
+ *   · 缩放/圆角让内容里的**竖直边**(边界沿 x 移动)整体往里挪。带上半部竖边在
+ *     x=a, 下半部在 x=a+Δ —— 同一条竖边被撕成错开几像素的两段, 黑白交界上
+ *     就是一道硬缺口。
+ *   · 横向边(上下边沿 y 移动)错开之后, 位置正好和带边界重合, 看不出来。
+ *   ⇒ 所以撕裂只在 x 有明显变化时才显形。
+ *   · 纯透明度只改亮度, 任何一条边都不动; 相邻两条带最多差一档亮度(≤10%),
+ *     在纯色页面上只是一道极淡的亮度台阶, 不是缺口。
+ * 菜单页正因为整屏大半是黑, 只有三张图标有竖直边, 所以缺口一出就特别扎眼。
+ *
+ * ── 本轮的对策 ──
+ * 1) 少推: 只推"非黑内容包围盒"。菜单页真正会变的只有中间那条图标, 整屏 90% 的
+ *    黑像素从头到尾一个字节都不变, 却每帧跟着重写 110,080 B。这里在快照后扫一遍
+ *    求非黑包围盒 s_box, **首帧整屏刷一次**(把背景/黑底一次性画对), 之后每帧只
+ *    重算并只 lv_obj_invalidate_area() 这一块。菜单页因此从 4 条带 110,080 B 降到
+ *    2 条带约 45~60 KB, 每帧少一半时间。合法性: 缩放只向中心收缩(scale≤1)、圆角
+ *    只往里切, 内容永远落在源快照的包围盒内; 换页那一刻收缩阶段最后一帧 alpha=0
+ *    已把盒内写成全黑, 盒外本来就是黑, 所以面板全黑, 展开阶段按新盒推不会留残影。
+ * 2) 彻底不写像素: 设置页整屏大白底, 黑白交界最长, 就算只改亮度, 带与带之间那一档
+ *    亮度差也会显成"一根灰线在 Y 上乱跳"。所以涉及设置页的切换根本不进这个模块 ——
+ *    power_mgr 直接淡背光, 过渡期间屏幕上没有一个字节在变, 接缝无从谈起。
+ *    音乐/小说/菜单(以及它们之间的切换)仍走这里的软件过渡: 底色本来就是黑的,
+ *    接缝看不出来, 也就不值得牺牲光圈的观感。
  * ──────────────────────────────────────────── */
 
 static const char *TAG = "MODE_ANIM";
@@ -47,6 +74,15 @@ static void       (*s_work)(void) = NULL;   /* 黑场切换工作 */
 static void       (*s_done)(void) = NULL;   /* 全部结束回调 */
 static bool         s_work_done = false;
 
+/* 本阶段内容的非黑包围盒 (画布坐标): 每帧只重算它、只推它 */
+static lv_area_t    s_box;
+static bool         s_full_frame = true;    /* 本帧整屏失效 (动画首帧: 把背景画对一次) */
+
+/* 本阶段统计 (阶段切换/结束时打印) */
+static int          s_st_frames  = 0;
+static int64_t      s_st_comp_us = 0;
+static int64_t      s_st_refr_us = 0;
+
 /* PSRAM 优先分配, 失败回退内部 RAM */
 static void *ma_alloc(uint32_t bytes)
 {
@@ -69,9 +105,64 @@ static inline uint16_t ma_blend_black(uint16_t px, int f)
     return c.full;
 }
 
+/* 扫描快照, 求"非黑像素"的外接矩形.
+ * 这块之外在整段动画里恒为黑 (纯色页面的底色), 既不用重算也不用重推。
+ * 全黑时退回整屏, 宁可多刷也不漏刷。 */
+static void ma_scan_box(const uint8_t *buf)
+{
+    const uint16_t *p = (const uint16_t *)buf;
+    int x1 = MA_W, y1 = MA_H, x2 = -1, y2 = -1;
+
+    for (int y = 0; y < MA_H; y++) {
+        const uint16_t *row = p + (size_t)y * MA_W;
+        int a = -1, b = -1;
+        for (int x = 0; x < MA_W; x++) {
+            if (row[x]) { a = x; break; }
+        }
+        if (a < 0) continue;                       /* 整行黑, 跳过 */
+        for (int x = MA_W - 1; x > a; x--) {
+            if (row[x]) { b = x; break; }
+        }
+        if (b < 0) b = a;
+        if (y < y1) y1 = y;
+        y2 = y;
+        if (a < x1) x1 = a;
+        if (b > x2) x2 = b;
+    }
+
+    if (x2 < 0) {                                  /* 整屏黑: 退回整屏 */
+        x1 = 0; y1 = 0; x2 = MA_W - 1; y2 = MA_H - 1;
+    }
+    s_box.x1 = (lv_coord_t)x1;
+    s_box.y1 = (lv_coord_t)y1;
+    s_box.x2 = (lv_coord_t)x2;
+    s_box.y2 = (lv_coord_t)y2;
+
+    ESP_LOGI(TAG, "内容包围盒 x %d..%d y %d..%d (共 %dx%d, %d B/帧, 整屏 %d B)",
+             x1, x2, y1, y2, x2 - x1 + 1, y2 - y1 + 1,
+             (x2 - x1 + 1) * (y2 - y1 + 1) * 2, MA_BYTES);
+}
+
+/* 打印本阶段统计: 帧数 / 每帧合成耗时 / 每帧刷屏耗时 / 每帧推送字节 */
+static void ma_stat_flush(const char *tag)
+{
+    if (s_st_frames <= 0) return;
+    int w = s_box.x2 - s_box.x1 + 1;
+    int h = s_box.y2 - s_box.y1 + 1;
+    ESP_LOGI(TAG, "%s: %d 帧, 合成 %.1f ms/帧, 刷屏 %.1f ms/帧, 推送约 %d B/帧",
+             tag, s_st_frames,
+             (float)s_st_comp_us / 1000.0f / (float)s_st_frames,
+             (float)s_st_refr_us / 1000.0f / (float)s_st_frames,
+             w * h * 2);
+    s_st_frames  = 0;
+    s_st_comp_us = 0;
+    s_st_refr_us = 0;
+}
+
 /* 单帧合成: 把源快照按 scale/radius/alpha 画到合成缓冲.
  * s_q16=缩放(Q16.16), radius=圆角(元素局部px), alpha=透明度(0..255).
- * 目标像素在"缩放后的圆角矩形"内取源像素(可乘 alpha), 否则填黑。 */
+ * 目标像素在"缩放后的圆角矩形"内取源像素(可乘 alpha), 否则填黑。
+ * 只写 s_box 以内: 盒外整段动画恒为黑, 一个字节都不用重算。 */
 static void ma_compose(int s_q16, int radius, int alpha)
 {
     uint16_t *src = (uint16_t *)s_src;
@@ -85,6 +176,8 @@ static void ma_compose(int s_q16, int radius, int alpha)
     int f = alpha + 1;                      /* 1..256 */
     bool opaque = (alpha >= 255);
 
+    const int bx1 = s_box.x1, bx2 = s_box.x2;   /* 只动这一条横区间 */
+
     /* 预计算"目标列 → 源列"映射 (每帧 172 次除法, 避免逐像素除) */
     static int xmap[MA_W];
     for (int dx = x0; dx < x0 + ws && dx < MA_W; dx++) {
@@ -94,12 +187,12 @@ static void ma_compose(int s_q16, int radius, int alpha)
         xmap[dx] = sx;
     }
 
-    for (int dy = 0; dy < MA_H; dy++) {
+    for (int dy = s_box.y1; dy <= s_box.y2; dy++) {
         uint16_t *drow = dst + (size_t)dy * MA_W;
 
-        /* 缩放矩形之外: 整行黑 */
+        /* 缩放矩形之外: 盒内整行黑 */
         if (dy < y0 || dy >= y0 + hs) {
-            memset(drow, 0, MA_W * 2);
+            memset(drow + bx1, 0, (size_t)(bx2 - bx1 + 1) * 2);
             continue;
         }
 
@@ -132,18 +225,25 @@ static void ma_compose(int s_q16, int radius, int alpha)
         if (dhi > MA_W) dhi = MA_W;
         if (dlo > dhi) dlo = dhi;
 
-        if (dlo > 0) memset(drow, 0, (size_t)dlo * 2);
+        /* 夹到包围盒, 两头不足的部分按黑填满 (盒内必须整段写过) */
+        int lo = (dlo < bx1) ? bx1 : dlo;
+        int hi = (dhi > bx2 + 1) ? bx2 + 1 : dhi;
+        if (lo > bx2 + 1) lo = bx2 + 1;
+        if (hi < bx1) hi = bx1;
+        if (lo > hi) lo = hi;
+
+        if (lo > bx1) memset(drow + bx1, 0, (size_t)(lo - bx1) * 2);
 
         const uint16_t *srow = src + (size_t)ey * MA_W;
         if (opaque) {
-            for (int dx = dlo; dx < dhi; dx++)
+            for (int dx = lo; dx < hi; dx++)
                 drow[dx] = srow[xmap[dx]];
         } else {
-            for (int dx = dlo; dx < dhi; dx++)
+            for (int dx = lo; dx < hi; dx++)
                 drow[dx] = ma_blend_black(srow[xmap[dx]], f);
         }
 
-        if (dhi < MA_W) memset(drow + dhi, 0, (size_t)(MA_W - dhi) * 2);
+        if (hi <= bx2) memset(drow + hi, 0, (size_t)(bx2 + 1 - hi) * 2);
     }
 }
 
@@ -187,6 +287,8 @@ static void ma_snapshot_new(void)
     lv_obj_update_layout(lv_scr_act());
     lv_snapshot_take_to_buf(lv_scr_act(), LV_IMG_CF_TRUE_COLOR, &tmp, s_src, MA_BYTES);
     lv_obj_add_flag(lv_scr_act(), LV_OBJ_FLAG_HIDDEN);
+
+    ma_scan_box(s_src);   /* 新界面的内容范围 (设置页白底 = 整屏; 菜单 = 中间那条图标) */
 }
 
 static void ma_timer_cb(lv_timer_t *tmr)
@@ -210,9 +312,24 @@ static void ma_timer_cb(lv_timer_t *tmr)
         alpha  = (255 * p) >> 8;
     }
 
+    int64_t c0 = esp_timer_get_time();
     ma_compose(s_q16, radius, alpha);
-    if (s_img) lv_obj_invalidate(s_img);
+    s_st_comp_us += esp_timer_get_time() - c0;
+
+    if (s_img) {
+        if (s_full_frame) {
+            /* 动画首帧: 整屏推一次, 把背景/黑底一次性画对 (之后盒外再也不动) */
+            s_full_frame = false;
+            lv_obj_invalidate(s_img);
+        } else {
+            lv_obj_invalidate_area(s_img, &s_box);   /* 之后只推内容那一小块 */
+        }
+    }
+
+    int64_t r0 = esp_timer_get_time();
     lv_refr_now(lv_disp_get_default());
+    s_st_refr_us += esp_timer_get_time() - r0;
+    s_st_frames++;
 
     if (el < dur) return;
 
@@ -222,11 +339,13 @@ static void ma_timer_cb(lv_timer_t *tmr)
             s_work_done = true;
             s_work();
         }
+        ma_stat_flush("关闭阶段");
         ma_snapshot_new();
         s_phase = MA_PHASE_OPEN;
         s_t0 = esp_timer_get_time();
     } else {
         void (*done)(void) = s_done;
+        ma_stat_flush("展开阶段");
         ma_cleanup();
         if (done) done();
     }
@@ -247,6 +366,7 @@ bool mode_anim_run(void (*switch_work)(void), void (*done)(void))
     }
 
     memcpy(comp, src, MA_BYTES);   /* 首帧即等于当前画面 */
+    ma_scan_box(src);              /* 旧界面里真正有内容的范围 */
 
     s_src  = src;
     s_comp = comp;
@@ -274,6 +394,10 @@ bool mode_anim_run(void (*switch_work)(void), void (*done)(void))
     s_work      = switch_work;
     s_done      = done;
     s_work_done = false;
+    s_full_frame = true;      /* 首帧整屏推一次, 之后只推 s_box */
+    s_st_frames  = 0;
+    s_st_comp_us = 0;
+    s_st_refr_us = 0;
     s_phase     = MA_PHASE_CLOSE;
     s_t0        = esp_timer_get_time();
 

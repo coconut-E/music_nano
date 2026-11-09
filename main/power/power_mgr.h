@@ -56,8 +56,10 @@ void power_mgr_set_lyrics_active(bool active);
 void power_mgr_poll_key(bool level);
 
 /* 模式切换黑屏过渡: 淡出到纯黑 → 调用 work() (清理+构建) → 淡入.
- * work 在 LVGL 任务上下文执行; 过渡期间屏蔽按键与蓝牙轮询 */
-void power_mgr_mode_transition(void (*work)(void));
+ * work 在 LVGL 任务上下文执行; 过渡期间屏蔽按键与蓝牙轮询.
+ * backlight_fade=true 时用背光淡出/淡入代替像素过渡 (过渡期间不写任何像素,
+ * 彻底没有分带接缝; 设置页大白底用它). false 走光圈缩放动画. */
+void power_mgr_mode_transition(void (*work)(void), bool backlight_fade);
 
 #ifdef __cplusplus
 }
