@@ -198,6 +198,18 @@ try {
 
 if ($code -eq 0) {
     Write-Host "=== 编译成功 ===" -ForegroundColor Green
+
+    # 编译完核对一遍配置: defaults 里写了但固件里没生效的项会在这里暴露.
+    # (idf.py 只读 sdkconfig, sdkconfig.defaults 只是"生成新配置的种子";
+    #  本工程踩过坑: 以为关掉了 DHCP 的 ARP 检查, 实际每版固件都还开着.)
+    $chk = Join-Path $PROJ_DIR 'tools\check_sdkconfig.ps1'
+    if (Test-Path -LiteralPath $chk) {
+        & $chk
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "=== 配置核对失败: 上面这些项没进固件, 要改 sdkconfig 本身 ===" -ForegroundColor Red
+            exit 2
+        }
+    }
 } else {
     Write-Host "=== 编译失败 (exit $code) ===" -ForegroundColor Red
     exit $code
