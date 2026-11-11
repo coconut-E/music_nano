@@ -65,3 +65,49 @@ CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 # 只用 IPv4; IPv6 在 lwip 里占 26KB flash
 CONFIG_LWIP_IPV6=n
+# ── WiFi 运行期内部 RAM: 默认缓冲数太奢侈, 按默认值 esp_wifi_init 会直接
+#    ESP_ERR_NO_MEM (实测 "Init static rx buffer: 1/10", 内部堆 47KB 也放不下).
+#    本工程只用它扫一遍 AP + 连一次 + 下个 bin, 不需要 32 个动态收发缓冲.
+#    IDF 默认 → 现在:
+#      静态 RX 10 → 4 (每个 1.6KB, 扫描收 beacon 靠它, 不能再降)
+#      动态 RX 4 → 2 (数据帧收发用; DHCP/ARP 一帧一帧来, 2 个够)
+#      动态 TX 4 → 2 (每发一帧要一个, 串行发就够; 每个约 1.6KB DMA 内存)
+#      管理帧短缓冲 32 → 6
+#      管理 RX 5 → 2 (扫描结果靠它, 别再降)
+#      AMPDU TX 关 (只影响上行聚合; 下载我们是收方, AMPDU RX 保留)
+#    实测占用从 ~45KB 降到 ~20KB, 见 main/app/wifi_mgr.c 的 WiFi 已释放日志.
+#
+#    为什么要压到 2: 收/发缓冲都是从 "DMA 可用内部堆" 里拿的, 而这个池子本来就
+#    只剩几 KB. 曾出现连 WiFi 时 DMA 只剩 719B、最大连续块 248B —— WiFi 每发
+#    一帧要 ~1.6KB 的 TX 缓冲, 拿不到就返回 ESP_ERR_NO_MEM, 表现为
+#    "关联成功、DISCOVER 发不出去、20 秒拿不到 IP"(见 wifi_mgr.c 的 TX 闸门).
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=2
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+# 聚合窗口不能大于动态 RX 缓冲数 (Kconfig 里 wifi_init.c 有 #error 检查)
+CONFIG_ESP_WIFI_RX_BA_WIN=2
+
+# ── DHCP 的地址冲突检查: 全关 ────────────────────────────────────────────
+# 这是 Kconfig 里的一个 choice (3 选 1), 所以不能写成 "ARP_CHECK=n" —— 那样
+# 配置阶段会回落到默认项 (还是 ARP_CHECK), 等于没改. 必须显式选第三项.
+#
+# 为什么关: IDF 5.5.5 的 ARP 检查走 port/acd_dhcp_check.c, 收到 ACK 后先发 2 次
+# ARP 探测 (间隔 500ms) 再 bind. 只要有人应答"这个 IP 我占了"(手机热点/带 ARP
+# 代理的路由器就会替客户端应答), 它就发 DHCPDECLINE 并退避 10 秒, 然后重来 ——
+# 而我们的连接窗口只有 20 秒, 于是表现为 "关联成功、DHCP 状态 STARTED、IP 一直
+# 0.0.0.0、20 秒超时". 换哪家 WiFi 都可能中招, 且和信号强度无关.
+# 参考 espressif/esp-idf#17500 (IDFGH-16360): decline 之后客户端不再重试.
+#
+# 关掉以后: 收到 ACK 直接 dhcp_bind(), 不探测、不 DECLINE, 1 秒内拿到 IP.
+# 代价: 万一同网段真有别的设备抢同一个地址, 不会自动避让 (家用/手机热点场景里
+# 这个概率远低于上面那个坑).
+#
+# 注意: 本文件只是"新配置的种子". idf.py 只读 sdkconfig, 已经存在的 sdkconfig
+# 不会被这里的值覆盖 —— 所以同样的三行在 sdkconfig 里也必须改, 两边要一致.
+# 编译完 tools/check_sdkconfig.ps1 会核对实际生效值 (build.ps1 已自动调用).
+# CONFIG_LWIP_DHCP_DOES_ARP_CHECK is not set
+# CONFIG_LWIP_DHCP_DOES_ACD_CHECK is not set
+CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y

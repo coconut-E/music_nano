@@ -19,6 +19,7 @@
 #include "sys_monitor.h"
 #include "app_mode.h"
 #include "ui_player.h"
+#include "ui_settings.h"
 #include "battery_low_img.h"
 #include "atomic_utils.h"
 #include "power_mgr.h"
@@ -87,6 +88,12 @@ typedef enum {
  * "请勿断电", 按什么都没反应, 避免误触导致新固件来不及打标就被回退. */
 static volatile bool s_sleep_inhibit = false;
 
+/* 界面抑制: 设置页的 WiFi 流程在扫描/连接/释放期间置位.
+ * 和 s_sleep_inhibit 分开存、互不覆盖 (OTA 的校验窗口可能同时也在用),
+ * 两者任一为真 → 电源键短按/长按与无操作熄屏全部失效.
+ * 正好就是需求里"扫描/连接中按电源键、按退出都无反应"的语义, 由 UI 按阶段开关. */
+static volatile bool s_ui_inhibit = false;
+
 static pwr_state_t s_state = PWR_ACTIVE;   /* 当前电源状态 */
 static bool        s_key_prev = false;     /* 上次按键电平 (用于检测沿) */
 static int64_t     s_key_last_us = 0;      /* 上次按键沿的时刻 (us), 用于冷却 */
@@ -137,7 +144,17 @@ void power_mgr_set_sleep_inhibit(bool inhibit)
 
 bool power_mgr_sleep_inhibited(void)
 {
-    return s_sleep_inhibit;
+    return s_sleep_inhibit || s_ui_inhibit;
+}
+
+/* 界面抑制开关 (设置页 WiFi 流程用): 只影响"按键 + 无操作熄屏",
+ * 与 OTA 的 sleep_inhibit 各存一个标志, 谁也不会把对方清掉. */
+void power_mgr_set_ui_inhibit(bool inhibit)
+{
+    if (s_ui_inhibit == inhibit) return;
+    s_ui_inhibit = inhibit;
+    ESP_LOGI(TAG, "界面抑制(按键/熄屏) %s", inhibit ? "开启" : "解除");
+    if (!inhibit) power_mgr_notify_activity();   /* 解除时重新计时, 避免立刻熄屏 */
 }
 
 /* 歌词页显示状态: true=歌词页 (3 分钟), false=封面 (1 分钟).
@@ -309,8 +326,8 @@ static void screen_on(void)
 /* 执行与之前相同的短按动作 (息屏/亮屏/深睡) */
 static void power_short_press_action(void)
 {
-    if (s_sleep_inhibit) {          /* OTA 校验窗口: 按键直接吞掉 */
-        ESP_LOGW(TAG, "新固件校验中, 忽略睡眠键");
+    if (s_sleep_inhibit || s_ui_inhibit) {   /* OTA 校验窗口 / WiFi 操作中: 按键直接吞掉 */
+        ESP_LOGW(TAG, "校验或 WiFi 操作中, 忽略睡眠键");
         return;
     }
     switch (s_state) {
@@ -340,7 +357,7 @@ static void idle_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (s_mode_switching) return;
-    if (s_sleep_inhibit) return;    /* OTA 校验窗口: 不做无操作熄屏 */
+    if (s_sleep_inhibit || s_ui_inhibit) return;   /* OTA 校验 / WiFi 操作中: 不熄屏 */
     if (s_state != PWR_ACTIVE) return;
 
     int64_t timeout_us;
@@ -364,7 +381,7 @@ static void idle_poll_cb(lv_timer_t *timer)
 void power_mgr_poll_key(bool level)
 {
     if (s_mode_switching) return;   /* 切换过渡中: 忽略 */
-    if (s_sleep_inhibit) {          /* OTA 校验窗口: 吞掉按键, 但仍跟踪电平避免解锁后误判边沿 */
+    if (s_sleep_inhibit || s_ui_inhibit) {   /* 校验/WiFi 操作中: 吞掉按键, 但仍跟踪电平避免解锁后误判边沿 */
         s_key_prev = level;
         return;
     }
@@ -402,6 +419,14 @@ void power_mgr_poll_key(bool level)
             return;
         }
         s_key_last_us = now;
+
+        /* 设置页里短按 = 返回上一级 (列表那一级 = 退出设置回菜单).
+         * 注意这里拦的是"物理按键"这一条; 无操作熄屏仍然走 power_short_press_action,
+         * 否则在设置页里闲置 30 秒会莫名其妙地"返回". */
+        if (app_mode_is_settings()) {
+            ui_settings_back();
+            return;
+        }
         power_short_press_action();
     }
 }

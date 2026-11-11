@@ -1,13 +1,18 @@
-/* 设置页 (APP_MODE_SETTINGS): 白底整屏 lv_list + 固件版本详情页.
+/* 设置页 (APP_MODE_SETTINGS): 白底整屏 lv_list + 固件版本详情页 + WiFi 子流程入口.
  *
  * 它和音乐/小说/菜单一样是"一种模式": 由 app_mode.c 在模式切换的黑场里
  * 调用 ui_settings_build() 建、ui_settings_destroy() 删, 进出都走原有过渡动画.
  * 本文件不碰资源 (音频/封面/蓝牙) 也不碰 NVS —— 那些由 app_mode 的
  * leave/enter 负责.
  *
- * 列表目前只有一项「固件版本」: 点进去看当前运行 APP 的版本号和镜像大小,
- * 下面一个「检查更新」按钮. 按钮按需求先占位 —— 点了没有任何反应 (只打日志),
- * 联网 OTA 做好了再接到这里. */
+ * 页面层级 (电源键短按 = 返回上一级; 已经在「设置列表」这一级时退出设置回菜单):
+ *
+ *   设置列表 ─「固件版本」→ 固件版本详情 ─「检查更新」→ 连接 WiFi ─ 密码(横屏) …
+ *      ↑                          ↑                        └→ 正在连接 → 正在检查更新
+ *      └──────────────────────────┴───────────────────────────────────┘
+ *
+ * 「检查更新」之后那几页全在 ui_settings_wifi.c 里 (它自己开关 WiFi、自己管返回),
+ * 本文件只负责: 进流程前把列表/详情藏起来, 流程结束时把详情页显示回来. */
 #include <stdio.h>
 #include <string.h>
 
@@ -18,9 +23,11 @@
 #include "esp_partition.h"
 #include "lvgl.h"
 
+#include "app_mode.h"
 #include "power_mgr.h"
 #include "ui_core.h"
 #include "ui_settings.h"
+#include "ui_settings_wifi.h"
 
 static const char *TAG = "SETTINGS";
 
@@ -164,10 +171,19 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *txt, lv_color_t color,
 
 /* ── 列表页 / 详情页 切换 ── */
 
+/* 当前停在哪一级: 电源键短按要知道"还能不能再往上退" */
+typedef enum {
+    PG_LIST = 0,      /* 根: 再返回就是退出设置 */
+    PG_VERSION,       /* 固件版本详情 */
+} page_t;
+
+static page_t s_page = PG_LIST;
+
 static void list_show(void)
 {
     if (s_list)   lv_obj_clear_flag(s_list, LV_OBJ_FLAG_HIDDEN);
     if (s_detail) lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+    s_page = PG_LIST;
 }
 
 static void detail_show(void)
@@ -176,6 +192,7 @@ static void detail_show(void)
     lv_obj_move_foreground(s_detail);              /* 压住列表页 */
     lv_obj_clear_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
     if (s_list) lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
+    s_page = PG_VERSION;
 }
 
 /* 点「固件版本」行: 进详情页 */
@@ -194,11 +211,45 @@ static void back_cb(lv_event_t *e)
     power_mgr_notify_activity();
 }
 
-/* 「检查更新」: 按需求先占位 —— 点了没有任何反应, 只留一条日志 */
+/* 「检查更新」: 进 WiFi 子流程 (列表/详情先藏起来, 流程结束时再显示回来) */
 static void check_update_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "检查更新: 未实现 (点击无响应)");
+    power_mgr_notify_activity();
+
+    if (ui_wifi_active()) return;
+    if (!ui_wifi_enter()) {
+        ESP_LOGW(TAG, "进入 WiFi 流程失败 (上一次会话可能还在释放)");
+        return;
+    }
+    if (s_list)   lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
+    if (s_detail) lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* WiFi 流程结束 (扫描页/检查更新页返回, 资源已释放): 回到固件版本详情 */
+static void wifi_flow_end_cb(void)
+{
+    detail_show();
+    power_mgr_notify_activity();
+}
+
+/* 电源键短按: 返回上一级; 已经在设置列表这一级 → 退出设置 (回菜单).
+ * 扫描/连接/释放期间由 ui_wifi_back() 自己拦掉 (按了没反应). */
+void ui_settings_back(void)
+{
+    if (ui_wifi_active()) {
+        ui_wifi_back();
+        return;
+    }
+
+    if (s_page == PG_VERSION) {
+        list_show();
+        power_mgr_notify_activity();
+        return;
+    }
+
+    ESP_LOGI(TAG, "设置列表: 退出设置, 回主菜单");
+    app_mode_request(APP_MODE_MENU);
 }
 
 /* ── 列表页 ── */
@@ -322,6 +373,8 @@ void ui_settings_build(void)
     ensure_info();                 /* 版本/大小只取一次 */
     list_build();
     detail_build();
+    ui_wifi_set_end_cb(wifi_flow_end_cb);   /* WiFi 子流程结束时回到详情页 */
+    s_page = PG_LIST;
 
     lv_obj_move_foreground(s_list);   /* 压住常驻的音量弹窗 */
     ESP_LOGI(TAG, "设置页已构建");
@@ -329,7 +382,12 @@ void ui_settings_build(void)
 
 void ui_settings_destroy(void)
 {
+    /* 先收 WiFi 子流程: 它可能停在横屏密码页, 也可能还有会话在释放.
+     * 必须在删列表/详情之前做 —— 它要把屏幕旋转恢复成竖屏. */
+    ui_wifi_destroy();
+
     if (s_detail) { lv_obj_del(s_detail); s_detail = NULL; }
     if (s_list)   { lv_obj_del(s_list);   s_list   = NULL; }
+    s_page = PG_LIST;
     ESP_LOGI(TAG, "设置页已销毁");
 }

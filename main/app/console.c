@@ -11,6 +11,7 @@
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_heap_task_info.h"   /* memtask: 按任务统计堆占用 (需 CONFIG_HEAP_TASK_TRACKING) */
 #include "esp_psram.h"
 #include "esp_debug_helpers.h"
 #include "esp_private/freertos_debug.h"
@@ -156,6 +157,33 @@ static void cmd_psram(void)
            total / 1024, largest / 1024);
 }
 
+/* ── mem 命令: 一次看完三类堆的空闲/最大块/历史最低/碎片 ──
+ * "历史最低" = 开机以来的最小空闲字节数, 判断"峰值够不够"要看它, 而不是当前值.
+ * 块数 = 已分配块 + 空闲块; 空闲块越多说明碎片越厉害 (可用最大块会明显小于总空闲). */
+static void print_heap_one(const char *tag, uint32_t caps)
+{
+    multi_heap_info_t info;
+    heap_caps_get_info(&info, caps);
+    if (info.total_blocks == 0) {
+        printf("[MEM] %-5s 不可用\n", tag);
+        return;
+    }
+    printf("[MEM] %-5s 空闲 %6u B (最大块 %6u, 历史最低 %6u) | 已分配 %6u B | 块 %u 已用 / %u 空闲\n",
+           tag,
+           (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
+           (unsigned)info.minimum_free_bytes, (unsigned)info.total_allocated_bytes,
+           (unsigned)info.allocated_blocks, (unsigned)info.free_blocks);
+}
+
+static void cmd_mem(void)
+{
+    printf("\n");
+    print_heap_one("内部", MALLOC_CAP_INTERNAL);
+    print_heap_one("DMA", MALLOC_CAP_DMA);
+    if (esp_psram_is_initialized()) print_heap_one("PSRAM", MALLOC_CAP_SPIRAM);
+    printf("[MEM] 任务栈峰值余量: taskmem    按任务统计堆占用: memtask\n\n");
+}
+
 /* nvs 命令: 打印 NVS 分区条目统计与剩余比例 */
 static void cmd_nvs(void)
 {
@@ -291,6 +319,74 @@ static void cmd_taskmem(const char *name)
     free(snap);
 }
 
+/* ── memtask 命令: 按"申请内存的任务"统计当前占用 ──
+ * 需要 CONFIG_HEAP_TASK_TRACKING=y (开了以后每次 malloc/free 都会记账到当前任务).
+ * 本工程每个子系统都有自己的任务 (audio / bt_a2dp / BTC / BTU / lvgl / cover /
+ * wifi / tcpip), 所以这张表基本就是"谁吃了多少"的账本.
+ *
+ * 若同时开了 CONFIG_HEAP_TRACK_DELETED_TASKS, 已删任务的记录会保留, 但它的 TCB
+ * 已经被释放 —— 直接用 pcTaskGetName() 会踩野指针. 所以这里先用当前任务快照
+ * 建一个句柄→名字的对照, 查不到就标成"(已删除)". */
+static void cmd_memtask(void)
+{
+#if CONFIG_HEAP_TASK_TRACKING
+    enum { MAX_T = 24 };
+    typedef struct { const char *name; size_t size; size_t cnt; } row_t;
+
+    static heap_task_totals_t s_tot[MAX_T];    /* 静态: 控制台任务栈只有 3KB */
+    static TaskStatus_t       s_alive[MAX_T];
+    static row_t              s_row[MAX_T];
+
+    size_t n = 0;
+    heap_task_info_params_t p = {
+        .caps = {0}, .mask = {0},              /* 不做 caps 分区, 全部算一类 */
+        .totals = s_tot, .num_totals = &n, .max_totals = MAX_T,
+        .blocks = NULL, .max_blocks = 0,
+    };
+    heap_caps_get_per_task_info(&p);
+
+    UBaseType_t na = uxTaskGetSystemState(s_alive, MAX_T, NULL);
+
+    int m = 0;
+    for (size_t i = 0; i < n && m < MAX_T; i++) {
+        size_t sz = 0, cnt = 0;
+        for (int c = 0; c < NUM_HEAP_TASK_CAPS; c++) {
+            sz  += s_tot[i].size[c];
+            cnt += s_tot[i].count[c];
+        }
+        if (sz == 0) continue;
+
+        const char *nm = "(已删除)";
+        for (UBaseType_t k = 0; k < na; k++) {
+            if (s_alive[k].xHandle == s_tot[i].task) { nm = s_alive[k].pcTaskName; break; }
+        }
+        s_row[m].name = nm;
+        s_row[m].size = sz;
+        s_row[m].cnt  = cnt;
+        m++;
+    }
+
+    /* 按占用从大到小插入排序 (最多 24 条) */
+    for (int i = 1; i < m; i++) {
+        row_t key = s_row[i];
+        int j = i - 1;
+        while (j >= 0 && s_row[j].size < key.size) { s_row[j + 1] = s_row[j]; j--; }
+        s_row[j + 1] = key;
+    }
+
+    printf("\n[memtask] 任务                占用        块数\n");
+    size_t sum = 0;
+    for (int i = 0; i < m; i++) {
+        printf("[memtask] %-14s %8u B  %4u\n",
+               s_row[i].name, (unsigned)s_row[i].size, (unsigned)s_row[i].cnt);
+        sum += s_row[i].size;
+    }
+    printf("[memtask] %-14s %8u B\n\n", "合计", (unsigned)sum);
+#else
+    printf("[memtask] 未开启 CONFIG_HEAP_TASK_TRACKING, 改 sdkconfig 后重编\n");
+#endif
+}
+
 /* version 命令: 当前运行的固件版本 + 所在分区 */
 static void cmd_version(void)
 {
@@ -327,7 +423,7 @@ static void console_task(void *arg)
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);   /* 设非阻塞读, 任务循环里轮询 */
 
     printf("\n=== 音乐播放器 ===\n");
-    printf("系统命令: stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名]\n");
+    printf("系统命令: mem | stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名] | memtask\n");
     printf("升级命令: version | ota | ota boot <0|1> | font crc\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     //printf("命令> ");
@@ -365,6 +461,10 @@ static void console_task(void *arg)
                         cmd_taskmem(NULL);
                     } else if (strncmp(line, "taskmem ", 8) == 0) {   /* "taskmem <任务名>" */
                         cmd_taskmem(line + 8);
+                    } else if (strcmp(line, "mem") == 0) {
+                        cmd_mem();
+                    } else if (strcmp(line, "memtask") == 0) {
+                        cmd_memtask();
                     } else if (strcmp(line, "version") == 0) {
                         cmd_version();
                     } else if (strcmp(line, "ota") == 0) {

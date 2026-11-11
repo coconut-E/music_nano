@@ -24,14 +24,9 @@ static QueueHandle_t s_audio_rsp_queue = NULL;  /* 音频应答队列: 音频任
 
 /* 系统入口: 初始化各子系统并启动对应任务.
  * 所有任务由子系统 init 内部创建, 本函数最后把自己挂起, 只保留各任务在跑. */
-/* 临时: 链接期测量探针 (见 net_probe.c), 测量完随该文件一起删除 */
-void net_probe_maybe(void);
 
 void app_main(void)
 {
-    /* 临时探针: 运行期直接返回, 只为把 WiFi/HTTP 栈链接进来量占用 */
-    net_probe_maybe();
-
 #ifdef TEST_CRASH_ON_BOOT
     /* 测试专用 (build.ps1 -TestCrash): 模拟"能通过镜像校验, 但一启动就崩"的坏固件,
      * 用来验证 OTA 回退: bootloader 判 ABORTED 并退回上一个槽 */

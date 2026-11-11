@@ -46,6 +46,11 @@ void power_mgr_notify_activity(void);
 void power_mgr_set_sleep_inhibit(bool inhibit);
 bool power_mgr_sleep_inhibited(void);
 
+/* 界面抑制开关 (设置页 WiFi 流程): 置位期间电源键短按/长按与无操作熄屏全部失效,
+ * 触摸/音量键不受影响. 与 power_mgr_set_sleep_inhibit 各存一个标志、互不覆盖
+ * (OTA 校验窗口可能同时在用). 扫描/连接/释放期间的"按了没反应"就是它实现的 */
+void power_mgr_set_ui_inhibit(bool inhibit);
+
 /* 设置歌词页是否显示: true=歌词页 (无操作 3 分钟熄屏), false=音乐封面 (1 分钟).
  * 由音乐 UI 在进入/退出歌词页、销毁音乐组时调用 */
 void power_mgr_set_lyrics_active(bool active);
