@@ -166,8 +166,14 @@
 #endif
 
 /*Maximum buffer size to allocate for rotation.
- *Only used if software rotation is enabled in the display driver.*/
-#define LV_DISP_ROT_MAX_BUF (10*1024)
+ *Only used if software rotation is enabled in the display driver.
+ *
+ * 2KB (不是 4KB/10KB): 设置页开 WiFi 时内部堆只剩 ~12KB 且高度碎片化.
+ * 这块临时缓冲由 lv_mem_buf_get() (malloc) 申请, 一旦落到 PSRAM, SPI 驱动就会再要一块
+ * 同样大小的 DMA "反射缓冲"(spi_master.c:1213), 两块都得从内部堆出.
+ * 2KB 时两边都只有 1.9KB 级, 在剩下的碎片里能找到位置; 代价是横屏一帧 3 行/块,
+ * 整屏约 11ms 传输 + 2ms 命令开销, 键盘页无感. */
+#define LV_DISP_ROT_MAX_BUF (2*1024)
 
 /*-------------
  * GPU
@@ -474,7 +480,7 @@
 
 #define LV_USE_BTN        1
 
-#define LV_USE_BTNMATRIX  0
+#define LV_USE_BTNMATRIX  1   /* 设置页的 WiFi 密码键盘 (lv_keyboard 的基类) 用到 */
 
 #define LV_USE_CANVAS     0
 
@@ -501,7 +507,7 @@
 
 #define LV_USE_SWITCH     1
 
-#define LV_USE_TEXTAREA   0   /*Requires: lv_label*/
+#define LV_USE_TEXTAREA   1   /*Requires: lv_label. WiFi 密码输入框用 */
 #if LV_USE_TEXTAREA != 0
     #define LV_TEXTAREA_DEF_PWD_SHOW_TIME 1500    /*ms*/
 #endif
@@ -537,7 +543,7 @@
 
 #define LV_USE_IMGBTN     0
 
-#define LV_USE_KEYBOARD   0
+#define LV_USE_KEYBOARD   1   /* 横屏密码页的软键盘 (Requires: lv_btnmatrix) */
 
 #define LV_USE_LED        0
 

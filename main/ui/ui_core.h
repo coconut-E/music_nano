@@ -58,6 +58,16 @@ void ui_loop_task(void *arg);
  * enable=true 使能 */
 void ui_touch_set_enabled(bool enable);
 
+/* 横屏刷屏的中转缓冲 (2KB, 内部 DMA RAM).
+ *
+ * 软件旋转时 LVGL 的旋转块可能落在 PSRAM, SPI 驱动就会再要一块同尺寸的 DMA 反射缓冲;
+ * WiFi 开着时内部堆早已碎片化, 那块申请必然失败 ("Failed to allocate priv TX buffer").
+ * 这块缓冲在 WIFI_EV_READY 申请 (WiFi 已 init 完、列表页还没建, 池子最宽裕),
+ * 点「确认」连接前让出去, 流程结束释放.
+ * 返回 false 表示申请失败 (横屏刷新可能出错, 但不影响竖屏). */
+bool ui_core_rot_stage_acquire(void);
+void ui_core_rot_stage_release(void);
+
 #ifdef __cplusplus
 }
 #endif

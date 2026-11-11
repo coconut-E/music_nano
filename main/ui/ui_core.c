@@ -14,7 +14,13 @@
 
 #define TAG "ui_core"
 
-#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 20 * 13)  /* 绘制缓冲总大小 (屏的 65%) */
+/* 绘制缓冲总大小: 屏的 60% (两块各 30%), 单块 172x96, 整屏仍是 4 条带 (96/96/96/32).
+ *
+ * 65% → 60% 是为了再给设置页的 esp_wifi_init 让出 5,504 B 内部 DMA 堆 (WiFi 要从
+ * DMA 池拿 ~27KB, 而横屏页还有旋转临时块 + SPI 反射块要抢). 60% 和 65% 一样是
+ * 4 条带, 只是每条窄一点; 40% 会变 5 条带, 分带接缝明显变多, 那才是撕裂变差的原因.
+ * 注意: 绘制缓冲必须留在内部 RAM —— ESP32 的 SPI DMA 读不了 PSRAM. */
+#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 20 * 12)  /* 绘制缓冲总大小 (屏的 60%) */
 #define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)                    /* 单帧缓冲 = 一半 */
 
 /* 触摸原始坐标的可用范围 (用于线性映射到屏幕坐标) */
@@ -37,12 +43,83 @@ static esp_lcd_panel_handle_t s_panel = NULL;   /* LCD 面板句柄 */
 /* 触摸开关: 息屏时置 false, touch_read_cb 短路返回 (顺带省 I2C 功耗) */
 static volatile bool s_touch_enabled = true;
 
-/* LVGL 刷新回调: 把脏区像素写进 LCD 面板 */
+/* 横屏刷屏用的中转缓冲 (2KB, 内部 DMA RAM).
+ *
+ * 为什么需要: 软件旋转时 LVGL 的旋转块来自 lv_mem_buf_get() (malloc), 尺寸是
+ * LV_DISP_ROT_MAX_BUF (lv_conf.h, 2KB), 可能落在 PSRAM. SPI 的 DMA 读不了 PSRAM,
+ * 驱动就会再申请一块同尺寸的 "反射缓冲" (spi_master.c:1214); WiFi 开着时内部堆只剩
+ * 几百字节, 那块申请必然失败 → 整页刷不出来 ("Failed to allocate priv TX buffer").
+ * 这里自己备一块内部 DMA 缓冲, memcpy 进去再交给 SPI, 就不依赖驱动那块反射缓冲了.
+ *
+ * 归属: 由设置页的 WiFi 流程管, 不开 WiFi 就完全不占内存.
+ *   - 进流程 (WIFI_EV_READY) 申请一次: 此刻 esp_wifi_init 刚结束、列表页还没建,
+ *     DMA 池还有 ~12KB, 2KB 随手可得 (不能更早: init 自己要从 DMA 池拿 ~27KB,
+ *     0.8.6 用 4KB 静态缓冲抢先占位, 直接把 init 掐死了);
+ *   - 点「确认」去连接前让出去: 连接每帧要 ~1.6KB 的 DMA TX 缓冲,
+ *     2KB 还占着的话实测只剩 1595B/最大连续块 800B, 第一帧 DISCOVER 都发不出去;
+ *   - 流程结束 (ui_wifi_destroy) 释放.
+ * 让出去之后不再补: 等列表页建完, 池子只剩 ~900B 连续块, 补的那次必然失败 ——
+ * 所以连接失败直接退出整个流程重来 (见 ui_settings_wifi.c 文件头), 而不是回列表.
+ * 2KB 够用: LVGL 旋转出的每一块最大就是 LV_DISP_ROT_MAX_BUF.
+ * 传输走同步接口, 返回时 DMA 已排空, 所以下一块可以直接覆盖它. */
+#define ROT_STAGE_BYTES 2048
+static uint8_t *s_rot_stage = NULL;
+
+/* 申请横屏中转缓冲: 幂等, 已经有就直接返回 true.
+ *
+ * 唯一可靠的时机是 WIFI_EV_READY (见上). 密码页可以反复进入
+ * (电源键返回 -> 再进), 所以申请放在流程入口, 不是密码页的构建函数里. */
+bool ui_core_rot_stage_acquire(void)
+{
+    if (s_rot_stage) return true;
+    s_rot_stage = (uint8_t *)heap_caps_malloc(ROT_STAGE_BYTES,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!s_rot_stage) {
+        ESP_LOGW(TAG, "横屏中转缓冲申请失败 (DMA 可用 %u B), 横屏刷新会出错",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        return false;
+    }
+    ESP_LOGI(TAG, "横屏中转缓冲已申请 %u B (DMA 可用 %u B)",
+             (unsigned)ROT_STAGE_BYTES,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    return true;
+}
+
+void ui_core_rot_stage_release(void)
+{
+    if (!s_rot_stage) return;
+    heap_caps_free(s_rot_stage);
+    s_rot_stage = NULL;
+    ESP_LOGI(TAG, "横屏中转缓冲已释放 (DMA 可用 %u B)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+}
+
+/* LVGL 刷新回调: 把脏区像素写进 LCD 面板.
+ *
+ * 竖屏走异步 (沿用原来的做法). 横屏 (软件旋转 90°) 必须同步:
+ * lv_refr.c 的 draw_buf_rotate() 会把同一块缓冲原地旋转 / 反复复用一个 rot_buf,
+ * 每块之间只等一个 draw_buf->flushing 标志 —— 而我们这里一旦立即 flush_ready,
+ * 它就会接着改写还在被 DMA 读的缓冲, 横屏页会整块串行错位.
+ * lcd_draw_bitmap_sync 末尾用一次无命令 tx_param 把在途 color 事务排空, 正是 DMA 屏障. */
 static void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area,
                           lv_color_t *color_p)
 {
-    esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,   /* 把 area 区域像素送显 */
-                              area->x2 + 1, area->y2 + 1, color_p);
+    if (lv_disp_get_rotation(NULL) != LV_DISP_ROT_NONE) {
+        uint32_t w   = (uint32_t)(area->x2 - area->x1 + 1);
+        uint32_t h   = (uint32_t)(area->y2 - area->y1 + 1);
+        uint32_t len = w * h * sizeof(lv_color_t);
+
+        if (s_rot_stage && len <= ROT_STAGE_BYTES) {
+            memcpy(s_rot_stage, color_p, len);      /* 汇总到内部 DMA RAM */
+            lcd_draw_bitmap_sync(area->x1, area->y1, area->x2 + 1, area->y2 + 1, s_rot_stage);
+        } else {
+            /* 兜底: 超大可走原路 (旋转块正常不会超过 LV_DISP_ROT_MAX_BUF) */
+            lcd_draw_bitmap_sync(area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+        }
+    } else {
+        esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,   /* 把 area 区域像素送显 */
+                                  area->x2 + 1, area->y2 + 1, color_p);
+    }
     lv_disp_flush_ready(disp_drv);   /* 通知 LVGL 本次刷新完成 */
 }
 
@@ -117,6 +194,11 @@ void ui_core_display_init(void)
     s_disp_drv.ver_res  = TFT_VER_RES;
     s_disp_drv.flush_cb = my_disp_flush;
     s_disp_drv.draw_buf = &s_draw_buf_dsc;
+    /* 允许运行期软件旋转 (设置页的 WiFi 密码键盘是横屏): 不打开这个开关,
+     * lv_disp_set_rotation() 只会记下角度, 不会真的把像素转过来.
+     * 旋转时 LVGL 用 LV_DISP_ROT_MAX_BUF (lv_conf.h, 2KB) 分块转,
+     * 每块都是一次同步刷屏 —— 见 my_disp_flush 里的说明. */
+    s_disp_drv.sw_rotate = 1;
     lv_disp_drv_register(&s_disp_drv);
 
     /* 屏底色钉成近黑.
