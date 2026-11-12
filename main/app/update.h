@@ -79,10 +79,15 @@ int update_check(void);
  * 返回 upd_err_t; 成功时 otadata 已指向新槽, 由调用方决定何时重启. */
 int update_start(void);
 
+/* 服务器地址字符串上限. GitHub 那条 URL 是 105 字节, gh-proxy 前缀 21 —— 256 够放
+ * 两倍余量, 同时限定串口命令行的长度. */
+#define UPDATE_URL_MAX 256
+
 /* 服务器地址 (存 NVS, 换服务器不用重编):
  *   api = 版本接口的完整 URL
  *   dlp = 下载地址前缀; 局域网调试服务器可以直接给绝对地址, 这里留空串
- * 没设置过就用编译期默认值 (gh-proxy + GitHub Releases). */
+ * 没设置过就用编译期默认值 (gh-proxy + GitHub Releases).
+ * 任一参数为 NULL 表示"这个不取". */
 void update_server_get(char *api, size_t api_sz, char *dlp, size_t dlp_sz);
 bool update_server_set(const char *api, const char *dlp);
 bool update_server_reset(void);   /* 抹掉 NVS 里的两个键, 回到编译期默认值 */

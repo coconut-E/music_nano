@@ -12,19 +12,32 @@
  * PSRAM 只有 2MB. 所以暂存缓冲是 256KB 一块 (UPD_STAGE_BYTES): 读满就停止 read
  * (不关连接、不碰 esp_wifi_*; TCP 窗口关死, 服务端自己会停), 写完这块再继续读.
  *
- * 为什么写 flash 要 4KB 一步 + 每步 vTaskDelay
- * --------------------------------------------
- * 写 flash 的窗口里 cache 是关的, 另一个核取不到指令. 擦一个 4KB 扇区约 25~50ms,
- * 连续擦 2.2MB 就是十几秒的整机卡死 (界面、音频、蓝牙全停). 所以每写 4KB 就让出
- * 一次 CPU, 把停顿切成一片一片, 让别的任务每 ~35ms 能拿到一次执行机会.
+ * 为什么写 flash 要分步 + 每步 vTaskDelay
+ * ---------------------------------------
+ * 写 flash 的窗口里 cache 是关的, 另一个核取不到指令. 实测 (flashspd 0.7.28):
+ * 擦一个 4KB 扇区 17.7ms, 写 4KB ~137ms, 所以 16KB 一步要 ~617ms 全程关 cache.
+ * 2.39MB 连续写就是 90 秒的整机卡死 (界面、音频、蓝牙全停). 所以每步之后按
+ * 写耗时的 1/9 让出 CPU (见循环里的 rest_ms), 把停顿切成一片一片.
  *
- * 为什么不能把 PSRAM 指针直接交给 esp_ota_write
- * ---------------------------------------------
+ * 为什么写 flash 要先 memcpy 到 4KB 内部缓冲 ("中转")
+ * --------------------------------------------------
  * ESP32 主 flash (SPI1) 的 supports_direct_write() 恒为 false
  * (components/hal/spi_flash_hal.c:155), 于是 esp_flash_api.c:1128 的 direct_write
- * 为 false, 会退化成"32 字节一次"的 temp_buf 拷贝 —— 2.2MB 就是 6.9 万次 cache
- * 开关, 比整段停一次还糟. 所以先 memcpy 搬进一块 4KB 的内部 RAM
- * (UPD_BOUNCE_BYTES), 从内部 RAM 写走 direct 路径.
+ * 只取决于源在不在 DRAM:
+ *   源在内部 RAM → 一次 MAX_WRITE_CHUNK 传下去;
+ *   源在 PSRAM    → 退化成 32 字节一段, 每段关一次 cache 再 memcpy (esp_flash_api.c:1152-1153).
+ * 这个差别实测正好是一倍 (flashspd 0.7.28, 每一项都带回读校验):
+ *   写 16KB 源内部 RAM   545,644 us (29.3 KB/s)
+ *   写 16KB 源 PSRAM   1,130,545 us (14.2 KB/s)   ← 以前 OTA 走的就是这条
+ *   擦 16KB (4×4KB 扇区)  70,683 us
+ *   线上单步 1.223s = 1,131 (PSRAM 写) + 71 (擦) + 21 (开销), 分毫不差.
+ * 所以现在: 下载仍落 PSRAM 暂存 (便宜), 写之前把这一小段搬进 4KB 内部缓冲,
+ * 让 esp_flash_write 走快路径。单步 1.223s → ~0.62s, 2.39MB 的写阶段 183s → 92s.
+ * 4KB 这个尺寸也是 flashspd 的 C3 项验证过的: 4KB×4 与直接 16KB 同样快, 只多 2.6ms.
+ *
+ * 以前删掉过这块缓冲, 理由是"下载时 8bit 内部堆只剩 2~3KB, 4KB 申请不到, 申请到
+ * 也会饿死 WiFi 收包". 现在条件变了: WiFi 的收包缓冲已搬进私有堆 (app/wifi_arena.c),
+ * 公共内部堆在下载开始时实测 27KB / 最大连续块 13KB, 4KB 拿得到.
  *
  * 为什么用 OTA_WITH_SEQUENTIAL_WRITES
  * -----------------------------------
@@ -43,6 +56,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -71,24 +87,35 @@ static const char *TAG = "UPDATE";
 #define UPD_NVS_API   "api"
 #define UPD_NVS_DLP   "dlp"
 
-#define UPD_URL_MAX   384
+#define UPD_URL_MAX   UPDATE_URL_MAX
 #define UPD_UA_MAX    48
 
 /* GitHub 返回的 JSON 上限. per_page=5、一个 release 连正文也就几 KB,
  * 超过这个数就认为不是我们能认的东西, 直接报错 (不截断解析, 免得解析出半个字段) */
 #define UPD_JSON_MAX  (24 * 1024)
 
-/* 暂存块 / 写 flash 的步长 */
-#define UPD_STAGE_BYTES   (256 * 1024)
-#define UPD_BOUNCE_BYTES  4096
-/* 每写 4KB 让出 CPU 的时间. CONFIG_FREERTOS_HZ=1000, 所以 2 就是 2ms ——
- * 一次扇区擦写要 25~50ms, 这个空档让界面能画一帧. 改大只会拖慢总时长. */
-#define UPD_STEP_DELAY_MS 2
+/* 暂存块 / 写 flash 的步长.
+ * STAGE 从 256KB 降到 64KB: 收满一整段就要停下去写 flash, 这期间 TCP 窗口关死,
+ * 服务器 sendall 只能干等 —— 实测 256KB 一段会让 2.3MB 的升级反复卡 30~120 秒.
+ * 64KB 一段时停顿只有 1/4, 网络和 flash 轮流跑, 总时长反而更短.
+ * WRITE_STEP 4KB → 16KB: 每次 esp_ota_write 都要关一次 cache 并判擦除边界,
+ * 步长太小等于一直在付固定开销. */
+#define UPD_STAGE_BYTES   (64 * 1024)
+#define UPD_WRITE_STEP    (16 * 1024)
+/* 写 flash 之前的中转块 (内部 RAM). 只要源在 DRAM, esp_flash_write 就走快路径,
+ * 与块大小无关; 4KB 是 flashspd 验过的尺寸 (4KB×4 与 16KB×1 同样快, 多付 2.6ms).
+ * 选小一点也是为了下载期间别把内部 DMA 池占太多. */
+#define UPD_RELAY_BYTES   (4 * 1024)
+/* 每步之后最少让出多少毫秒 (写耗时 1/9 ≈ 90% 时间给烧写, 10% 让 CPU 取指令) */
+#define UPD_STEP_DELAY_MS 1
 
 /* busy 期间电源键无效, 每个网络动作都必须有硬上限, 否则会锁死在退不出去的页面 */
 #define UPD_TMO_CONNECT_MS  5000      /* 建连 + TLS 握手 + 收响应头 */
-#define UPD_TMO_READ_MS     10000     /* 下载时单次 read 的空闲超时 */
-#define UPD_TMO_TOTAL_MS    180000    /* 整个下载+写入的上限 */
+#define UPD_TMO_READ_MS     20000     /* 下载时单次 read 的空闲超时 (重传退避可能到 24 秒) */
+#define UPD_TMO_TOTAL_MS    600000    /* 整个下载+写入的上限 (10 分钟, 只兜底) */
+#define UPD_READ_BUF        2048      /* 下载用的内部缓冲 = 单次 transport read 的上限 */
+#define UPD_READ_CHUNK      4096      /* 单次 esp_http_client_read 的长度 */
+#define UPD_READ_RETRY      6         /* 连续这么多次读不到数据才放弃 (每次前等 50ms) */
 
 /* 证书: 由 CMakeLists 的 EMBED_TXTFILES 打进来 (PEM 末尾自带 NUL).
  * 内容是"本地自签 CA + ISRG Root X1 (+X2)"拼在一起 —— mbedtls 支持一个 buffer
@@ -99,10 +126,35 @@ extern const char ota_ca_pem_start[] asm("_binary_ota_ca_pem_start");
 
 static upd_status_t s_st;
 
-/* 版本查询的结果留到用户点「更新」时用 (update_start 只认 READY) */
-static char     s_dl_url[UPD_URL_MAX * 2];
-static char     s_sha[65];     /* 服务器给的 sha256 (空串 = 没有/不校验) */
-static uint32_t s_expect;      /* 固件总长 (JSON 里的 size) */
+/* 服务器上的那一份固件 (解析 JSON 的产物, 也会被拷进 upd_target_t) */
+typedef struct {
+    char     ver[24];
+    char     url[UPD_URL_MAX];
+    uint32_t size;
+    char     sha[65];       /* 空串 = 服务器没给 sha256 */
+} asset_t;
+
+/* 版本查询的结果留到用户点「更新」时用 (update_start 只认 READY).
+ *
+ * 整块放 PSRAM, 而且是"一次申请, 反复用": 里面不但有结果, 还有解析过程中的
+ * 两个 URL 和 asset_t. 为什么费这个劲:
+ *   1) .bss 每 1 字节都从 DRAM 里扣, 而 DRAM 正是 WiFi 收发缓冲要的池子;
+ *   2) 局部数组占的是 **任务栈**, 而这条路径最深的栈就在 mbedtls 握手 —— 之前
+ *      把 api/dlp/asset 放在 update_check 的栈上 (约 1.1KB), 直接把 wifi 任务的
+ *      6KB 栈压爆, 表现为 newlib 建锁时 malloc 失败 → abort (见 locks.c:77).
+ * 规则: 给 DMA 用的必须内部 RAM, 只给 CPU 读的大块一律 PSRAM. */
+typedef struct {
+    /* dlp(<=255) + browser_download_url(<=255) + NUL: 留 2 倍再 +1,
+     * 免得 snprintf 报 format-truncation (PSRAM 里多 300 字节无所谓) */
+    char     url[UPD_URL_MAX * 2 + 1];   /* 下载地址 = dlp + browser_download_url */
+    char     sha[65];                    /* 服务器给的 sha256 (空串 = 没有/不校验) */
+    char     api[UPD_URL_MAX];           /* 版本接口 URL (NVS 或编译期默认值) */
+    char     dlp[UPD_URL_MAX];           /* 下载地址前缀 (局域网调试时为空串) */
+    asset_t  asset;                      /* 解析结果 */
+} upd_target_t;
+
+static upd_target_t *s_tgt;     /* PSRAM, update_check() 里申请, update_reset() 释放 */
+static uint32_t      s_expect;  /* 固件总长 (JSON 里的 size) */
 
 /* ── 小工具 ── */
 
@@ -201,13 +253,6 @@ static bool take_str(const char *p, char *out, size_t out_sz)
     return true;
 }
 
-typedef struct {
-    char     ver[24];
-    char     url[UPD_URL_MAX];
-    uint32_t size;
-    char     sha[65];       /* 空串 = 服务器没给 sha256 */
-} asset_t;
-
 /* 从 GitHub 的 releases JSON 里挑出"版本最高的 music_nano x.y.z.bin".
  * 这不是通用 JSON 解析器, 只认 GitHub 这一套固定字段顺序:
  *   {..., "name":"music_nano 0.7.9.bin", ..., "size":2200256, ..., "browser_download_url":"..."}
@@ -280,15 +325,17 @@ static int parse_releases(char *json, asset_t *best)
 
 /* ── HTTP ── */
 
-/* 建连 + 发请求头, 不读 body (esp_http_client_perform 会把 body 读完丢掉, 不能用) */
-static esp_http_client_handle_t http_open(const char *url, int timeout_ms)
+/* 建连 + 发请求头, 不读 body (esp_http_client_perform 会把 body 读完丢掉, 不能用).
+ * buf 是内部缓冲大小: 版本查询用 1KB (省内存), 下载用 4KB —— 它同时也是单次
+ * esp_transport_read 的上限, 1KB 时每 4KB 数据要来回 4 次. */
+static esp_http_client_handle_t http_open(const char *url, int timeout_ms, int buf)
 {
     esp_http_client_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.url        = url;
     cfg.cert_pem   = ota_ca_pem_start;
     cfg.timeout_ms = timeout_ms;
-    cfg.buffer_size = 2048;
+    cfg.buffer_size = buf;
 
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) {
@@ -302,19 +349,52 @@ static esp_http_client_handle_t http_open(const char *url, int timeout_ms)
     esp_http_client_set_header(c, "User-Agent", ua);
     esp_http_client_set_header(c, "Accept", "application/vnd.github+json");
 
+    /* 握手前先量一次栈余量: 这条路径最深的一段在 mbedtls 里, 曾经把 worker 的
+     * 6KB 栈压爆 (newlib 建锁时 malloc 失败 → abort, locks.c:77). 这两个数字
+     * 以后就是"TLS 到底需要多少栈"的依据. */
+    ESP_LOGI(TAG, "建连前栈余量 %u B", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    /* 探针: 自己先要一个 socket 再关掉. 它能把 esp-tls 那句 "Failed to create
+     * socket" 的两种原因分开 —— 探针也失败 = lwIP 侧真没资源 (EMFILE 槽位耗尽 /
+     * ENOMEM 内部 8bit 内存不够); 探针成功而 http 失败 = 问题在 esp-tls 的建连流程. */
+    int probe = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe < 0) {
+        ESP_LOGE(TAG, "socket 探针失败: errno=%d (EMFILE=%d ENOMEM=%d)",
+                 errno, EMFILE, ENOMEM);
+    } else {
+        ESP_LOGI(TAG, "socket 探针正常 (fd=%d)", probe);
+        close(probe);
+    }
+
     esp_err_t e = esp_http_client_open(c, 0);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "打开 %s 失败: %s", url, esp_err_to_name(e));
+        /* 失败原因基本就两种, 靠 errno 区分:
+         *   ENOMEM  → socket() 内部要建的 netconn 收件箱/信号量拿不到内部 8bit 内存
+         *             (TLS 缓冲可以放 PSRAM, 这几个小对象不行);
+         *   EMFILE  → 10 个 socket 槽用完了 (漏了), 见下面显式 close.
+         * 所以这里把 errno 和两组堆数字一起打出来, 一次上机就能定性. */
+        ESP_LOGE(TAG, "打开 %s 失败: %s, errno=%d, 8bit内部 %u/最大块 %u, DMA %u/最大块 %u",
+                 url, esp_err_to_name(e), errno,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        /* esp_http_client_close() 只在 state>INIT 时才关 fd (esp_http_client.c),
+         * 而 connect 失败时 state 还停在 INIT —— 它不会关. 这里照样先调一次
+         * (成功连接后走到这儿的路径需要它), 再 destroy 保证把 socket 收干净. */
+        esp_http_client_close(c);
         esp_http_client_cleanup(c);
         return NULL;
     }
+    ESP_LOGI(TAG, "建连完成 (含 TLS 握手), 栈余量 %u B",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return c;
 }
 
 /* 拉版本 JSON 到 buf. *status 回传 HTTP 状态码 */
 static int fetch_json(const char *url, char *buf, size_t cap, size_t *out_len, int *status)
 {
-    esp_http_client_handle_t c = http_open(url, UPD_TMO_CONNECT_MS);
+    esp_http_client_handle_t c = http_open(url, UPD_TMO_CONNECT_MS, 1024);
     if (!c) return UPD_E_NET;
 
     int64_t len = esp_http_client_fetch_headers(c);
@@ -369,10 +449,14 @@ static bool nvs_read_raw(const char *key, char *out, size_t sz)
 
 void update_server_get(char *api, size_t api_sz, char *dlp, size_t dlp_sz)
 {
-    if (!nvs_read_raw(UPD_NVS_API, api, api_sz)) snprintf(api, api_sz, "%s", UPD_DEF_API);
+    if (api && api_sz) {
+        if (!nvs_read_raw(UPD_NVS_API, api, api_sz)) snprintf(api, api_sz, "%s", UPD_DEF_API);
+    }
     /* dlp 允许是空串 (局域网调试服务器的 browser_download_url 本来就是绝对地址),
      * 所以这里只判"键在不在", 不判内容 */
-    if (!nvs_read_raw(UPD_NVS_DLP, dlp, dlp_sz)) snprintf(dlp, dlp_sz, "%s", UPD_DEF_DLP);
+    if (dlp && dlp_sz) {
+        if (!nvs_read_raw(UPD_NVS_DLP, dlp, dlp_sz)) snprintf(dlp, dlp_sz, "%s", UPD_DEF_DLP);
+    }
 }
 
 bool update_server_set(const char *api, const char *dlp){
@@ -425,9 +509,8 @@ void update_reset(void)
     memset(&s_st, 0, sizeof s_st);
     s_st.phase = UPD_IDLE;
     snprintf(s_st.cur_ver, sizeof s_st.cur_ver, "%s", esp_app_get_description()->version);
-    s_dl_url[0] = '\0';
-    s_sha[0]    = '\0';
-    s_expect    = 0;
+    if (s_tgt) { heap_caps_free(s_tgt); s_tgt = NULL; }
+    s_expect = 0;
 }
 
 int update_check(void)
@@ -435,13 +518,22 @@ int update_check(void)
     memset(&s_st, 0, sizeof s_st);
     s_st.phase = UPD_CHECKING;
     snprintf(s_st.cur_ver, sizeof s_st.cur_ver, "%s", esp_app_get_description()->version);
-    s_dl_url[0] = '\0';
-    s_sha[0]    = '\0';
-    s_expect    = 0;
+    s_expect = 0;
 
-    char api[UPD_URL_MAX], dlp[UPD_URL_MAX];
-    update_server_get(api, sizeof api, dlp, sizeof dlp);
-    ESP_LOGI(TAG, "查版本: %s", api);
+    /* 上一次流程可能留着一份 (正常 update_reset 已释放), 先清掉 */
+    if (s_tgt) { heap_caps_free(s_tgt); s_tgt = NULL; }
+    s_tgt = heap_caps_malloc(sizeof *s_tgt, MALLOC_CAP_SPIRAM);
+    if (!s_tgt) {
+        ESP_LOGE(TAG, "PSRAM 申请下载目标失败 (%u B)", (unsigned)sizeof *s_tgt);
+        goto fail_nomem;
+    }
+    s_tgt->url[0] = '\0';
+    s_tgt->sha[0] = '\0';
+
+    /* 两个 URL 直接落在 PSRAM 的 s_tgt 里: 它们要是放栈上, 这条路径最深的栈
+     * (mbedtls 握手) 就会被多压 512 字节, 之前就是这么 abort 的 */
+    update_server_get(s_tgt->api, sizeof s_tgt->api, s_tgt->dlp, sizeof s_tgt->dlp);
+    ESP_LOGI(TAG, "查版本: %s", s_tgt->api);
     ESP_LOGI(TAG, "内存: PSRAM 空闲 %u B, 内部空闲 %u B",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -454,7 +546,7 @@ int update_check(void)
 
     size_t len = 0;
     int http = 0;
-    int r = fetch_json(api, json, UPD_JSON_MAX, &len, &http);
+    int r = fetch_json(s_tgt->api, json, UPD_JSON_MAX, &len, &http);
     s_st.http = http;
     if (r != UPD_OK) {
         heap_caps_free(json);
@@ -462,33 +554,33 @@ int update_check(void)
     }
     json[len] = '\0';
 
-    asset_t a;
-    memset(&a, 0, sizeof a);
-    r = parse_releases(json, &a);
+    asset_t *a = &s_tgt->asset;
+    memset(a, 0, sizeof *a);
+    r = parse_releases(json, a);
     heap_caps_free(json);
     if (r != UPD_OK) goto fail;
-    if (a.size == 0) {
-        ESP_LOGE(TAG, "资产 %s 的 size 是 0", a.ver);
+    if (a->size == 0) {
+        ESP_LOGE(TAG, "资产 %s 的 size 是 0", a->ver);
         r = UPD_E_PARSE;
         goto fail;
     }
 
-    snprintf(s_st.new_ver, sizeof s_st.new_ver, "%s", a.ver);
+    snprintf(s_st.new_ver, sizeof s_st.new_ver, "%s", a->ver);
     ESP_LOGI(TAG, "本机 %s, 服务器最新 %s (%u B, sha=%s)",
-             s_st.cur_ver, a.ver, (unsigned)a.size, a.sha[0] ? "有" : "无");
+             s_st.cur_ver, a->ver, (unsigned)a->size, a->sha[0] ? "有" : "无");
 
-    if (ver_cmp(a.ver, s_st.cur_ver) <= 0) {
+    if (ver_cmp(a->ver, s_st.cur_ver) <= 0) {
         s_st.phase = UPD_LATEST;
         return UPD_OK;
     }
 
     /* 拼下载地址: dlp 是镜像前缀 (gh-proxy), 局域网调试服务器时为空串 */
-    snprintf(s_dl_url, sizeof s_dl_url, "%s%s", dlp, a.url);
-    snprintf(s_sha, sizeof s_sha, "%s", a.sha);
-    s_expect   = a.size;
-    s_st.total = a.size;
+    snprintf(s_tgt->url, sizeof s_tgt->url, "%s%s", s_tgt->dlp, a->url);
+    snprintf(s_tgt->sha, sizeof s_tgt->sha, "%s", a->sha);
+    s_expect   = a->size;
+    s_st.total = a->size;
     s_st.phase = UPD_READY;
-    ESP_LOGI(TAG, "发现新版本, 下载地址: %s", s_dl_url);
+    ESP_LOGI(TAG, "发现新版本, 下载地址: %s", s_tgt->url);
     return UPD_OK;
 
 fail_nomem:
@@ -511,31 +603,39 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
         return UPD_E_SWITCH;
     }
 
-    /* 两块缓冲都一次拿好: 中途再抢会撞上碎片化 (和横屏 2KB 中转缓冲同一个教训) */
-    uint8_t *stage  = heap_caps_malloc(UPD_STAGE_BYTES, MALLOC_CAP_SPIRAM);
-    uint8_t *bounce = heap_caps_malloc(UPD_BOUNCE_BYTES, MALLOC_CAP_INTERNAL);
-    if (!stage || !bounce) {
-        ESP_LOGE(TAG, "缓冲申请失败: 暂存 %s, 弹跳 %s",
-                 stage ? "ok" : "失败", bounce ? "ok" : "失败");
-        if (stage)  heap_caps_free(stage);
-        if (bounce) heap_caps_free(bounce);
+    /* 只要一块 PSRAM 暂存 (2.39MB 的固件, 内部 RAM 放不下).
+     * 下载期间 WiFi 每收一帧要 1.6KB 连续内部 RAM, 但那部分现在走私有堆
+     * (app/wifi_arena.c), 不再跟这里抢公共内部堆. */
+    uint8_t *stage = heap_caps_malloc(UPD_STAGE_BYTES, MALLOC_CAP_SPIRAM);
+    if (!stage) {
+        ESP_LOGE(TAG, "PSRAM 暂存缓冲申请失败 (%u B)", (unsigned)UPD_STAGE_BYTES);
         return UPD_E_NOMEM;
+    }
+
+    /* 写 flash 的中转块 (内部 RAM). 见文件头: 源在 PSRAM 时 esp_flash_write 会退化成
+     * 32 字节一段, 比源在 DRAM 慢一倍. 拿不到就退回直接写 PSRAM (正确, 只是慢). */
+    uint8_t *mid = heap_caps_malloc(UPD_RELAY_BYTES,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!mid) {
+        ESP_LOGW(TAG, "中转缓冲申请失败 (内部 %u B / 最大块 %u B), 写 flash 走 PSRAM 慢路径",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 
     esp_ota_handle_t h = 0;
     esp_err_t e = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &h);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin 失败: %s", esp_err_to_name(e));
+        heap_caps_free(mid);
         heap_caps_free(stage);
-        heap_caps_free(bounce);
         return UPD_E_WRITE;
     }
 
-    esp_http_client_handle_t c = http_open(url, UPD_TMO_READ_MS);
+    esp_http_client_handle_t c = http_open(url, UPD_TMO_READ_MS, UPD_READ_BUF);
     if (!c) {
         esp_ota_abort(h);
+        heap_caps_free(mid);
         heap_caps_free(stage);
-        heap_caps_free(bounce);
         return UPD_E_NET;
     }
 
@@ -547,8 +647,8 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
         esp_ota_abort(h);
+        heap_caps_free(mid);
         heap_caps_free(stage);
-        heap_caps_free(bounce);
         return UPD_E_HTTP;
     }
     if (expect == 0 && clen > 0) {
@@ -556,7 +656,16 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
         s_st.total = expect;
     }
 
-    ESP_LOGI(TAG, "开始下载 %u B 到 \"%s\"", (unsigned)expect, part->label);
+    /* Content-Length 单独打一行: 它是 -1 就说明响应没有 Length (或解析没认出来),
+     * 而 esp_http_client_read 里正是拿它判断"还有没有 body" —— 那种情况下读会
+     * 立刻返回 0, 一眼就能对上. */
+    ESP_LOGI(TAG, "开始下载 %u B 到 \"%s\" (Content-Length=%lld)",
+             (unsigned)expect, part->label, (long long)clen);
+    ESP_LOGI(TAG, "下载前内存: 内部 %u (最大块 %u) | DMA %u (最大块 %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
@@ -583,24 +692,75 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
 
         size_t got = 0;
         bool eof = false;
+        int  empty = 0;                 /* 连续"这一次没读到"的次数 */
         s_st.phase = UPD_DOWNLOADING;
         while (got < want) {
-            int r = esp_http_client_read(c, (char *)stage + got, (int)(want - got));
-            if (r <= 0) { eof = true; break; }
-            mbedtls_sha256_update(&sha, stage + got, (size_t)r);
-            got += (size_t)r;
-            s_st.dl += (uint32_t)r;
+            size_t ask = want - got;
+            if (ask > UPD_READ_CHUNK) ask = UPD_READ_CHUNK;
+
+            int64_t tr0 = esp_timer_get_time();
+            int r = esp_http_client_read(c, (char *)stage + got, (int)ask);
+            int64_t tms = (esp_timer_get_time() - tr0) / 1000;
+
+            if (r > 0) {
+                empty = 0;
+                mbedtls_sha256_update(&sha, stage + got, (size_t)r);
+                got += (size_t)r;
+                s_st.dl += (uint32_t)r;
+                if (tms > 500) {
+                    ESP_LOGW(TAG, "read 慢: %d B, 累计 %u B, 耗时 %lld ms",
+                             r, (unsigned)(off + got), (long long)tms);
+                }
+                continue;
+            }
+
+            /* r <= 0 不等于"下载结束": esp_http_client_read 这一次没读到会返回 0,
+             * 读超时返回 -ESP_ERR_HTTP_EAGAIN (esp_http_client.c:1378-1397).
+             * 真正的结束只有两种: 收够 Content-Length, 或对端 FIN. */
+            ESP_LOGW(TAG, "read=%d errno=%d 耗时 %lld ms, 已收 %u/%u, complete=%d",
+                     r, errno, (long long)tms, (unsigned)(off + got), (unsigned)expect,
+                     (int)esp_http_client_is_complete_data_received(c));
+            if (esp_http_client_is_complete_data_received(c)) { eof = true; break; }
+            if (++empty >= UPD_READ_RETRY) {
+                ESP_LOGE(TAG, "连续 %d 次读不到数据, 放弃", empty);
+                ret = UPD_E_NET;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
+        if (ret != UPD_OK) break;
         if (got == 0) break;
 
-        /* 2) 写进 flash: 4KB 一步, 每步让出 CPU */
+        /* 2) 写进 flash: 4KB 一步, 每步让出 CPU.
+         *    源直接给 PSRAM 的 stage —— esp_flash_write 会自己按 32 字节一段搬到
+         *    栈上再写 (esp_flash_api.c:1152 的 temp_buf[8]), 正确但慢一点.
+         *    慢的代价换的是: 这 2.2MB 期间内部 RAM 一点不占, WiFi 收包不受影响.
+         *
+         *    节奏按 3:1 让出: 写 flash 期间 cache 是关的, 别的任务 (WiFi 收包)
+         *    取不了指令. 所以写多久就歇三分之一 —— 75% 的时间给烧写, 25% 留给
+         *    CPU 取指令. 按实测写耗时反推, 比固定 2ms 更贴合这颗慢 flash. */
         s_st.phase = UPD_WRITING;
+        int64_t tw = 0;
         for (size_t done = 0; done < got; ) {
             size_t n = got - done;
-            if (n > UPD_BOUNCE_BYTES) n = UPD_BOUNCE_BYTES;
+            if (n > UPD_WRITE_STEP) n = UPD_WRITE_STEP;
 
-            memcpy(bounce, stage + done, n);        /* 此刻 cache 开着, 读 PSRAM 安全 */
-            e = esp_ota_write(h, bounce, n);        /* 内部 RAM 源 → direct 路径 */
+            int64_t ts = esp_timer_get_time();
+            if (mid) {
+                /* 经内部中转再写: esp_flash_write 只有源在 DRAM 时才走快路径
+                 * (esp_flash_api.c:1128), 源在 PSRAM 会退化成 32 字节一段, 慢一倍. */
+                e = ESP_OK;
+                for (size_t o = 0; o < n && e == ESP_OK; o += UPD_RELAY_BYTES) {
+                    size_t m = n - o;
+                    if (m > UPD_RELAY_BYTES) m = UPD_RELAY_BYTES;
+                    memcpy(mid, stage + done + o, m);
+                    e = esp_ota_write(h, mid, m);
+                }
+            } else {
+                e = esp_ota_write(h, stage + done, n);   /* 没中转块: 直接写 (慢一倍) */
+            }
+            tw = esp_timer_get_time() - ts;
+
             if (e != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_write 失败 (off=%u): %s", (unsigned)off, esp_err_to_name(e));
                 ret = UPD_E_WRITE;
@@ -609,14 +769,33 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
             done += n;
             off  += n;
             s_st.wr = off;
-            vTaskDelay(pdMS_TO_TICKS(UPD_STEP_DELAY_MS));
+
+            uint32_t rest_ms = (uint32_t)(tw / 9000);      /* 1/9 的写入耗时 ≈ 90% 给烧写 */
+            if (rest_ms < UPD_STEP_DELAY_MS) rest_ms = UPD_STEP_DELAY_MS;
+            vTaskDelay(pdMS_TO_TICKS(rest_ms));
         }
         if (ret != UPD_OK) break;
+
+        int64_t el_ms = (esp_timer_get_time() - t0) / 1000;
+        ESP_LOGI(TAG, "已写 %u/%u B, %lld ms (%.1f KB/s), 单步写 %lld us | "
+                      "内部 %u (最大 %u) DMA %u (最大 %u)",
+                 (unsigned)off, (unsigned)expect, (long long)el_ms,
+                 el_ms > 0 ? (double)off / 1024.0 * 1000.0 / (double)el_ms : 0.0,
+                 (long long)tw,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
         if (eof) break;
     }
 
+    /* 关闭也计时: 如果这 10 秒卡在 close 而不是 read, 那说明 TLS close_notify
+     * 撞上了满的发送缓冲 (服务端还在灌 2MB, 我们这边不读了) */
+    int64_t tc0 = esp_timer_get_time();
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
+    ESP_LOGI(TAG, "关闭连接耗时 %lld ms",
+             (long long)((esp_timer_get_time() - tc0) / 1000));
 
     if (ret == UPD_OK && expect && off != expect) {
         ESP_LOGE(TAG, "下载不完整: %u/%u 字节", (unsigned)off, (unsigned)expect);
@@ -657,8 +836,8 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
     }
 
     mbedtls_sha256_free(&sha);
+    heap_caps_free(mid);
     heap_caps_free(stage);
-    heap_caps_free(bounce);
 
     if (ret == UPD_OK) {
         int64_t ms = (esp_timer_get_time() - t0) / 1000;
@@ -671,7 +850,7 @@ static int ota_run(const char *url, uint32_t expect, const char *sha_hex)
 
 int update_start(void)
 {
-    if (s_st.phase != UPD_READY || !s_dl_url[0]) {
+    if (s_st.phase != UPD_READY || !s_tgt || !s_tgt->url[0]) {
         ESP_LOGE(TAG, "没有可升级的版本 (phase=%d)", (int)s_st.phase);
         return UPD_E_PARSE;
     }
@@ -695,8 +874,8 @@ int update_start(void)
     s_st.dl    = 0;
     s_st.wr    = 0;
 
-    /* 下载地址和 sha256 都是 update_check 时存下来的 */
-    int r = ota_run(s_dl_url, s_expect, s_sha);
+    /* 下载地址和 sha256 都是 update_check 时存下来的 (都在 PSRAM 的 s_tgt 里) */
+    int r = ota_run(s_tgt->url, s_expect, s_tgt->sha);
     ESP_LOGI(TAG, "任务栈余量 %u B", (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     if (r == UPD_OK) {

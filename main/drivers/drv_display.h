@@ -25,6 +25,10 @@ esp_lcd_panel_handle_t lcd_get_panel(void);
 esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
                                const void *color_data);
 
+/* 只等 SPI 在途事务排空 (DMA 屏障), 不动画面.
+ * 竖屏刷屏是异步入队的, 复用/转交某块缓冲之前要它确认 DMA 已经不再读那块内存. */
+esp_err_t lcd_wait_idle(void);
+
 /* 背光亮度 (LEDC PWM, 0~255) */
 void lcd_set_brightness(uint8_t level);
 

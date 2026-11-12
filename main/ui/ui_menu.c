@@ -6,6 +6,7 @@
  * leave/enter 负责. */
 #include "freertos/FreeRTOS.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "lvgl.h"
 #include "ui_core.h"
 #include "ui_res.h"
@@ -91,6 +92,15 @@ static lv_obj_t *make_row(int idx)
 void ui_menu_build(void)
 {
     if (s_root) return;                        /* 幂等: 已建好就不重建 */
+
+    /* 进菜单是这台机器最干净的时刻: app_mode 的 mode_music_leave 已经停播、挂起音频
+     * 任务、挂起蓝牙, 既没有 PCM 生产者, 也没有协议栈事件在跑 —— 所以这一行数字最适合
+     * 当"内部 RAM 基线"看 (后来 WiFi 流程里那个见底的数字跟它比). */
+    ESP_LOGI(TAG, "进菜单: 内部空闲 %u B (最大块 %u), DMA 空闲 %u B (最大块 %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
     s_root = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(s_root);

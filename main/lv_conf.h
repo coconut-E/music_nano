@@ -168,11 +168,11 @@
 /*Maximum buffer size to allocate for rotation.
  *Only used if software rotation is enabled in the display driver.
  *
- * 2KB (不是 4KB/10KB): 设置页开 WiFi 时内部堆只剩 ~12KB 且高度碎片化.
- * 这块临时缓冲由 lv_mem_buf_get() (malloc) 申请, 一旦落到 PSRAM, SPI 驱动就会再要一块
- * 同样大小的 DMA "反射缓冲"(spi_master.c:1213), 两块都得从内部堆出.
- * 2KB 时两边都只有 1.9KB 级, 在剩下的碎片里能找到位置; 代价是横屏一帧 3 行/块,
- * 整屏约 11ms 传输 + 2ms 命令开销, 键盘页无感. */
+ * 保持 2KB: 这块临时缓冲由 lv_mem_buf_get() (malloc) 申请, 池子紧的时候会落到
+ * IRAM/PSRAM —— 不满足 SPI DMA, 所以 flush 里还要再过一遍 1KB 的内部中转缓冲
+ * (ui_core.c 的 s_rot_stage), 按"面板行"分段发.
+ * 也就是说: 这里定的是"LVGL 一次转多少像素", 中转缓冲定的是"一次发多少字节",
+ * 两者不再互相牵制. 2KB → 3 行/块, 整屏约 57 次 SPI 事务 (1KB 中转 → 114 次). */
 #define LV_DISP_ROT_MAX_BUF (2*1024)
 
 /*-------------

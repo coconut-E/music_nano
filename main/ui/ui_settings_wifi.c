@@ -9,25 +9,27 @@
  * notice_build(), 到点和按电源键都是同一个 flow_exit() —— 加一种结果不需要
  * 再写一套"删页面 + 停定时器 + 收尾"的代码.
  *
- * 为什么连接失败要退出整个流程, 而不是退回列表
- * ----------------------------------------------
- * 横屏页要一块 2KB 的"内部 DMA 中转缓冲"(见 ui_core.c 的 s_rot_stage), 这块缓冲只在
- * WIFI_EV_READY 那一刻好拿: 此时 esp_wifi_init 刚结束、列表页还没建, DMA 池有 ~12KB.
- * 等列表页建完就只剩 ~900B (实测持有时 943B/最大连续块 304B), 中途再也抢不到 2KB.
- * 而"连接失败 -> 回列表 -> 重扫 -> 再进密码页"这条路径恰恰要求中途重新申请,
- * 于是必然花屏 (Failed to allocate priv TX buffer).
- * 现在改成失败即退出: 每次重试都是一次全新的流程入口, 也就回到了那个 12KB 的时刻.
+ * 横屏缓冲只有一次好时机
+ * ------------------------
+ * 横屏页要一块 1KB 的"内部 DMA 中转缓冲"(见 ui_core.c 的 s_rot_stage), 这块缓冲只在
+ * WIFI_EV_READY 那一刻好拿: esp_wifi_init 刚结束、列表页还没建, 池子最宽裕.
+ * 实测那一刻 DMA 池 free 2755B / 最大连续块 1792B; 等列表页建完只剩 ~550B
+ * (最大连续块 368B), 连 1KB 都拼不出来, 所以"中途重新申请"这条路是必失败的.
+ * 而"连接失败 -> 回列表 -> 重扫 -> 再进密码页"恰恰要求中途重新申请 ——
+ * 现在改成失败即退出流程: 每次重试都是一次全新的入口, 也就回到了那个时刻.
  *
  * 统一出口
  * --------
- * 电源键 / 左上角返回 / 失败页 2 秒超时, 三个入口全部只调 ui_wifi_back() 或 flow_exit(),
- * 最终都走同一个 flow_exit() -> wifi_mgr_release() -> WIFI_EV_RELEASED ->
- * ui_wifi_destroy(). 任何新增的退出路径都不许自己拼收尾代码, 否则迟早漏掉一处.
+ * 电源键 / 左上角返回 / 结果提示页按返回, 三个入口全部只调 ui_wifi_back() 或 flow_exit().
+ * 收尾本身只有两处触发: 提示页出现时 (notice_build 末尾, 后台拆 WiFi + 装回蓝牙),
+ * 或直接退出时 (flow_exit -> wifi_mgr_release()); 两条都汇到 WIFI_EV_RELEASED ->
+ * ui_wifi_destroy(). 提示页那条路在 RELEASED 之后只置 s_released, 等用户按返回再关页面,
+ * 所以 flow_exit 里要判断"是不是已经释放完". 任何新增退出路径都不许自己拼收尾代码.
  *
  * 记住密码
  * --------
  * 连成功一次就把 "SSID + 密码" 写进 NVS (见 app/wifi_cred.c). 下次在列表里选中同一台
- * 点「连接」, 直接用记住的密码连, 密码页整个跳过 —— 连带着那块 2KB 横屏缓冲都不用申请.
+ * 点「连接」, 直接用记住的密码连, 密码页整个跳过 —— 连带着那块横屏缓冲都不用申请.
  * 只有失败原因是"密码错" (IDF 的 4WAY_HANDSHAKE_TIMEOUT) 才删掉这条记录;
  * 找不到 AP / 超时都保留, 那不是密码的问题. 删掉之后下次进流程会重新弹密码页.
  *
@@ -49,7 +51,8 @@
  * ------------
  * 扫描/连接/释放期间 s_busy=true: 电源键与左上角返回全部无反应 (另外还置了
  * power_mgr_set_ui_inhibit, 连无操作熄屏一起挡住), 没有弹窗, 就是按了没反应.
- * "连接失败"提示页是唯一 s_busy=false 的过渡页: 那 2 秒里按电源键可以立刻走.
+ * "连接失败"这类结果提示页是唯一 s_busy=false 的页面: 出现 1 秒后按返回键可以走
+ * (那 1 秒在等蓝牙装回, 见 notice_build). 其余结果页同理, 只有"更新完成"自动走.
  * WiFi 的清理只在流程真正结束时做一次, 且由 wifi_mgr 的任务跑完手上的操作后执行. */
 
 #include <stdio.h>
@@ -59,8 +62,10 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 
+#include "bt_a2dp.h"
 #include "power_mgr.h"
 #include "ui_core.h"
 #include "ui_settings_wifi.h"
@@ -106,10 +111,20 @@ typedef enum {
     WP_NOTICE,      /* 结果提示 (失败原因/已是最新/更新完成), 到点自动退出 */
 } wpage_t;
 
-/* 提示页停留时长 */
-#define NOTICE_HOLD_MS     2000   /* 连接失败 / 已是最新 */
-#define NOTICE_HOLD_ERR    3000   /* 带原因的失败 */
-#define NOTICE_HOLD_DONE   1500   /* 更新完成, 即将重启 */
+/* 提示页停留时长.
+ * 除了「更新完成」那条 (它要重启, 留着定时器), 其余结果页都不自动退出,
+ * 由用户按返回键关页面 —— 只是关页面, 资源早就在后台收完了.
+ *
+ * 收尾什么时候做: 提示页一出现就做 (notice_build 末尾发 RELEASE), 藏在停留时间
+ * 和 1 秒防误触后面. 顺序固定为"拆 WiFi → 装蓝牙"(wifi_mgr.c 的 worker),
+ * 装蓝牙时内部堆已经有 61KB, 不会再出现 bt_workqueue 分不出来.
+ *
+ * 曾经的错法: 提示页出现 150ms 后在 LVGL 任务里直接 bt_mem_trim(false). 那一刻
+ * WiFi 还活着 (内部只剩 2~3KB), bt_workqueue 分配失败 → BTU 的失败清理路径又去
+ * 释放已经释放过的 alarm hash map (bta_sys_main.c:193-200 释放后不置 NULL) →
+ * 读到野指针 → assert "free() target pointer is outside heap areas". */
+#define NOTICE_HOLD_DONE   1500   /* 更新完成, 即将重启 (唯一保留的自动退出) */
+#define NOTICE_LOCK_MS     1000   /* 出现后这么久之内不认返回键 */
 
 /* WiFi 断开原因里的"密码错": IDF 的 WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT.
  * 只有这个原因才删掉 NVS 里记的密码 —— 热点没开/信号差/超时都不是密码的问题,
@@ -119,10 +134,12 @@ typedef enum {
 static wpage_t     s_page;
 static bool        s_busy;          /* 有 WiFi 操作在跑: 一切退出入口无效 */
 static bool        s_session;       /* 本次进入流程后有一次 WiFi 会话没结束 */
+static bool        s_released;      /* WiFi 已经释放干净 (提示页期间就可能完成) */
 static bool        s_leaving;       /* 已经决定退出, flow_exit 只走一次 */
 static bool        s_pass_from_nvs; /* 本次连接用的是 NVS 里记住的密码 (没走密码页) */
 static bool        s_cred_dropped;  /* 记忆的密码被判无效并删除 (失败页要说明) */
 static lv_timer_t *s_timer;         /* 事件轮询 (100ms) + 小动画 */
+static int64_t     s_notice_us;     /* 提示页出现的时刻 (用于"头 1 秒不认返回") */
 static void      (*s_end_cb)(void);
 
 static char s_sel[33];              /* 选中的 SSID */
@@ -175,7 +192,8 @@ static int         s_prog_tick;
 
 /* 前向声明 (页面之间互相跳转) */
 static void list_build(void);
-static void pass_build(void);
+static void list_delete(void);
+static bool pass_build(void);
 static void pass_delete(void);
 static void conn_page_delete(void);
 static void prog_delete(void);
@@ -283,6 +301,27 @@ static void rows_clear(void)
     }
     s_row_n = 0;
     if (s_rows) lv_obj_clean(s_rows);
+}
+
+/* 删掉整个列表页 (页面 + 行 + 提示 + 状态行 + 两个按钮).
+ *
+ * 除了流程收尾, 连接前也会调一次: 这一页几十个 LVGL 对象是**连续**从内部堆里要的,
+ * 删掉能还给 WiFi 一大块连续 DMA 空间 —— 而 WiFi 每发/收发一帧要 ~1.6KB 连续缓冲.
+ * 实测不删的话连接时"最大连续块"只有 1024B, 结果是关联成功、DISCOVER 发不出去、
+ * 20 秒拿不到 IP (最后 reason=8). 连接之后流程不会再回列表, 所以提前删是安全的. */
+static void list_delete(void)
+{
+    if (s_list_pg) {
+        lv_obj_del(s_list_pg);
+        s_list_pg  = NULL;
+        s_rows     = NULL;
+        s_hint     = NULL;
+        s_status   = NULL;
+        s_back_btn = NULL;
+        s_btn_scan = NULL;
+        s_btn_conn = NULL;
+    }
+    rows_clear();
 }
 
 /* 空列表 / 扫描中的提示 */
@@ -443,7 +482,7 @@ static void conn_cb(lv_event_t *e)
     rows_clear();
 
     /* 这台机器以前连成功过: 直接用记住的密码, 密码页整个跳过.
-     * 少了那一页, 也就不用那块 2KB 横屏中转缓冲 —— 少一个出错的地方. */
+     * 少了那一页, 也就不用那块横屏中转缓冲 —— 少一个出错的地方. */
     if (wifi_cred_load(s_sel, s_pass, sizeof s_pass)) {
         s_pass_from_nvs = true;
         start_connect();
@@ -451,7 +490,14 @@ static void conn_cb(lv_event_t *e)
     }
 
     s_pass_from_nvs = false;
-    pass_build();
+    if (!pass_build()) {
+        /* 中转缓冲拿不到: 这一页建出来必花屏, 不如明确拒绝. 不立刻 flow_exit,
+         * 让提示页停 3 秒再自己走 (定时器到点和电源键都是同一个出口). */
+        s_page = WP_NOTICE;
+        set_busy(false);
+        notice_build("内存不足", "无法显示密码页", "按返回键继续", NULL, 0);
+        return;
+    }
     s_page = WP_PASS;
 }
 
@@ -535,8 +581,8 @@ static void pass_delete(void)
  * 手输密码 (pass_confirm) 和用 NVS 里记住的密码 (conn_cb) 两条路都走这里,
  * 因为两件事必须一模一样:
  *   1. 恢复/保持竖屏 —— 连接页是竖屏的, 横屏那套到这一步就结束了;
- *   2. 先把横屏那块 2KB 中转缓冲还回去 —— 连接一开始就要发 DHCP/ARP, 每帧要
- *      ~1.6KB 的 DMA TX 缓冲, 2KB 还占着的话实测 1595B/最大连续块 800B,
+ *   2. 先把横屏那块 1KB 中转缓冲还回去 —— 连接一开始就要发 DHCP/ARP, 每帧要
+ *      ~1.6KB 的 DMA TX 缓冲, 还占着的话实测 1595B/最大连续块 800B,
  *      第一帧就 ret=-1, 后面永远拿不到 IP.
  * 释放之后不再补申请: 这个流程里横屏页不会再出现 (失败直接退出流程). */
 static void start_connect(void)
@@ -561,6 +607,14 @@ static void start_connect(void)
 
     ui_core_rot_stage_release();
     ESP_LOGI(TAG, "连网前释放横屏缓冲: DMA 可用 %u B (最大连续块 %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
+    /* 列表页也用不上了 (连接之后流程不会再回列表), 一起删掉把内部 DMA 空间还给
+     * WiFi. 不删的话连接时最大连续块只有 ~1KB, 而 WiFi 每帧要 ~1.6KB —— 表现是
+     * 关联成功、DHCP 拿不到 IP、20 秒超时 (reason=-1/8). */
+    list_delete();
+    ESP_LOGI(TAG, "连网前删掉列表页: DMA 可用 %u B (最大连续块 %u)",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
@@ -594,13 +648,14 @@ static void kb_cb(lv_event_t *e)
     /* CANCEL (键盘上的收起键): 什么都不做, 别让人误退出 */
 }
 
-static void pass_build(void)
+static bool pass_build(void)
 {
-    /* 进横屏页之前确保中转缓冲在手 (幂等: 已有就直接返回).
-     * 通常是进流程时或"连接失败"时已经申请好; 这里再兜一次, 覆盖
-     * "密码页 → 电源键返回 → 再进密码页" 这类来回路径. */
+    /* 横屏每一块都要先 memcpy 进中转缓冲, 才能保证交给 SPI 的指针在内部 DMA RAM.
+     * 拿不到就别建这一页 —— 硬建的结果是整页花屏 + "RAMWR failed", 用户还看不出
+     * 是内存问题. (幂等: 已在手就直接返回 true.) */
     if (!ui_core_rot_stage_acquire()) {
-        ESP_LOGW(TAG, "进密码页时申请横屏缓冲失败, 这一页可能花屏");
+        ESP_LOGE(TAG, "横屏中转缓冲不可用, 不进入密码页");
+        return false;
     }
 
     ESP_LOGI(TAG, "进密码页前: 内部堆 %u B (最大块 %u), DMA 可用 %u B (最大连续块 %u)",
@@ -662,6 +717,8 @@ static void pass_build(void)
     lv_obj_set_style_bg_color(s_kb, W_PRESSED, LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(0xD8D8D8), LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_text_color(s_kb, W_TEXT, LV_PART_ITEMS);
+
+    return true;
 }
 
 /* ── 正在检查更新 ── */
@@ -768,13 +825,16 @@ static const char *reason_text(int reason)
     }
 }
 
-/* ── 结果提示页 (竖屏, 到点自动退出流程) ──
+/* ── 结果提示页 (竖屏) ──
  *
  * 连接失败 / 检查更新失败 / 已是最新 / 更新失败 / 更新完成 全走这一页:
- * 标题 + 两行说明 + 底部一句话 + 一个一次性定时器. 到点和按电源键都是 flow_exit().
- * 以前只有"连接失败"一种, 每加一种结果都要复制一遍"删页面 + 停定时器 + 收尾";
- * 现在只有一套, 新增结果只需要在 handle_evt 里换个文案. */
-
+ * 标题 + 两行说明 + 底部一句话.
+ *
+ * 退出方式有两种:
+ *   - 「更新完成」: 一次性定时器到点自动走 (它要重启, 没什么可等的);
+ *   - 其余: 不自动退出, 由用户按返回键走 —— 一是让人看清失败原因, 二是退出后的
+ *     收尾 (释放 WiFi、装回蓝牙、还绘制缓冲) 统一由这一次返回触发.
+ * 头 1 秒不认返回键: 避免"刚看清结果就误触退出". 蓝牙装回不在这里做了, 见文件头. */
 static void notice_timer_cancel(void)
 {
     if (s_notice_timer) { lv_timer_del(s_notice_timer); s_notice_timer = NULL; }
@@ -794,12 +854,15 @@ static void notice_exit_cb(lv_timer_t *t)
     flow_exit("提示页超时");
 }
 
-/* l1 是灰色小字 (SSID/版本), l2 是主文案, l3 是"即将返回"这种尾巴; 传 NULL 就不建 */
+/* l1 是灰色小字 (SSID/版本), l2 是主文案, l3 是"按返回键继续"这种尾巴; 传 NULL 就不建.
+ * hold_ms > 0: 到点自动退出 (只给「更新完成」用); == 0: 等用户按返回.
+ * 注意这里不再装回蓝牙 —— 装回只在 wifi 任务释放完 WiFi 之后做, 见文件头的说明. */
 static void notice_build(const char *title, const char *l1, const char *l2,
                          const char *l3, int hold_ms)
 {
     notice_delete();
     s_notice_pg = page_create();
+    s_notice_us = esp_timer_get_time();
     mk_label(s_notice_pg, title, W_TEXT, 0, 96, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
 
     if (l1) {
@@ -810,8 +873,21 @@ static void notice_build(const char *title, const char *l1, const char *l2,
     if (l2) mk_label(s_notice_pg, l2, W_TEXT, 0, 162, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
     if (l3) mk_label(s_notice_pg, l3, W_MUTED, 0, 196, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
 
-    s_notice_timer = lv_timer_create(notice_exit_cb, hold_ms, NULL);
-    lv_timer_set_repeat_count(s_notice_timer, 1);
+    if (hold_ms > 0) {
+        s_notice_timer = lv_timer_create(notice_exit_cb, hold_ms, NULL);
+        lv_timer_set_repeat_count(s_notice_timer, 1);
+    }
+
+    /* 提示页就是这个流程的终点 (下一步只有"回去"), 所以现在就开始拆 WiFi:
+     * 拆要 ~215ms、蓝牙装回再 ~69ms, 正好藏在这一页的停留/1 秒防误触时间里.
+     * 拆完才装蓝牙 (wifi_mgr.c 的 worker 顺序), 那时内部堆 61KB, 不会再出现
+     * "bt_workqueue 分不出来 → BTU 二次释放 → assert" 那条路.
+     * 用户按返回时只是关页面, 不再等 WiFi. */
+    if (!s_released && s_session && wifi_mgr_session_active()) {
+        s_session = false;
+        wifi_mgr_release();
+        ESP_LOGI(TAG, "提示页已出现, 后台开始释放 WiFi 并装回蓝牙");
+    }
 }
 
 static void handle_evt(wifi_ev_t ev, int arg)
@@ -821,12 +897,12 @@ static void handle_evt(wifi_ev_t ev, int arg)
         /* 先销毁占位页再建列表页: 此刻内存已经从 WiFi 初始化里还回来一部分,
          * 列表页那 ~10KB 现在花得起 */
         boot_delete();
-        /* 横屏中转缓冲 (2KB): 整个流程只在这里申请一次, 由 ui_wifi_destroy 释放一次.
+        /* 横屏中转缓冲 (1KB): 整个流程只在这里申请一次, 由 ui_wifi_destroy 释放一次.
          * 中途只有在"点确认去连接"那一刻会让出去 (pass_confirm, 连接要发包, 见那里的
-         * 说明), 释放之后不再补 —— 因为补的那条路必然失败 (池子只剩 ~1.3KB 连续块),
+         * 说明), 释放之后不再补 —— 因为补的那条路必然失败 (池子只剩 ~550B 连续块),
          * 所以连接失败直接退出流程重来, 而不是回列表.
-         * 为什么现在申请: 此刻 esp_wifi_init 刚结束、列表页还没建, DMA 池最宽裕;
-         * 等列表页建完就只剩几百字节, 再也拼不出 2KB 连续块. */
+         * 为什么现在申请: 此刻 esp_wifi_init 刚结束、列表页还没建, 池子最宽裕;
+         * 等列表页建完就只剩几百字节, 再也拼不出 1KB 连续块. */
         if (!ui_core_rot_stage_acquire()) {
             ESP_LOGE(TAG, "横屏中转缓冲申请失败 (DMA 内存紧张), 密码页会花屏");
         }
@@ -879,8 +955,8 @@ static void handle_evt(wifi_ev_t ev, int arg)
         break;
 
     case WIFI_EV_CONNECT_FAIL:
-        /* 不再退回列表: 那会要求在流程中途重新抢 2KB 横屏缓冲 (此时池子只剩
-         * ~1.3KB 连续块, 必然失败 -> 再进密码页必花屏). 改成显示 2 秒原因后
+        /* 不再退回列表: 那会要求在流程中途重新抢横屏缓冲 (此时池子只剩
+         * ~550B 连续块, 必然失败 -> 再进密码页必花屏). 改成显示 2 秒原因后
          * 退出整个流程, 下次重试就是一次全新的入口. 详见文件头的说明. */
         conn_page_delete();
 
@@ -898,13 +974,13 @@ static void handle_evt(wifi_ev_t ev, int arg)
         }
 
         s_page = WP_NOTICE;
-        set_busy(false);            /* 这 2 秒里电源键可以立刻走 */
+        set_busy(false);            /* 返回键在 1 秒后可用, 见 ui_wifi_back */
         notice_build("连接失败", s_sel,
                      s_cred_dropped ? "保存的密码已失效" : reason_text(arg),
-                     s_cred_dropped ? "已清除这次记住的密码" : "即将返回",
-                     NOTICE_HOLD_MS);
-        ESP_LOGW(TAG, "连接失败 (%s), %d 秒后自动退出流程",
-                 s_cred_dropped ? "保存的密码已失效" : reason_text(arg), NOTICE_HOLD_MS / 1000);
+                     s_cred_dropped ? "已清除这次记住的密码" : "按返回键继续",
+                     0);
+        ESP_LOGW(TAG, "连接失败 (%s), 等用户按返回退出流程",
+                 s_cred_dropped ? "保存的密码已失效" : reason_text(arg));
         break;
 
     case WIFI_EV_UPDATE_CHECKED: {
@@ -917,7 +993,7 @@ static void handle_evt(wifi_ev_t ev, int arg)
             char http[24] = "";
             if (st->http) snprintf(http, sizeof http, "HTTP %d", (int)st->http);
             s_page = WP_NOTICE;
-            notice_build("检查更新失败", update_err_text(arg), http, "即将返回", NOTICE_HOLD_ERR);
+            notice_build("检查更新失败", update_err_text(arg), http, "按返回键继续", 0);
             break;
         }
         if (st->phase == UPD_LATEST) {
@@ -925,7 +1001,7 @@ static void handle_evt(wifi_ev_t ev, int arg)
             snprintf(cur, sizeof cur, "当前 %s", st->cur_ver);
             s_page = WP_NOTICE;
             /* 两行都填: 上面是"当前 0.7.8", 中间是服务器最新版本 */
-            notice_build("已是最新版本", cur, st->new_ver, "即将返回", NOTICE_HOLD_MS);
+            notice_build("已是最新版本", cur, st->new_ver, "按返回键继续", 0);
             break;
         }
         ver_build();
@@ -942,7 +1018,7 @@ static void handle_evt(wifi_ev_t ev, int arg)
         check_delete();
         s_page = WP_NOTICE;
         set_busy(false);
-        notice_build("更新失败", update_err_text(arg), http, "即将返回", NOTICE_HOLD_ERR);
+        notice_build("更新失败", update_err_text(arg), http, "按返回键继续", 0);
         break;
     }
 
@@ -957,10 +1033,25 @@ static void handle_evt(wifi_ev_t ev, int arg)
         break;
 
     case WIFI_EV_RELEASED:
+        s_released = true;
+        s_session  = false;
+
+        /* WiFi 已经 deinit、私有堆也拆了 (wifi_arena_close), 现在把第二块绘制缓冲
+         * 还给 LVGL: 一次描述符写入, 恢复双缓冲 + 异步刷新. 这一步不会失败. */
+        ui_core_draw_buf_return();
+
         if (s_restart_after_exit) {
             ESP_LOGI(TAG, "新固件已写入, 重启进入校验窗口");
             esp_restart();
         }
+
+        /* 提示页还在 (用户在读结果): 收尾已经全部做完, 别把页面抢掉,
+         * 等他按返回时 flow_exit 只做"关页面 + 回设置页". */
+        if (s_page == WP_NOTICE && !s_leaving) {
+            ESP_LOGI(TAG, "WiFi 资源已释放 (提示页停留中), 等返回键");
+            break;
+        }
+
         ESP_LOGI(TAG, "WiFi 资源已释放, 退出流程");
         ui_wifi_destroy();
         if (s_end_cb) s_end_cb();
@@ -1043,11 +1134,20 @@ static void flow_exit(const char *why)
     if (s_page == WP_NONE || s_leaving) return;
     s_leaving = true;
 
-    ESP_LOGI(TAG, "退出流程 (%s): 交给 wifi_mgr 释放, 完成后回设置页", why);
+    ESP_LOGI(TAG, "退出流程 (%s)", why);
 
     notice_timer_cancel();      /* 提示页的定时器一并取消, 免得二次触发;
                                  * 页面本身留到 ui_wifi_destroy 再删, 免得释放期间
                                  * 露出底下的列表页闪一下 */
+
+    /* 提示页出现时就已经在后台拆 WiFi 了 (notice_build), 现在很可能已经拆完:
+     * 那种情况下按返回只是关页面, 不用再等. */
+    if (s_released) {
+        ui_wifi_destroy();
+        if (s_end_cb) s_end_cb();
+        return;
+    }
+
     s_session = false;          /* 不再接受扫描/连接命令 */
     set_busy(true);             /* 释放期间挡住所有退出入口 */
     set_status("正在断开 WiFi…");
@@ -1071,6 +1171,7 @@ bool ui_wifi_enter(void)
     s_tick    = 0;
     s_prog_tick = 0;
     s_leaving = false;
+    s_released = false;
     s_pass_from_nvs = false;
     s_cred_dropped  = false;
     s_restart_after_exit = false;
@@ -1085,6 +1186,15 @@ bool ui_wifi_enter(void)
 
     if (s_timer) lv_timer_del(s_timer);
     s_timer = lv_timer_create(poll_cb, 100, NULL);
+
+    /* 进 WiFi 之前先把第二块绘制缓冲交出去 (所有权转移, 不释放):
+     * 这块 33KB 由 wifi_mgr 建成私有堆, WiFi 的通用分配全落在里面, 公共堆不再被它
+     * 切碎. LVGL 这边同步切成单缓冲, WiFi 页全是静态的, 看不出差别.
+     * 顺序: 先借缓冲 → 再告诉 wifi_mgr → 最后起会话 (会话任务一起来就开始分配). */
+    void  *arena_mem = NULL;
+    size_t arena_len = 0;
+    ui_core_draw_buf_borrow(&arena_mem, &arena_len);
+    wifi_mgr_provide_arena(arena_mem, arena_len);
 
     wifi_mgr_start_session();
     ESP_LOGI(TAG, "进入「连接 WiFi」流程");
@@ -1142,7 +1252,13 @@ void ui_wifi_back(void)
         break;
 
     case WP_NOTICE:
-        /* 不等那几秒了, 立刻走 —— 和定时器到点是同一个出口 */
+        /* 头 1 秒不认返回, 免得刚看清结果就误触退出 —— 这一秒也正是 WiFi 拆除
+         * (~215ms) 和蓝牙装回 (~69ms) 在后台跑完的时间. 过了这一秒按返回,
+         * 大多数情况下 flow_exit 只需要关页面. */
+        if (esp_timer_get_time() - s_notice_us < (int64_t)NOTICE_LOCK_MS * 1000) {
+            ESP_LOGI(TAG, "提示页 1 秒内不认返回");
+            break;
+        }
         flow_exit("提示页按返回");
         break;
 
@@ -1160,7 +1276,7 @@ void ui_wifi_destroy(void)
 {
     if (s_timer) { lv_timer_del(s_timer); s_timer = NULL; }
 
-    /* 横屏中转缓冲用完就还, 不常驻 (不开 WiFi 的设备上完全不占这 2KB) */
+    /* 横屏中转缓冲用完就还, 不常驻 (不开 WiFi 的设备上完全不占这 1KB) */
     ui_core_rot_stage_release();
 
     /* 可能停在横屏的密码页: 先收掉页面并恢复竖屏, 否则后续所有页面都是横的 */
@@ -1173,17 +1289,7 @@ void ui_wifi_destroy(void)
     prog_delete();
     boot_delete();
 
-    if (s_list_pg) {
-        lv_obj_del(s_list_pg);
-        s_list_pg  = NULL;
-        s_rows     = NULL;
-        s_hint     = NULL;
-        s_status   = NULL;
-        s_back_btn = NULL;
-        s_btn_scan = NULL;
-        s_btn_conn = NULL;
-    }
-    rows_clear();
+    list_delete();
 
     if (s_session) {            /* 兜底: 还有会话就让 worker 跑完手上的操作再自己释放 */
         s_session = false;
@@ -1195,6 +1301,7 @@ void ui_wifi_destroy(void)
     s_sel[0]  = '\0';
     s_pass[0] = '\0';
     s_leaving = false;
+    s_released = false;
     s_pass_from_nvs = false;
     s_cred_dropped  = false;
     set_busy(false);            /* 一定要解掉 ui_inhibit, 否则以后永远不熄屏 */
@@ -1202,6 +1309,11 @@ void ui_wifi_destroy(void)
     if (lv_disp_get_rotation(NULL) != LV_DISP_ROT_NONE) {
         lv_disp_set_rotation(NULL, LV_DISP_ROT_NONE);
     }
+    /* 会话已经退干净才收回绘制缓冲. 还在释放中的话那块内存还在 WiFi 手里,
+     * 提前收回来 LVGL 就会和私有堆抢同一块内存; 那种情况留给 RELEASED 那条路
+     * (或下一次进流程) 处理, 两边都是幂等的. */
+    if (!wifi_mgr_session_active()) ui_core_draw_buf_return();
+
     lv_obj_invalidate(lv_scr_act());
     ESP_LOGI(TAG, "WiFi 流程页面已清理");
 }

@@ -2,6 +2,7 @@
 #define __UI_CORE_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -60,13 +61,25 @@ void ui_touch_set_enabled(bool enable);
 
 /* 横屏刷屏的中转缓冲 (2KB, 内部 DMA RAM).
  *
- * 软件旋转时 LVGL 的旋转块可能落在 PSRAM, SPI 驱动就会再要一块同尺寸的 DMA 反射缓冲;
- * WiFi 开着时内部堆早已碎片化, 那块申请必然失败 ("Failed to allocate priv TX buffer").
- * 这块缓冲在 WIFI_EV_READY 申请 (WiFi 已 init 完、列表页还没建, 池子最宽裕),
+ * 软件旋转时 LVGL 的旋转块 (2KB) 常常落在 IRAM/PSRAM, 那里不满足 SPI DMA, 驱动
+ * 就会再要一块同尺寸的反射缓冲; WiFi 开着时内部堆早已碎片化, 那块申请必然失败
+ * ("Failed to allocate priv TX buffer"). flush 里把数据过一遍这块缓冲再发.
+ * 2KB 这个尺寸还有个作用: 连接前释放它, 正好给 WiFi 留一个 2048 的连续洞
+ * (WiFi 每帧要 ~1.6KB), 缩到 1KB 会让 DHCP 发不出包.
+ * 在 WIFI_EV_READY 申请 (WiFi 已 init 完、列表页还没建, 池子最宽裕),
  * 点「确认」连接前让出去, 流程结束释放.
- * 返回 false 表示申请失败 (横屏刷新可能出错, 但不影响竖屏). */
+ * 返回 false 表示申请失败: 调用方**不应该**再进横屏页 (必花屏). */
 bool ui_core_rot_stage_acquire(void);
 void ui_core_rot_stage_release(void);
+
+/* 绘制缓冲交接 (WiFi 会话期间把第二块让给 WiFi 私有堆用).
+ *
+ * borrow: 把 LVGL 切成单缓冲 (并切到同步刷新), 通过 mem/len 交出第二块缓冲 —
+ *         一块已对齐、内部 RAM、DMA 可用的连续 33KB. 幂等.
+ * return: 恢复双缓冲 + 异步刷新. 只是一次描述符写入, 不分配内存, 不会失败.
+ * 只能在 LVGL 任务里调. 借用期间不能调 return 之外的 LVGL 配置函数. */
+void ui_core_draw_buf_borrow(void **mem, size_t *len);
+void ui_core_draw_buf_return(void);
 
 #ifdef __cplusplus
 }

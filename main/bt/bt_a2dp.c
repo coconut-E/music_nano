@@ -15,6 +15,7 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "bt_a2dp.h"
 #include "audio_task.h"
 #include "atomic_utils.h"
@@ -960,6 +961,148 @@ static void bt_a2dp_hdl_stack_up(void)
     ESP_LOGI(BT_TAG, "蓝牙初始化完成"); 
 }
 
+/* ── 协议栈分三段启动: 任务入口和内存探针共用 ──
+ * 拆开是为了让"拆掉再装回来"走的是和开机逐行相同的代码 —— 否则探针装出来的
+ * 蓝牙和真正的开机状态会差一截, 测出的时间和内存都不可信. */
+static esp_err_t bt_stack_ctrl_up(bool release_ble_mem)
+{
+    /* BLE 内存只在开机这次释放 (之后就属于堆了, 重复释放没意义) */
+    if (release_ble_mem) esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t e = esp_bt_controller_init(&cfg);
+    if (e != ESP_OK) {
+        ESP_LOGE(BT_TAG, "蓝牙控制器初始化失败: %s", esp_err_to_name(e));
+        return e;
+    }
+    e = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (e != ESP_OK) {
+        ESP_LOGE(BT_TAG, "蓝牙控制器启用失败: %s", esp_err_to_name(e));
+        return e;
+    }
+    if (esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9) != ESP_OK) {
+        ESP_LOGW(BT_TAG, "设置蓝牙发射功率失败");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t bt_stack_host_up(void)
+{
+    esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+    esp_err_t e = esp_bluedroid_init_with_cfg(&cfg);
+    if (e != ESP_OK) {
+        ESP_LOGE(BT_TAG, "Bluedroid 初始化失败: %s", esp_err_to_name(e));
+        return e;
+    }
+    e = esp_bluedroid_enable();
+    if (e != ESP_OK) {
+        ESP_LOGE(BT_TAG, "Bluedroid 启用失败: %s", esp_err_to_name(e));
+        return e;
+    }
+
+    /* 安全参数: 无输入无输出 (Just Works 配对, 无需在 PC 上比对数字) */
+    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
+
+    esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
+    esp_bt_pin_code_t pin_code;
+    esp_bt_gap_set_pin(pin_type, 0, pin_code);
+    return ESP_OK;
+}
+
+/* ── 蓝牙内存让位: 拆/装 Bluedroid 主机协议栈 ──
+ *
+ * 为什么拆的是主机而不是控制器: 控制器 (射频/基带) 那部分是 esp_bt_controller_*,
+ * 拆它要重做 PHY, 而且碎片更大; 光是主机就够用了 —— 实测内部堆 +12,204 B,
+ * 而 OTA 的 TLS 握手只需要 ~2.7KB. 主机里是三样东西: BTC/BTU/HCI 三个任务栈
+ * (2560/3072/2048, 各自必须连续) + L2CAP/AVDTP/AVCTP/SDP 各层缓冲.
+ *
+ * 顺序为什么重要: 拆的时候 AVRC CT/TG 必须先于 A2DP source, 反了协议栈会打一行
+ * "AVRC CT should deinit in advance of A2DP" 然后跳过, 实测只还回来 616 B.
+ *
+ * 拆 215ms (其中 200ms 是 bta_dm_disable 的固定延时), 装 69ms. 所以拆要藏在
+ * "正在初始化 WiFi…" 那一页, 装要藏在结果提示页 (或 WiFi 释放完之后). */
+static volatile bool s_host_trimmed = false;   /* host 已拆, 等装回 */
+
+static void bt_profiles_down(void)
+{
+    esp_err_t e = esp_avrc_ct_deinit();
+    if (e != ESP_OK) ESP_LOGW(BT_TAG, "avrc_ct_deinit: %s", esp_err_to_name(e));
+    e = esp_avrc_tg_deinit();
+    if (e != ESP_OK) ESP_LOGW(BT_TAG, "avrc_tg_deinit: %s", esp_err_to_name(e));
+    e = esp_a2d_source_deinit();
+    if (e != ESP_OK) ESP_LOGW(BT_TAG, "a2d_source_deinit: %s", esp_err_to_name(e));
+}
+
+bool bt_mem_trim(bool release)
+{
+    if (!release) {
+        if (!s_host_trimmed) return true;          /* 没拆过, 什么都不用做 */
+        int64_t t0 = esp_timer_get_time();
+        if (bt_stack_host_up() != ESP_OK) {
+            ESP_LOGE(BT_TAG, "蓝牙装回失败: 本次开机内蓝牙不可用 (重启恢复)");
+            return false;
+        }
+        bt_a2dp_hdl_stack_up();                    /* profile + 可连接不可发现 */
+        s_host_trimmed = false;
+        ESP_LOGI(BT_TAG, "蓝牙已装回: 内部空闲 %u B, 耗时 %lld ms",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (long long)((esp_timer_get_time() - t0) / 1000));
+        return true;
+    }
+
+    if (s_host_trimmed) return true;
+    if (!s_task) return false;
+
+    /* 只在"任务已挂起"时拆: 那一刻没有链路、没有事件在跑, 从别的任务动协议栈才安全.
+     * 退出音乐时 bt_a2dp_pause() 已经把任务挂起了, 所以正常情况下这里一定通过. */
+    if (!s_paused || !atomic_load_bool(&s_bt_ready)) {
+        ESP_LOGW(BT_TAG, "蓝牙没挂起, 不拆 (paused=%d ready=%d)",
+                 (int)s_paused, (int)atomic_load_bool(&s_bt_ready));
+        return false;
+    }
+
+    size_t  before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    int64_t t0 = esp_timer_get_time();
+
+    /* bt_a2dp_pause() 发过 disconnect, 但事件留在队列里没人处理, 标志还是旧的:
+     * 这里直接清掉, 别让拆完的协议栈还挂着"已连接" */
+    s_connected      = false;
+    s_connecting     = false;
+    s_stream_started = false;
+    s_avrc_connected = false;
+    s_pending_vol    = false;
+    s_last_sent_vol  = -1;         /* 装回后 bt_sync_volume 会自动重推音量 */
+    memset(s_peer_bda, 0, sizeof(s_peer_bda));
+    atomic_store_bool(&s_bt_ready, false);
+
+    bt_profiles_down();
+    esp_err_t e = esp_bluedroid_disable();
+    if (e == ESP_OK) e = esp_bluedroid_deinit();
+    if (e != ESP_OK) {
+        /* 拆失败: 原样装回去, 不留半死状态 (装不回来也只是本次开机蓝牙不可用) */
+        ESP_LOGE(BT_TAG, "蓝牙 host 拆不掉 (%s), 装回去", esp_err_to_name(e));
+        if (bt_stack_host_up() == ESP_OK) bt_a2dp_hdl_stack_up();
+        return false;
+    }
+    s_host_trimmed = true;
+
+    /* 注意: 只拆 host, 不要碰控制器.
+     * 试过 esp_bt_controller_disable()+deinit() 再 init, 结果
+     *   "Coex register Wi-Fi channel change btdm cb faild"
+     *   assert failed: hci_hal_env_init hci_hal_h4.c:144 (event != NULL)
+     * —— 开机时 esp_bt_controller_mem_release(ESP_BT_MODE_BLE) 已经把 BLE 控制器
+     * 那块内存还给堆, WiFi 起来后又占住了; 控制器重新 init 时 osi_event_create()
+     * 拿不到内存直接 assert, 表现为反复重启. 详见 docs/ERRATA_zh.md. */
+
+    ESP_LOGI(BT_TAG, "蓝牙让位: 内部空闲 %u → %u B (+%d), 耗时 %lld ms",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (int)((int32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - (int32_t)before),
+             (long long)((esp_timer_get_time() - t0) / 1000));
+    return true;
+}
+
 /* ── 未连接时排水: 以 44.1kHz/16bit/双声道 真实速率丢弃 PCM ── */
 #define DRAIN_BYTES_PER_SEC  (44100 * 2 * 2)
 
@@ -1002,47 +1145,16 @@ static void bt_drain_pcm(void)
 /* ── BT task entry (merged: commands + dispatch events) ── */
 static void bt_a2dp_task(void *arg)
 {
-    /* 释放 BLE 控制器内存 (只用于 Classic BT) */
-    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-
-    /* 初始化蓝牙控制器 */
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
-        ESP_LOGE(BT_TAG, "蓝牙控制器初始化失败");
+    /* 三段启动: 控制器 → Bluedroid host → profile/回调.
+     * 拆成三个函数是因为 bt_mem_trim 只拆 host 那一层, 装回时走的和开机同一条路径. */
+    if (bt_stack_ctrl_up(true) != ESP_OK) {   /* true: 开机这次释放 BLE 控制器内存 */
         vTaskDelete(NULL);
         return;
     }
-    if (esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) != ESP_OK) {
-        ESP_LOGE(BT_TAG, "蓝牙控制器启用失败");
+    if (bt_stack_host_up() != ESP_OK) {
         vTaskDelete(NULL);
         return;
     }
-    if (esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9) != ESP_OK) {
-        ESP_LOGW(BT_TAG, "设置蓝牙发射功率失败");
-    }
-
-    /* 初始化并启用 Bluedroid 协议栈 */
-    esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-    esp_err_t ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(BT_TAG, "Bluedroid 初始化失败: %s", esp_err_to_name(ret));
-        vTaskDelete(NULL);
-        return;
-    }
-    if (esp_bluedroid_enable() != ESP_OK) {
-        ESP_LOGE(BT_TAG, "Bluedroid 启用失败");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* 安全参数: 无输入无输出 (Just Works 配对, 无需在 PC 上比对数字) */
-    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
-    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
-
-    esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
-    esp_bt_pin_code_t pin_code;
-    esp_bt_gap_set_pin(pin_type, 0, pin_code);
 
     char bda_str[18];
     ESP_LOGI(BT_TAG, "本机地址:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));

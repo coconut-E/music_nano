@@ -94,8 +94,46 @@
 | # | 结论 | 依据 |
 |---|------|------|
 | 1 | **`esp_ota_begin(part, image_size)` 会先把整包擦掉**：给了具体 size（而不是 `OTA_WITH_SEQUENTIAL_WRITES`）时，它直接 `esp_partition_erase_range(0, ALIGN_UP(size, 4K))`。2.2MB 就是十几秒不可中断的连续擦除，期间 cache 关着、别的任务全停。写 OTA 要用 sequential，让擦除跟着每次 write 只擦本次跨到的扇区。 | `components/app_update/esp_ota_ops.c:190`（预擦）与 `:314`（`need_erase` 分步擦） |
-| 2 | **PSRAM 里的缓冲不能直接交给 `esp_ota_write`**：ESP32 主 flash（SPI1）的 `supports_direct_write()` 恒为 false，于是 `esp_flash_write` 的 `direct_write` 为 false，退化成 `uint32_t temp_buf[8]`（**32 字节**）一次一拷 —— 2.2MB 就是 6.9 万次 cache 开关，比"整段停一次"还糟。必须先 memcpy 进内部 RAM（4KB）再写。 | `components/spi_flash/esp_flash_api.c:1128` + `components/hal/spi_flash_hal.c:155`（`spi != SPI1_HOST` 才 true） |
+| 2 | **PSRAM 源写 flash 会退化成 32 字节一段**：ESP32 主 flash（SPI1）的 `supports_direct_write()` 恒为 false，于是 `esp_flash_write` 的 `direct_write` 为 false，按 `uint32_t temp_buf[8]`（**32 字节**）一段段搬到栈上再写（`memcpy` 在关 cache **之前**做，所以读 PSRAM 是安全的，只是慢）。原本为此备了 4KB 内部弹跳缓冲想走 direct 路径，**0.7.13 起删掉**：下载期间 8bit 内部堆只剩 2~3KB，4KB 申请不到、2KB 又会饿死 WiFi 的 1.6KB 收包缓冲，于是选择"慢一点、但不占内部 RAM"。 | `components/spi_flash/esp_flash_api.c:1128`/`:1152-1153` + `components/hal/spi_flash_hal.c:155`（`spi != SPI1_HOST` 才 true） |
 
 另：`sdkconfig.defaults` 里"网络升级不做 TLS（会拉进 mbedtls + 60KB 证书包）"的旧结论在 0.7.8 作废 ——
 只 pin 自己的 CA（`main/certs/ota_ca.pem`）就不用证书包，实测 TLS 全栈代价 +177,264 B，
 app 槽还剩 2%（47,312 B）。
+
+---
+
+## 四、OTA 提速（0.7.19~0.7.22）验证出的四条
+
+| # | 结论 | 依据 |
+|---|------|------|
+| 1 | **蓝牙控制器可以拆 host，但不能再 init 控制器**。`esp_bt_controller_disable()+deinit()+init()` 会打 `Coex register Wi-Fi channel change btdm cb faild`，随后 `assert failed: hci_hal_env_init hci_hal_h4.c:144 (event != NULL)` —— 开机时 `esp_bt_controller_mem_release(ESP_BT_MODE_BLE)` 已把 BLE 控制器内存还给堆，WiFi/lwIP 占走后，控制器重建时 `osi_event_create()` 分配失败 → assert → 反复重启。0.7.21 踩过，0.7.22 回退为"只拆 host"（实测还回 12.2~17.4 KB，装回 ~69 ms）。 | `components/bt/host/bluedroid/hci/hci_hal_h4.c:143-144` |
+| 2 | **默认 `TCP_WND=5760` 只有 4 个 MSS**，是 OTA 下载的硬天花板；官方吞吐预设是 65534。我们只抬到 23040（16 MSS），并同步抬 `TCP_RECVMBOX_SIZE`。 | `components/wifi/iperf/sdkconfig.defaults.esp32`（IDF 官方"Improve Network Speed"指定的配置） |
+| 3 | **收包缓冲按"省内存"压到 4 静态 / 2 动态 / RX_BA_WIN=2 会让 2.3MB 下载退化到 1KB/s**：`wstatt` 的 BUFFER 表里 `fail_fc=248`（流控失败 = 没有空闲收包缓冲），设备 190 秒只收到 262 个数据帧，服务器 `sendall` 一直阻塞（对端窗口关着）。0.7.22 起抬到 8/4/3（+约 11 KB，钱由蓝牙 host 让位出）。注意 `RX_BA_WIN ≤ DYNAMIC_RX_BUFFER_NUM`，Kconfig 有 `#error` 检查。 | `wstatt` 实测 + `wifi_init.c` 的 Kconfig 约束 |
+| 4 | **大块暂存会放大"写 flash 停顿"**：收满 256 KB 才写，写完才继续收，期间 TCP 窗口关死、服务器 `sendall` 干等 —— 实测 2.3 MB 升级在 256 KB 边界反复卡 30~120 秒。0.7.21 起改为 64 KB 一段、写步长 16 KB、写:歇 = 9:1（90% 给烧写）。 | 服务器端 `[send]` 分块日志 + `update.c` 的 `UPD_STAGE_BYTES` |
+
+另：手机热点（PC 与 ESP32 都是它的客户端）不适合做 OTA 测速 —— 客户端间转发实测下行 0.9 KB/s、
+下载中 ping 丢包 92%；换普通路由器后同一份固件首段能跑到 100 KB/s 量级。测速请用路由器。
+
+---
+
+## 五、把 WiFi 的分配搬进私有堆（0.7.23）验证出的五条
+
+| # | 结论 | 依据 |
+|---|------|------|
+| 1 | **WiFi 没有"传入缓冲区"的接口，只有传入分配器表的接口**：`wifi_init_config_t.osi_funcs` 是唯一入口，表里通用分配只有 `_malloc` / `_free` 两项，`_*_internal` 是"必须内部 RAM"的 DMA 那一组，`_wifi_*` 是允许去 PSRAM 的那一组。库里的 `os_calloc/os_zalloc/os_realloc` 建在这两个入口上。 | `esp_wifi.h:98/187/317` + `esp_private/wifi_os_adapter.h:73-129` |
+| 2 | **预编译 WiFi 库的分配几乎全部走这张表**：`nm` 扫 7 个 `.a`，`U malloc/calloc/realloc` 一个都没有，仅 `libpp.a` 有 1 处 `U free`。所以换掉 `_malloc`/`_free` 就能覆盖 WiFi 的堆使用。 | `xtensa-esp32-elf-nm` 扫 `components/esp_wifi/lib/esp32/*.a` |
+| 3 | **必须拦 libc `free`**：那唯一一处 `U free` 在 `libpp.a` 的 `hal_crypto.o`（`hal_crypto_set_key_entry` 里 `callx8 free`），它绕过 osi 表。原生 IDF 里 `_free` 就是 libc `free`，所以库作者这么写没问题；私有堆指针落到这里会被判非法释放。解法是 `-Wl,--wrap=free` + `__wrap_free` 按地址分流，不改 IDF。实测链接后镜像里 `U free` 归零，`__wrap_free` 被引用 171 处。 | `objdump` hal_crypto.o 反汇编 + 链接后 `nm music_nano.elf` |
+| 4 | **`multi_heap_register` 的 tlsf 元数据约 3.2 KB（不随区域变大而变）**，33,024 B 的 LVGL 绘制缓冲建堆后实际可用约 29.7 KB，所以"33KB 私有堆"要按 ~29.7 KB 算。IDF 自己的测试也用 `HEAP_OVERHEAD_MAX = 3248` 作为上界。 | `multi_heap.h:98` + `test_apps/heap_tests/main/test_runtime_heap_reg.c:26` + 实测 `multi_heap_free_size()` |
+| 5 | **两块绘制缓冲在最终镜像里相邻且 4 字节对齐**（`s_draw_buf2` 0x3ffc54b4 / `s_draw_buf1` 0x3ffcd5b4，差 0x8100 = 33,024），所以在需要更大私有堆时可以把 buf1 尾部与 buf2 合并成一段连续区域。注意必须给数组加 `__attribute__((aligned(4)))`：16 位色深下 `lv_color_t` 只有 2 字节，默认对齐不足以让 multi_heap 按 `size_t` 读写块头。 | `nm music_nano.elf` 符号地址差 |
+
+---
+
+## 六、OTA 提速收尾（0.7.9~0.7.12）验证出的五条
+
+| # | 结论 | 依据 |
+|---|------|------|
+| 1 | **下载慢的真因是 RX 聚合窗口，不是收包缓冲不够**。`RX_BA_WIN=3` 对上 AP 协商的 64 帧窗口（日志 `ba-add ... winSize:64`），40MHz 下一个聚合组轻松超 3 帧，超出的直接丢 → TCP 重传 → 20~32 秒退避。改成 `RX_BA_WIN=8`（同时 `DYNAMIC_RX_BUFFER_NUM 4→8`，Kconfig 要求窗口 ≤ 动态缓冲数）后：2.0~2.8 KB/s → **10.8 KB/s**，最长停滞 32 s → 2.5 s。**把 DMA 从 4.7KB 腾到 19.7KB 反而没提速**（2.0 vs 3.4 KB/s，纯噪声）—— 内存这条路当时是伪线索。 | 两轮实测对比 + `esp_wifi.h` 的 `rx_ba_win` |
+| 2 | **写 flash 的 1.22 s/16KB 拆开是"编程 545ms + 擦 70ms + 22ms 开销"，而 PSRAM 源会让编程翻倍到 1130ms**。`esp_flash_write` 的 `direct_write` 只看源在不在 DRAM（`esp_flash_api.c:1128`），PSRAM 源退化成 32 字节一段、每段关一次 cache。改成 4KB 内部中转后单步 1.22s → **0.62s**，2.39MB 写阶段 183s → 93s。 | `flashspd` 命令实测（每项带回读校验）：C 545,644us / C2 1,130,545us / C3 548,303us / D 617,260us = C+A / E 545,680us = C |
+| 3 | **64KB 块擦真的是 17.6ms**（`0xFF` 回读通过），比 4 个 4KB 扇区擦的 70.7ms 便宜 4 倍 —— 但它只占 16KB 写耗时的 11%，换 `esp_ota_resume` + 滚动块擦只能再省 8.5%（93s → 85s），不值得接管擦除时序。 | `flashspd` 的 A/B 项 + `esp_flash_api.c:739`（地址/长度按块对齐才走块擦） |
+| 4 | **私有堆三组分配全部改成"私有堆优先、满了落公共堆"的两级**：只用私有堆时 99% 满那一刻有 68 次 malloc 拿到 NULL；两级后 3,462 次分配 **0 失败、332 次溢出**，两边的池子都用上了。释放不需要区分，`wifi_arena_free` 按地址分流。 | 0.7.32 / 0.7.33 两次完整 OTA 的 `私有堆关闭` 日志 |
+| 5 | **`esp_ota_end` 校验需要空闲 MMU 页，现在一页都没有 → 镜像校验必失败**（`esp_image: No free MMU pages are available`），所以下载和写入都成功后仍然切不了槽。2MB PSRAM 占掉大半 DROM 页，剩下的被 IROM/DROM 静态映射吃完；镜像 `.rodata` 段 828KB 要 13 页。这是 OTA 最后一个拦路虎，未解。 | `esp_image_format.c:662-686`（`bootloader_mmap_get_free_pages()` 为 0 就报错）+ 实测 2.39MB 全量下载 |

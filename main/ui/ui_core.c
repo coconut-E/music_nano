@@ -33,8 +33,11 @@ bt_a2dp_iface_t     *g_ui_bt_iface       = NULL;   /* 蓝牙接口 */
 QueueHandle_t        g_ui_audio_cmd_queue = NULL;  /* 音频命令队列 */
 QueueHandle_t        g_ui_audio_rsp_queue = NULL;  /* 音频应答队列 */
 
-static lv_color_t           s_draw_buf1[LVGL_BUF_SIZE];   /* 双缓冲 1 */
-static lv_color_t           s_draw_buf2[LVGL_BUF_SIZE];   /* 双缓冲 2 */
+/* aligned(4): 16 位色深下 lv_color_t 是 2 字节, 数组默认对齐可能只有 2.
+ * 第二块缓冲要借给 WiFi 当私有堆 (见下面的 ui_core_draw_buf_borrow),
+ * multi_heap 的块头按 size_t 读写, 2 字节对齐会把相邻内存踩坏. */
+static lv_color_t           s_draw_buf1[LVGL_BUF_SIZE] __attribute__((aligned(4)));   /* 双缓冲 1 */
+static lv_color_t           s_draw_buf2[LVGL_BUF_SIZE] __attribute__((aligned(4)));   /* 双缓冲 2 */
 static lv_disp_draw_buf_t   s_draw_buf_dsc;   /* LVGL 绘制缓冲描述符 */
 static lv_disp_drv_t        s_disp_drv;       /* 显示驱动 */
 static lv_indev_drv_t       s_indev_drv;   /* LVGL 8 只存指针不拷贝, 必须常驻 */
@@ -43,25 +46,40 @@ static esp_lcd_panel_handle_t s_panel = NULL;   /* LCD 面板句柄 */
 /* 触摸开关: 息屏时置 false, touch_read_cb 短路返回 (顺带省 I2C 功耗) */
 static volatile bool s_touch_enabled = true;
 
+/* WiFi 会话期间的单缓冲标记 (见 ui_core_draw_buf_borrow / _return).
+ *
+ * 为什么单缓冲必须配同步刷新: 竖屏那条分支是"挂进 DMA 队列就 flush_ready",
+ * 双缓冲时下一段渲染落到另一块, 没事; 只剩一块时 LVGL 会往 DMA 正在读的那块里
+ * 画, 花屏. WiFi 页全是静态的, 丢掉渲染/搬运的重叠看不出来. */
+static volatile bool s_flush_sync   = false;
+static bool          s_buf_borrowed = false;
+
 /* 横屏刷屏用的中转缓冲 (2KB, 内部 DMA RAM).
  *
  * 为什么需要: 软件旋转时 LVGL 的旋转块来自 lv_mem_buf_get() (malloc), 尺寸是
- * LV_DISP_ROT_MAX_BUF (lv_conf.h, 2KB), 可能落在 PSRAM. SPI 的 DMA 读不了 PSRAM,
- * 驱动就会再申请一块同尺寸的 "反射缓冲" (spi_master.c:1214); WiFi 开着时内部堆只剩
- * 几百字节, 那块申请必然失败 → 整页刷不出来 ("Failed to allocate priv TX buffer").
- * 这里自己备一块内部 DMA 缓冲, memcpy 进去再交给 SPI, 就不依赖驱动那块反射缓冲了.
+ * LV_DISP_ROT_MAX_BUF (lv_conf.h, 2KB), 池子紧的时候会落到 IRAM/PSRAM —— 那里的
+ * 内存不满足 SPI DMA, 驱动就会再申请一块同尺寸的 "反射缓冲" (spi_master.c:1214);
+ * WiFi 开着时内部堆只剩几百字节, 那块申请必然失败 → 整页刷不出来
+ * ("Failed to allocate priv TX buffer"). 这里自己备一块内部 DMA 缓冲, memcpy 进去
+ * 再交给 SPI, 就不依赖驱动那块反射缓冲了.
+ *
+ * 为什么坚持 2KB (试过 1KB, 能用但会把 WiFi 饿死):
+ *   这块缓冲在连接前会被释放, 释放出来的那一块**正好是 WiFi 要的那块连续空间** ——
+ *   WiFi 每发/收一帧要 ~1.6KB 连续的 DMA 缓冲. 用 2KB 时释放后留的是一个 2048 的洞,
+ *   连接能起来; 用 1KB 时洞里只有 1024, 实测 "最大连续块 1024" -> 关联成功、DHCP
+ *   DISCOVER 发不出去、20 秒拿不到 IP、最后 reason=8 退出.
+ *   所以这里的尺寸不只是"够刷屏就行", 还负责给 WiFi 留一个够大的洞.
+ *
+ * 能不能拿到 2KB: 实测 WIFI_EV_READY 时 DMA 池 free 2755B / 最大连续块 1792B,
+ *   差 256B 拿不到 —— 那是 .bss 里 OTA 的大字符串(约 1.5KB)直接从 DRAM 扣掉的缘故.
+ *   把那些字符串挪到 PSRAM 之后, 最大连续块回到 3KB 以上, 2048 就能拿到.
  *
  * 归属: 由设置页的 WiFi 流程管, 不开 WiFi 就完全不占内存.
- *   - 进流程 (WIFI_EV_READY) 申请一次: 此刻 esp_wifi_init 刚结束、列表页还没建,
- *     DMA 池还有 ~12KB, 2KB 随手可得 (不能更早: init 自己要从 DMA 池拿 ~27KB,
+ *   - 进流程 (WIFI_EV_READY) 申请一次 (不能更早: init 自己要从 DMA 池拿 ~27KB,
  *     0.8.6 用 4KB 静态缓冲抢先占位, 直接把 init 掐死了);
- *   - 点「确认」去连接前让出去: 连接每帧要 ~1.6KB 的 DMA TX 缓冲,
- *     2KB 还占着的话实测只剩 1595B/最大连续块 800B, 第一帧 DISCOVER 都发不出去;
+ *   - 点「确认」去连接前让出去 (start_connect), 顺便把列表页也删掉, 见那里的说明;
  *   - 流程结束 (ui_wifi_destroy) 释放.
- * 让出去之后不再补: 等列表页建完, 池子只剩 ~900B 连续块, 补的那次必然失败 ——
- * 所以连接失败直接退出整个流程重来 (见 ui_settings_wifi.c 文件头), 而不是回列表.
- * 2KB 够用: LVGL 旋转出的每一块最大就是 LV_DISP_ROT_MAX_BUF.
- * 传输走同步接口, 返回时 DMA 已排空, 所以下一块可以直接覆盖它. */
+ * 传输走同步接口, 返回时 DMA 已排空, 所以下一段可以直接覆盖它. */
 #define ROT_STAGE_BYTES 2048
 static uint8_t *s_rot_stage = NULL;
 
@@ -107,20 +125,84 @@ static void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area,
     if (lv_disp_get_rotation(NULL) != LV_DISP_ROT_NONE) {
         uint32_t w   = (uint32_t)(area->x2 - area->x1 + 1);
         uint32_t h   = (uint32_t)(area->y2 - area->y1 + 1);
-        uint32_t len = w * h * sizeof(lv_color_t);
+        uint32_t row = w * sizeof(lv_color_t);      /* 面板一行字节数, 最大 2*320 */
 
-        if (s_rot_stage && len <= ROT_STAGE_BYTES) {
-            memcpy(s_rot_stage, color_p, len);      /* 汇总到内部 DMA RAM */
-            lcd_draw_bitmap_sync(area->x1, area->y1, area->x2 + 1, area->y2 + 1, s_rot_stage);
+        /* 旋转块统一过一遍内部 DMA 缓冲. LVGL 那块 2KB 可能装不下一整段,
+         * 所以按"面板行"切: 任意连续几行都是合法矩形, 可以分多次发.
+         * 中转缓冲只要装得下一行就行, 与 LV_DISP_ROT_MAX_BUF 解耦. */
+        if (s_rot_stage && row && row <= ROT_STAGE_BYTES) {
+            uint32_t rows = ROT_STAGE_BYTES / row;      /* 一次能搬几行 (>=1) */
+            if (rows > h) rows = h;
+            for (uint32_t y = 0; y < h; y += rows) {
+                uint32_t n = (y + rows <= h) ? rows : (h - y);
+                memcpy(s_rot_stage, color_p + (size_t)y * w, (size_t)n * row);
+                lcd_draw_bitmap_sync(area->x1, area->y1 + y,
+                                     area->x2 + 1, area->y1 + y + n, s_rot_stage);
+            }
         } else {
-            /* 兜底: 超大可走原路 (旋转块正常不会超过 LV_DISP_ROT_MAX_BUF) */
+            /* 单行都放不下, 或缓冲没拿到: 只能原路发, 驱动会自己去要反射缓冲,
+             * 要不到就是 RAMWR failed. 正常到不了这里 (申请失败时就不进横屏页). */
             lcd_draw_bitmap_sync(area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
         }
+    } else if (s_flush_sync) {
+        /* 只有一块绘制缓冲时必须等 DMA 排空才能让 LVGL 继续写这块.
+         * lcd_draw_bitmap_sync 末尾用一次无命令 tx_param 排空在途事务, 就是 DMA 屏障
+         * (drv_display.c:168). WiFi 会话期间才走到这里, 见 ui_core_draw_buf_borrow. */
+        lcd_draw_bitmap_sync(area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
     } else {
         esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,   /* 把 area 区域像素送显 */
                                   area->x2 + 1, area->y2 + 1, color_p);
     }
     lv_disp_flush_ready(disp_drv);   /* 通知 LVGL 本次刷新完成 */
+}
+
+/* ── 绘制缓冲交接: WiFi 会话期间把第二块让出去 ──
+ *
+ * 是"所有权转移", 不是释放: 两块缓冲始终在 .bss 里, 只是这段时间 LVGL 只认第一块,
+ * 第二块由 app/wifi_arena.c 建成私有堆给 WiFi 的分配用. 结束时把描述符改回来即可 ——
+ * 一次结构体写入 (lv_hal_disp.c:150-158 只写 buf1/buf2/size), 不需要任何分配,
+ * 所以"一定拿得回来", 也不依赖公共堆当时还剩多少连续空间.
+ *
+ * 只能在 LVGL 任务里调用 (所有 lv_* 都在那儿跑). 调用点是设置页的 WiFi 入口
+ * (借用) 和 WIFI_EV_RELEASED 处理 (归还). */
+
+void ui_core_draw_buf_borrow(void **mem, size_t *len)
+{
+    if (s_buf_borrowed) {                    /* 幂等: 重复进流程不会重复切换 */
+        if (mem) *mem = s_draw_buf2;
+        if (len) *len = sizeof(s_draw_buf2);
+        return;
+    }
+
+    /* 先把刷新切到同步, 再排空在途 DMA, 最后才换描述符.
+     * 顺序很重要: 竖屏刷屏是异步入队的, 此刻可能刚有一块 buf2 还在被 DMA 读,
+     * 直接把它交给 WiFi 就是"一边 DMA 读、一边堆头往里写". */
+    s_flush_sync = true;
+    lcd_wait_idle();                         /* drv_display.c: 无命令 tx_param 屏障 */
+    lv_refr_now(NULL);                       /* 把还挂着的脏区用同步路径刷完 */
+
+    lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, NULL, LVGL_BUF_SIZE);
+    s_buf_borrowed = true;
+    lv_obj_invalidate(lv_scr_act());         /* 下一帧整屏重画, 不受旧内容影响 */
+
+    if (mem) *mem = s_draw_buf2;
+    if (len) *len = sizeof(s_draw_buf2);
+    ESP_LOGI(TAG, "绘制缓冲改单缓冲, 交出 %u B 给私有堆", (unsigned)sizeof(s_draw_buf2));
+}
+
+void ui_core_draw_buf_return(void)
+{
+    if (!s_buf_borrowed) return;
+
+    lv_refr_now(NULL);                       /* 此刻还是同步路径, 刷完就是干净的 */
+    lcd_wait_idle();
+
+    lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, s_draw_buf2, LVGL_BUF_SIZE);
+    s_flush_sync   = false;
+    s_buf_borrowed = false;
+    lv_obj_invalidate(lv_scr_act());         /* 双缓冲回来了, 整屏重画一次 */
+
+    ESP_LOGI(TAG, "绘制缓冲恢复双缓冲 (%u B/块)", (unsigned)sizeof(s_draw_buf1));
 }
 
 void ui_touch_set_enabled(bool enable)
@@ -197,7 +279,8 @@ void ui_core_display_init(void)
     /* 允许运行期软件旋转 (设置页的 WiFi 密码键盘是横屏): 不打开这个开关,
      * lv_disp_set_rotation() 只会记下角度, 不会真的把像素转过来.
      * 旋转时 LVGL 用 LV_DISP_ROT_MAX_BUF (lv_conf.h, 2KB) 分块转,
-     * 每块都是一次同步刷屏 —— 见 my_disp_flush 里的说明. */
+     * 每块再由 my_disp_flush 过一遍 1KB 中转缓冲、按面板行分几次同步刷屏 ——
+     * 见 my_disp_flush 里的说明. */
     s_disp_drv.sw_rotate = 1;
     lv_disp_drv_register(&s_disp_drv);
 

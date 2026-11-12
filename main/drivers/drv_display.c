@@ -174,6 +174,15 @@ esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
     return esp_lcd_panel_io_tx_param(s_panel_io, -1, NULL, 0);
 }
 
+/* 等 SPI 在途事务排空 (DMA 屏障), 不动画面.
+ * 和 lcd_draw_bitmap_sync 末尾那次 tx_param 是同一个动作, 单独拿出来给
+ * "要复用/转交某块缓冲"的场景用: 竖屏刷屏是异步的, 交接绘制缓冲之前必须先排空,
+ * 否则那块内存可能还在被 DMA 读, 换给 WiFi 当私有堆就会被同时写. */
+esp_err_t lcd_wait_idle(void)
+{
+    return esp_lcd_panel_io_tx_param(s_panel_io, -1, NULL, 0);
+}
+
 /* ────────────────────────── Backlight (LEDC PWM) ────────────────────────── */
 #define BL_PWM_FREQ_HZ  5000   /* 背光 PWM 频率 5kHz (高于人耳可闻, 避免电感啸叫) */
 

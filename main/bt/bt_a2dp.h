@@ -70,6 +70,12 @@ bool bt_a2dp_is_connected(void);        /* 是否已连接 */
 void bt_a2dp_pause(void);
 void bt_a2dp_resume(void);
 
+/* 蓝牙内存让位 (给 OTA 用): release=true 拆掉 Bluedroid 主机 (~12.2KB 内部 RAM),
+ * false 装回 (~69ms). 只在蓝牙任务已挂起 (退出音乐后的状态) 时生效, 幂等.
+ * 典型用法: WiFi 初始化之前拆, WiFi 退干净之后装 —— 中途装会在碎片化的池子里
+ * 抢几块 1~3KB 连续块 (三个任务栈), 这正是要避免的. */
+bool bt_mem_trim(bool release);
+
 #ifdef __cplusplus
 }
 #endif
