@@ -25,8 +25,11 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_private/wifi_os_adapter.h"   /* wifi_osi_funcs_t / g_wifi_osi_funcs */
 
+#include "bt_a2dp.h"
 #include "update.h"
+#include "wifi_arena.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "WIFI";
@@ -82,6 +85,20 @@ static volatile bool        s_connecting   = false;   /* 只在连接等待期�
 static volatile int         s_disc_reason  = 0;
 static esp_event_handler_instance_t s_h_wifi = NULL;
 static esp_event_handler_instance_t s_h_ip   = NULL;
+
+/* ── WiFi 私有堆 ── */
+
+/* 交给 WiFi 的那块内存 (由 UI 在会话开始前塞进来, 见 wifi_mgr_provide_arena) */
+static void  *s_arena_mem = NULL;
+static size_t s_arena_len = 0;
+
+/* WiFi 的 OS 抽象表副本. 必须是静态的: 库里存的是这张表的指针, 会话期间一直要用,
+ * 放栈上出了 wifi_acquire 就是悬空指针. 整表拷贝是为了把 _version / _magic
+ * (wifi_os_adapter.h:30 / :162) 原样带过去 —— 那两个字段是库校验表是否匹配的,
+ * 自己逐项填一定会错, 错了 esp_wifi_init 直接拒绝. */
+static wifi_osi_funcs_t s_osi;
+static bool             s_osi_patched = false;
+
 
 static wifi_ap_t s_ap[WIFI_MGR_MAX_APS];
 static int       s_ap_n = 0;
@@ -203,6 +220,38 @@ static bool wifi_acquire(void)
      * (Kconfig 的 range 是 1..10, 1 合法) */
     cfg.rx_mgmt_buf_num = 1;
 
+    /* 把 UI 让出来的那块内存做成私有堆, 让 WiFi 的分配全部落到里面.
+     *
+     * 换的是 osi_funcs 表里三组分配 (wifi_os_adapter.h:73-74 / 122-129):
+     *   _malloc / _free            — 通用块 (实测几乎不用: 峰值 0 字节)
+     *   _*_internal                — RX 缓冲/mgmt/TX, init 时约 17.6KB, 动态 RX ≤6.4KB
+     *   _wifi_*                    — net80211/WPA 的"可放 PSRAM"那批, 仍吃公共 DRAM
+     * 三组全接, 公共内部堆才真正腾得出来给收包缓冲 (1600 B/块).
+     *
+     * 不做绕过: 私有堆满就让 WiFi 拿到 NULL (与真实堆行为一致), 不偷偷退回公共堆 ——
+     * 否则"WiFi 不占公共堆"这件事就不成立. 峰值/失败次数在 wifi_arena_close() 里打. */
+    if (s_arena_mem && wifi_arena_open(s_arena_mem, s_arena_len)) {
+        memcpy(&s_osi, &g_wifi_osi_funcs, sizeof s_osi);
+        /* 三组全走"私有堆优先, 满了落公共堆"的两级分配 (见 wifi_arena.c):
+         * 0.7.32 只用私有堆时, 99% 满那一刻有 68 次 malloc 拿到 NULL. */
+        s_osi._malloc           = wifi_arena_malloc_tiered;
+        s_osi._free             = wifi_arena_free;
+        s_osi._malloc_internal  = wifi_arena_malloc_internal;
+        s_osi._calloc_internal  = wifi_arena_calloc_internal;
+        s_osi._zalloc_internal  = wifi_arena_zalloc_internal;
+        s_osi._realloc_internal = wifi_arena_realloc;
+        s_osi._wifi_malloc      = wifi_arena_malloc_tiered;
+        s_osi._wifi_calloc      = wifi_arena_calloc_tiered;
+        s_osi._wifi_zalloc      = wifi_arena_zalloc_tiered;
+        s_osi._wifi_realloc     = wifi_arena_realloc;
+        cfg.osi_funcs  = &s_osi;
+        s_osi_patched  = true;
+        ESP_LOGI(TAG, "WiFi 分配转入私有堆 (%u B): 三组都是两级 (私有堆优先)",
+                 (unsigned)s_arena_len);
+    } else {
+        ESP_LOGW(TAG, "没有可用私有堆, WiFi 仍走公共堆");
+    }
+
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         /* NO_MEM 时 IDF 内部 deinit 会失败, 已经分配的那部分收不回来 —— 只能重启恢复 */
@@ -229,8 +278,6 @@ static bool wifi_acquire(void)
     memset(&wc, 0, sizeof wc);          /* 清掉 NVS 里可能残留的旧配置 */
     esp_wifi_set_config(WIFI_IF_STA, &wc);
 
-    esp_wifi_set_ps(WIFI_PS_NONE);      /* 扫描/连接期间不要省电休眠, 响应快 */
-
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                         wifi_event_cb, NULL, &s_h_wifi);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
@@ -242,6 +289,18 @@ static bool wifi_acquire(void)
         return false;
     }
 
+    /* 省电模式必须在 esp_wifi_start() 之后设: 写在 start 之前会被启动流程覆盖掉.
+     * 症状就是下载降到 ~1KB/s —— 每次 DTIM 唤醒只交出一小段, 其余时间 AP 把包
+     * 压着, TCP 只能重传退避 (10/20/30/47 秒的间隔就是退避阶梯). 打完实际值,
+     * 一次上机就能确认到底关没关. */
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+    esp_wifi_get_ps(&ps);
+    ESP_LOGI(TAG, "省电模式: %d (0=NONE, 1=MIN_MODEM, 2=MAX_MODEM)", (int)ps);
+
+    /* 带宽/协议保持驱动默认 (40MHz + 11n).
+     * 曾经试过压到 20MHz + 只允许 11b/g, 实测更慢 (首包 28s → 37s): 问题不在
+     * 高阶 MCS, 在接收缓冲不够 (见 sdkconfig.defaults 里的 RX 缓冲说明). */
     log_heap("WiFi 已启动", heap0);
     return true;
 }
@@ -278,6 +337,16 @@ static void wifi_release(void)
         esp_wifi_deinit();
         s_wifi_inited = false;
     }
+
+    /* WiFi 已 deinit, 库里的分配全部还回来了, 现在才能拆私有堆: 顺序反过来
+     * (先拆堆再 deinit) 库会往一个不存在的堆里 free. 峰值和失败次数在这里打出来,
+     * 那就是"33KB 够不够"的实测答案. */
+    if (s_osi_patched) {
+        s_osi_patched = false;
+        wifi_arena_close();
+    }
+    s_arena_mem = NULL;      /* 这块地由 UI 收回 (ui_core_draw_buf_return) */
+    s_arena_len = 0;
 
     if (s_netif) {
         esp_netif_destroy_default_wifi(s_netif);
@@ -415,7 +484,13 @@ static void wifi_do_connect(const char *ssid, const char *pass)
     s_connecting = false;
 
     if (bits & BIT_GOT_IP) {
-        ESP_LOGI(TAG, "连接 \"%s\" 成功", ssid);
+        /* 再确认一次: 连接流程有可能把 PS/带宽改回去 (只读, 不再重设, 免得掉线) */
+        wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+        wifi_bandwidth_t bw = WIFI_BW_HT40;
+        esp_wifi_get_ps(&ps);
+        esp_wifi_get_bandwidth(WIFI_IF_STA, &bw);
+        ESP_LOGI(TAG, "连接 \"%s\" 成功 (省电模式 %d, 带宽 %s)", ssid, (int)ps,
+                 bw == WIFI_BW_HT20 ? "20MHz" : "40MHz");
         post_evt(WIFI_EV_CONNECTED, 0);
         return;
     }
@@ -434,6 +509,12 @@ static void wifi_do_connect(const char *ssid, const char *pass)
 static void wifi_task(void *arg)
 {
     (void)arg;
+
+    /* 先让蓝牙把 12.2KB 主机内存还回来, 再 esp_wifi_init (它自己要 ~28KB DMA 内部堆).
+     * 顺序反过来不行: 那时 WiFi 各层的缓冲已经把池子切成碎片, 而蓝牙装回去要几块
+     * 1~3KB 的连续块 (BTC/BTU/HCI 三个任务栈各要一块), 有可能满足不了.
+     * 此页 (WP_BOOT "正在初始化 WiFi…") 正好把这段 215ms 藏起来. */
+    bt_mem_trim(true);
 
     if (wifi_acquire()) {
         post_evt(WIFI_EV_READY, 0);
@@ -472,6 +553,11 @@ static void wifi_task(void *arg)
     }
 
     wifi_release();
+
+    /* WiFi 退干净 (~28KB 回到池子) 之后再装回蓝牙: 此刻池子最宽裕, 69ms 就够.
+     * 提示页那条路已经提前装过了 (bt_mem_trim 幂等, 这里直接返回); 这里是
+     * "没走提示页"的退出路径 (检查页/版本页按返回) 的兜底. */
+    bt_mem_trim(false);
     post_evt(WIFI_EV_RELEASED, 0);
 
     s_task  = NULL;
@@ -480,6 +566,18 @@ static void wifi_task(void *arg)
 }
 
 /* ── 对外接口 ── */
+
+void wifi_mgr_provide_arena(void *mem, size_t len)
+{
+    if (s_alive) {
+        /* 会话已经在跑: 此刻换堆没有意义 (WiFi 早就在用上一次的区域分配了) */
+        ESP_LOGW(TAG, "会话进行中, 忽略新的私有堆区域");
+        return;
+    }
+    s_arena_mem = mem;
+    s_arena_len = mem ? len : 0;
+    ESP_LOGI(TAG, "已收到私有堆区域: %p + %u B", mem, (unsigned)s_arena_len);
+}
 
 void wifi_mgr_start_session(void)
 {

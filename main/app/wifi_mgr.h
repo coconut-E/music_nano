@@ -2,6 +2,7 @@
 #define __WIFI_MGR_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -49,6 +50,14 @@ typedef enum {
     WIFI_EV_UPDATE_FAIL,    /* 下载/写入失败 (arg=upd_err_t), 槽位与 otadata 未动 */
     WIFI_EV_RELEASED,       /* 资源已全部释放, 任务已退出 */
 } wifi_ev_t;
+
+/* 把一块内存交给 WiFi 当私有堆用 (见 app/wifi_arena.h).
+ *
+ * 必须在 wifi_mgr_start_session() **之前**调: esp_wifi_init 在会话任务里一跑起来
+ * 就开始分配, 那时堆必须已经建好, 否则这一轮还是从公共堆分.
+ * mem/len 一般是 LVGL 让出来的第二块绘制缓冲 (ui_core_draw_buf_borrow).
+ * 会话释放后这块内存仍归调用方, 由它还给 LVGL (ui_core_draw_buf_return). */
+void wifi_mgr_provide_arena(void *mem, size_t len);
 
 /* 开一次会话 (幂等: 已在会话中则什么都不做) */
 void wifi_mgr_start_session(void);

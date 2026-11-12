@@ -10,6 +10,7 @@ idf_component_register(SRCS "main.c"
                             "app/ota.c"
                             "app/update.c"
                             "app/wifi_mgr.c"
+                            "app/wifi_arena.c"
                             "app/wifi_cred.c"
                             "audio/audio_task.cpp"
                             "audio/decoder_mp3.cpp"
@@ -57,6 +58,12 @@ idf_component_register(SRCS "main.c"
 # 由 tools/ota_cert.ps1 生成; 换服务器只改这个文件, 不用改代码.
 # 用 TXTFILES 是为了自动补末尾的 NUL —— mbedtls 按字符串取 CN, 需要它.
 target_add_binary_data(${COMPONENT_LIB} "certs/ota_ca.pem" TEXT)
+
+# 拦截 libc free: 闭源 WiFi 库里有绕过 osi 表直接调 free 的代码 (libpp.a 的
+# hal_crypto.o: hal_crypto_set_key_entry 里 callx8 free), 私有堆的指针落到那里
+# 会被当成非法释放. 全镜像的 free 引用改指向 __wrap_free, 由它按地址分流 ——
+# 见 app/wifi_arena.c 末尾. 只加链接选项, 不改 IDF.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=free")
 
 # 测试开关 (build.ps1 -TestCrash): 编译一版"一启动就 abort"的固件,
 # 用来验证 OTA 回退 (镜像能过校验, 但跑不起来).

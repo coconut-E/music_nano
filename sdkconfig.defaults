@@ -100,14 +100,25 @@ CONFIG_LWIP_IPV6=n
 #    只剩几 KB. 曾出现连 WiFi 时 DMA 只剩 719B、最大连续块 248B —— WiFi 每发
 #    一帧要 ~1.6KB 的 TX 缓冲, 拿不到就返回 ESP_ERR_NO_MEM, 表现为
 #    "关联成功、DISCOVER 发不出去、20 秒拿不到 IP"(见 wifi_mgr.c 的 TX 闸门).
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=2
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
 CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=2
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
-# 聚合窗口不能大于动态 RX 缓冲数 (Kconfig 里 wifi_init.c 有 #error 检查)
-CONFIG_ESP_WIFI_RX_BA_WIN=2
+# 聚合窗口不能大于动态 RX 缓冲数 (Kconfig 里 wifi_init.c 有 #error 检查).
+# 3 → 8: AP 协商给的是 64 帧 (日志 ba-add ... winSize:64), 而我们只留 3 帧给乱序
+# 重排, 40MHz 下一个聚合组轻松超过 3 帧, 超出的直接丢 → TCP 重传 → 20~30 秒退避.
+# 动态 RX 从 4 加到 8 才允许窗口开到 8; 那 6.4KB 由 _*_internal 的两级分配落到
+# 公共 DMA 堆 (私有堆优先, 见 main/app/wifi_arena.c).
+CONFIG_ESP_WIFI_RX_BA_WIN=8
+
+# ── lwIP TCP: 按官方 speed 指南 (examples/wifi/iperf) 放开 ──────────────
+# 默认 WND=5760 只有 4 个 MSS: 2.3MB 的 OTA 下载实测每 4KB 要等 10~30 秒,
+# 服务器侧 sendall 一直阻塞 (对端窗口关着). 23040 = 16 个 MSS.
+# RECVMBOX 6 → 16: tcpip 线程收包队列太浅时, 应用读得再快也会被邮箱卡住.
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
 
 # ── DHCP 的地址冲突检查: 全关 ────────────────────────────────────────────
 # 这是 Kconfig 里的一个 choice (3 选 1), 所以不能写成 "ARP_CHECK=n" —— 那样
