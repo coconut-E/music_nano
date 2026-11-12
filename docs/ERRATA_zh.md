@@ -86,3 +86,16 @@
 
 ---
 *本表由注释补全工作维护。已完成：第一轮 9 项 + 第二轮 34 项 = 修正/补全 43 项；待确认 4 项。*
+
+---
+
+## 三、网络 OTA（0.7.8）验证出的两条
+
+| # | 结论 | 依据 |
+|---|------|------|
+| 1 | **`esp_ota_begin(part, image_size)` 会先把整包擦掉**：给了具体 size（而不是 `OTA_WITH_SEQUENTIAL_WRITES`）时，它直接 `esp_partition_erase_range(0, ALIGN_UP(size, 4K))`。2.2MB 就是十几秒不可中断的连续擦除，期间 cache 关着、别的任务全停。写 OTA 要用 sequential，让擦除跟着每次 write 只擦本次跨到的扇区。 | `components/app_update/esp_ota_ops.c:190`（预擦）与 `:314`（`need_erase` 分步擦） |
+| 2 | **PSRAM 里的缓冲不能直接交给 `esp_ota_write`**：ESP32 主 flash（SPI1）的 `supports_direct_write()` 恒为 false，于是 `esp_flash_write` 的 `direct_write` 为 false，退化成 `uint32_t temp_buf[8]`（**32 字节**）一次一拷 —— 2.2MB 就是 6.9 万次 cache 开关，比"整段停一次"还糟。必须先 memcpy 进内部 RAM（4KB）再写。 | `components/spi_flash/esp_flash_api.c:1128` + `components/hal/spi_flash_hal.c:155`（`spi != SPI1_HOST` 才 true） |
+
+另：`sdkconfig.defaults` 里"网络升级不做 TLS（会拉进 mbedtls + 60KB 证书包）"的旧结论在 0.7.8 作废 ——
+只 pin 自己的 CA（`main/certs/ota_ca.pem`）就不用证书包，实测 TLS 全栈代价 +177,264 B，
+app 槽还剩 2%（47,312 B）。

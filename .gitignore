@@ -17,3 +17,13 @@ firmware/
 # flash_tool build output
 tools/flash_tool/out/
 tools/flash_tool/tmp/
+
+# OTA 调试服务器的本机材料: CA 私钥/服务器私钥不进仓库
+# 进仓库的只有公共证书: tools/ota_cert/ca.pem、tools/ota_cert/isrg.pem、
+# main/certs/ota_ca.pem (后者是前两者拼出来的, 是固件的构建依赖)
+tools/ota_cert/*.key
+tools/ota_cert/*.crt
+tools/ota_cert/*.csr
+tools/ota_cert/*.srl
+tools/ota_cert/server.ip
+tools/ota_cert/*.js

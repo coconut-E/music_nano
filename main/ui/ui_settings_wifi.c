@@ -1,7 +1,13 @@
-/* 设置页的「连接 WiFi」子流程 (5 个页面)
+/* 设置页的「连接 WiFi / 检查更新」子流程
  *
  *   连接 WiFi (竖屏) → 密码 (横屏, 顺时针 90°) → 正在连接 (竖屏) → 正在检查更新 (竖屏)
  *                                              ↘ 连接失败 (竖屏, 2 秒) → 退出流程
+ *   正在检查更新 → 版本页 (当前/最新 + 「更新」) → 下载/写入进度页 → 重启进新固件
+ *                ↘ 已是最新 / 检查失败 / 更新失败 (竖屏提示页, 到点自动退出)
+ *
+ * 所有提示页 (连接失败/检查失败/已是最新/更新失败/更新完成) 都是同一个
+ * notice_build(), 到点和按电源键都是同一个 flow_exit() —— 加一种结果不需要
+ * 再写一套"删页面 + 停定时器 + 收尾"的代码.
  *
  * 为什么连接失败要退出整个流程, 而不是退回列表
  * ----------------------------------------------
@@ -52,11 +58,13 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "lvgl.h"
 
 #include "power_mgr.h"
 #include "ui_core.h"
 #include "ui_settings_wifi.h"
+#include "update.h"
 #include "wifi_cred.h"
 #include "wifi_mgr.h"
 
@@ -84,6 +92,7 @@ static const char *TAG = "SET_WIFI";
 
 extern const lv_font_t lv_font_global_16;
 extern const lv_font_t lv_font_montserrat_14;
+extern const lv_font_t lv_font_montserrat_18;
 
 typedef enum {
     WP_NONE = 0,
@@ -91,12 +100,16 @@ typedef enum {
     WP_LIST,        /* 连接 WiFi: SSID 列表 + 扫描/连接 */
     WP_PASS,        /* 密码 (横屏) */
     WP_CONNECTING,  /* 正在连接 */
-    WP_FAIL,        /* 连接失败 (显示原因, 2 秒后自动退出流程) */
-    WP_CHECK,       /* 正在检查更新 (占位) */
+    WP_CHECK,       /* 正在查版本 (GET releases) */
+    WP_VER,         /* 当前版本 / 最新版本 + 「更新」按钮 */
+    WP_PROG,        /* 下载 + 写入 (进度条, 期间不许退出) */
+    WP_NOTICE,      /* 结果提示 (失败原因/已是最新/更新完成), 到点自动退出 */
 } wpage_t;
 
-/* 失败提示停留时长: 够看清原因, 又不至于让人等 */
-#define FAIL_HOLD_MS  2000
+/* 提示页停留时长 */
+#define NOTICE_HOLD_MS     2000   /* 连接失败 / 已是最新 */
+#define NOTICE_HOLD_ERR    3000   /* 带原因的失败 */
+#define NOTICE_HOLD_DONE   1500   /* 更新完成, 即将重启 */
 
 /* WiFi 断开原因里的"密码错": IDF 的 WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT.
  * 只有这个原因才删掉 NVS 里记的密码 —— 热点没开/信号差/超时都不是密码的问题,
@@ -143,22 +156,36 @@ static lv_obj_t *s_pass_pg;
 static lv_obj_t *s_ta;
 static lv_obj_t *s_kb;
 
-/* 正在连接 / 连接失败 / 检查更新 */
+/* 正在连接 / 检查更新 / 版本页 / 进度页 / 结果提示 */
 static lv_obj_t   *s_conn_pg;
-static lv_obj_t   *s_dots;
-static lv_obj_t   *s_fail_pg;
-static lv_timer_t *s_fail_timer;    /* 失败页的 2 秒一次性定时器 */
+static lv_obj_t   *s_dots;          /* 「正在…」后面的点点 (连接页和检查页共用) */
 static lv_obj_t   *s_check_pg;
+static lv_obj_t   *s_ver_pg;
+static lv_obj_t   *s_ver_cur;
+static lv_obj_t   *s_ver_new;
+static lv_obj_t   *s_prog_pg;
+static lv_obj_t   *s_prog_title;
+static lv_obj_t   *s_prog_pct;
+static lv_obj_t   *s_prog_sub;
+static lv_obj_t   *s_notice_pg;
+static lv_timer_t *s_notice_timer;  /* 提示页的一次性定时器 */
+static bool        s_restart_after_exit;  /* 升级成功: 释放完 WiFi 直接重启 */
 static int         s_tick;
+static int         s_prog_tick;
 
 /* 前向声明 (页面之间互相跳转) */
 static void list_build(void);
 static void pass_build(void);
 static void pass_delete(void);
 static void conn_page_delete(void);
+static void prog_delete(void);
+static void ver_delete(void);
+static void notice_delete(void);
+static void notice_build(const char *title, const char *l1, const char *l2,
+                         const char *l3, int hold_ms);
 static void start_connect(void);
 static void flow_exit(const char *why);
-static void fail_exit_cb(lv_timer_t *t);
+static void notice_exit_cb(lv_timer_t *t);
 
 /* ── 小工具 ── */
 
@@ -637,13 +664,89 @@ static void pass_build(void)
     lv_obj_set_style_text_color(s_kb, W_TEXT, LV_PART_ITEMS);
 }
 
-/* ── 检查更新页 (占位) ── */
+/* ── 正在检查更新 ── */
+
+static void check_delete(void)
+{
+    if (s_check_pg) { lv_obj_del(s_check_pg); s_check_pg = NULL; s_dots = NULL; }
+}
 
 static void check_build(void)
 {
+    check_delete();
     s_check_pg = page_create();
     mk_label(s_check_pg, "正在检查更新", W_TEXT, 0, 128, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
-    mk_label(s_check_pg, "（OTA 尚未实现）", W_MUTED, 0, 162, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+    s_dots = mk_label(s_check_pg, ".", W_MUTED, 0, 162, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+}
+
+/* ── 版本页: 当前 / 最新 + 「更新」 ── */
+
+static void ver_delete(void)
+{
+    if (s_ver_pg) {
+        lv_obj_del(s_ver_pg);
+        s_ver_pg = NULL; s_ver_cur = NULL; s_ver_new = NULL;
+    }
+}
+
+static void prog_build(void);
+
+static void update_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_busy) return;
+    power_mgr_notify_activity();
+
+    const upd_status_t *st = update_status();
+    if (st->phase != UPD_READY) return;     /* 状态不对就什么都不做 */
+
+    prog_build();
+    s_page = WP_PROG;
+    set_busy(true);                         /* 下载/写入期间电源键无效 */
+    wifi_mgr_update_start();
+}
+
+static void ver_build(void)
+{
+    const upd_status_t *st = update_status();
+    char b[48];
+
+    ver_delete();
+    s_ver_pg = page_create();
+    mk_label(s_ver_pg, "发现新版本", W_TEXT, 0, 52, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    snprintf(b, sizeof b, "当前 %s", st->cur_ver);
+    s_ver_cur = mk_label(s_ver_pg, b, W_MUTED, 0, 88, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    snprintf(b, sizeof b, "最新 %s", st->new_ver);
+    s_ver_new = mk_label(s_ver_pg, b, W_TEXT, 0, 112, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    lv_obj_t *btn = mk_btn(s_ver_pg, "更新", 26, 168, 120, 40);
+    lv_obj_add_event_cb(btn, update_click_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* ── 进度页 (下载 + 写入) ── */
+
+static void prog_delete(void)
+{
+    if (s_prog_pg) {
+        lv_obj_del(s_prog_pg);
+        s_prog_pg = NULL; s_prog_title = NULL; s_prog_pct = NULL; s_prog_sub = NULL;
+    }
+}
+
+static void prog_build(void)
+{
+    prog_delete();
+    s_prog_pg = page_create();
+    s_prog_title = mk_label(s_prog_pg, "正在下载", W_TEXT, 0, 88, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    /* 百分比用 18px 数字字体: 16px 那套里数字宽度不一样, 跳动时会左右抖 */
+    s_prog_pct = mk_label(s_prog_pg, "0%", W_TEXT, 0, 118, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_style_text_font(s_prog_pct, &lv_font_montserrat_18, 0);
+
+    s_prog_sub = mk_label(s_prog_pg, "", W_MUTED, 0, 158, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+    mk_label(s_prog_pg, "请勿断电", W_MUTED, 0, 196, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
 }
 
 /* ── 事件处理 ── */
@@ -665,42 +768,50 @@ static const char *reason_text(int reason)
     }
 }
 
-/* ── 连接失败提示页 (竖屏, 2 秒后自动退出流程) ── */
+/* ── 结果提示页 (竖屏, 到点自动退出流程) ──
+ *
+ * 连接失败 / 检查更新失败 / 已是最新 / 更新失败 / 更新完成 全走这一页:
+ * 标题 + 两行说明 + 底部一句话 + 一个一次性定时器. 到点和按电源键都是 flow_exit().
+ * 以前只有"连接失败"一种, 每加一种结果都要复制一遍"删页面 + 停定时器 + 收尾";
+ * 现在只有一套, 新增结果只需要在 handle_evt 里换个文案. */
 
-static void fail_timer_cancel(void)
+static void notice_timer_cancel(void)
 {
-    if (s_fail_timer) { lv_timer_del(s_fail_timer); s_fail_timer = NULL; }
+    if (s_notice_timer) { lv_timer_del(s_notice_timer); s_notice_timer = NULL; }
 }
 
-static void fail_delete(void)
+static void notice_delete(void)
 {
-    fail_timer_cancel();
-    if (s_fail_pg) { lv_obj_del(s_fail_pg); s_fail_pg = NULL; }
+    notice_timer_cancel();
+    if (s_notice_pg) { lv_obj_del(s_notice_pg); s_notice_pg = NULL; }
 }
 
-static void fail_build(int reason)
-{
-    s_fail_pg = page_create();
-    mk_label(s_fail_pg, "连接失败", W_TEXT, 0, 96, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
-
-    /* 哪台机器失败了也要看得见: 只显示原因会让人分不清是刚才那台还是别的 */
-    lv_obj_t *ssid = mk_label(s_fail_pg, s_sel, W_MUTED, 10, 128,
-                              TFT_HOR_RES - 20, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_long_mode(ssid, LV_LABEL_LONG_DOT);
-
-    /* s_cred_dropped 只可能因为"密码错"而置位, 所以这里的文案是准的 */
-    const char *rt = s_cred_dropped ? "保存的密码已失效" : reason_text(reason);
-    mk_label(s_fail_pg, rt, W_TEXT, 0, 162, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
-    mk_label(s_fail_pg, s_cred_dropped ? "已清除这次记住的密码" : "即将返回",
-             W_MUTED, 0, 196, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
-}
-
-/* 2 秒到点: 和电源键走的是同一个出口 */
-static void fail_exit_cb(lv_timer_t *t)
+/* 到点: 和电源键走的是同一个出口 */
+static void notice_exit_cb(lv_timer_t *t)
 {
     (void)t;
-    s_fail_timer = NULL;        /* 一次性定时器由 LVGL 自己回收, 这里只清指针 */
-    flow_exit("连接失败提示超时");
+    s_notice_timer = NULL;      /* 一次性定时器由 LVGL 自己回收, 这里只清指针 */
+    flow_exit("提示页超时");
+}
+
+/* l1 是灰色小字 (SSID/版本), l2 是主文案, l3 是"即将返回"这种尾巴; 传 NULL 就不建 */
+static void notice_build(const char *title, const char *l1, const char *l2,
+                         const char *l3, int hold_ms)
+{
+    notice_delete();
+    s_notice_pg = page_create();
+    mk_label(s_notice_pg, title, W_TEXT, 0, 96, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    if (l1) {
+        lv_obj_t *o = mk_label(s_notice_pg, l1, W_MUTED, 10, 128,
+                               TFT_HOR_RES - 20, LV_TEXT_ALIGN_CENTER);
+        lv_label_set_long_mode(o, LV_LABEL_LONG_DOT);
+    }
+    if (l2) mk_label(s_notice_pg, l2, W_TEXT, 0, 162, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+    if (l3) mk_label(s_notice_pg, l3, W_MUTED, 0, 196, TFT_HOR_RES, LV_TEXT_ALIGN_CENTER);
+
+    s_notice_timer = lv_timer_create(notice_exit_cb, hold_ms, NULL);
+    lv_timer_set_repeat_count(s_notice_timer, 1);
 }
 
 static void handle_evt(wifi_ev_t ev, int arg)
@@ -760,7 +871,11 @@ static void handle_evt(wifi_ev_t ev, int arg)
         s_pass_from_nvs = false;
         check_build();
         s_page = WP_CHECK;
-        ESP_LOGI(TAG, "已连上 \"%s\", 进入检查更新页", s_sel);
+        /* 查询期间又要禁止退出: 这一步最长 5 秒 (esp_http_client 的连接超时).
+         * 不设的话, 用户能在查询中途退出, 而 worker 还在等 TLS 握手. */
+        set_busy(true);
+        wifi_mgr_update_check();
+        ESP_LOGI(TAG, "已连上 \"%s\", 开始检查更新", s_sel);
         break;
 
     case WIFI_EV_CONNECT_FAIL:
@@ -782,20 +897,111 @@ static void handle_evt(wifi_ev_t ev, int arg)
             s_pass_from_nvs = false;
         }
 
-        s_page = WP_FAIL;
+        s_page = WP_NOTICE;
         set_busy(false);            /* 这 2 秒里电源键可以立刻走 */
-        fail_build(arg);
-        s_fail_timer = lv_timer_create(fail_exit_cb, FAIL_HOLD_MS, NULL);
-        lv_timer_set_repeat_count(s_fail_timer, 1);
+        notice_build("连接失败", s_sel,
+                     s_cred_dropped ? "保存的密码已失效" : reason_text(arg),
+                     s_cred_dropped ? "已清除这次记住的密码" : "即将返回",
+                     NOTICE_HOLD_MS);
         ESP_LOGW(TAG, "连接失败 (%s), %d 秒后自动退出流程",
-                 s_cred_dropped ? "保存的密码已失效" : reason_text(arg), FAIL_HOLD_MS / 1000);
+                 s_cred_dropped ? "保存的密码已失效" : reason_text(arg), NOTICE_HOLD_MS / 1000);
+        break;
+
+    case WIFI_EV_UPDATE_CHECKED: {
+        /* arg = upd_err_t; 0 表示查到了, 但"有没有新版本"看 phase */
+        set_busy(false);
+        check_delete();
+        const upd_status_t *st = update_status();
+
+        if (arg != UPD_OK) {
+            char http[24] = "";
+            if (st->http) snprintf(http, sizeof http, "HTTP %d", (int)st->http);
+            s_page = WP_NOTICE;
+            notice_build("检查更新失败", update_err_text(arg), http, "即将返回", NOTICE_HOLD_ERR);
+            break;
+        }
+        if (st->phase == UPD_LATEST) {
+            char cur[40];
+            snprintf(cur, sizeof cur, "当前 %s", st->cur_ver);
+            s_page = WP_NOTICE;
+            /* 两行都填: 上面是"当前 0.7.8", 中间是服务器最新版本 */
+            notice_build("已是最新版本", cur, st->new_ver, "即将返回", NOTICE_HOLD_MS);
+            break;
+        }
+        ver_build();
+        s_page = WP_VER;
+        break;
+    }
+
+    case WIFI_EV_UPDATE_FAIL: {
+        const upd_status_t *st = update_status();
+        char http[24] = "";
+        if (st->http) snprintf(http, sizeof http, "HTTP %d", (int)st->http);
+
+        prog_delete();
+        check_delete();
+        s_page = WP_NOTICE;
+        set_busy(false);
+        notice_build("更新失败", update_err_text(arg), http, "即将返回", NOTICE_HOLD_ERR);
+        break;
+    }
+
+    case WIFI_EV_UPDATE_DONE:
+        /* 页面留着, 1.5 秒后由提示页的定时器走 flow_exit → 释放 WiFi →
+         * RELEASED 时直接 esp_restart(). 期间不删页面, 屏幕上不会闪白底. */
+        prog_delete();
+        s_restart_after_exit = true;
+        s_page = WP_NOTICE;
+        set_busy(false);
+        notice_build("更新完成", update_status()->new_ver, "正在重启", NULL, NOTICE_HOLD_DONE);
         break;
 
     case WIFI_EV_RELEASED:
+        if (s_restart_after_exit) {
+            ESP_LOGI(TAG, "新固件已写入, 重启进入校验窗口");
+            esp_restart();
+        }
         ESP_LOGI(TAG, "WiFi 资源已释放, 退出流程");
         ui_wifi_destroy();
         if (s_end_cb) s_end_cb();
         break;
+    }
+}
+
+/* 进度页刷新: worker 只写 upd_status_t 里的数字, 这里 5Hz 取一次.
+ * 不跨任务碰 LVGL —— 所有 lv_* 调用都还在 LVGL 任务里. */
+static void prog_refresh(void)
+{
+    const upd_status_t *st = update_status();
+    uint32_t total = st->total;
+
+    int pct = 0;
+    if (total) {
+        /* 下载和写入的进度各占一半: dl/wr 都是"已完成字节", 相加再除以 2*total,
+         * 这样下载→暂停→写入的循环里进度条匀速上升, 不会来回跳 */
+        uint64_t done = (uint64_t)st->dl + st->wr;
+        pct = (int)(done * 100 / ((uint64_t)total * 2));
+        if (pct > 100) pct = 100;
+    }
+
+    if (s_prog_title) {
+        lv_label_set_text(s_prog_title, st->phase == UPD_WRITING ? "正在写入" : "正在下载");
+    }
+    if (s_prog_pct) {
+        char b[16];
+        snprintf(b, sizeof b, "%d%%", pct);
+        lv_label_set_text(s_prog_pct, b);
+    }
+    if (s_prog_sub) {
+        char b[64];
+        /* 下载阶段看"已下载", 写入阶段看"已写入" —— 两个计数是分开推进的 */
+        uint32_t cur = (st->phase == UPD_WRITING) ? st->wr : st->dl;
+        snprintf(b, sizeof b, "%u.%u / %u.%u MB",
+                 (unsigned)(cur / (1024u * 1024u)),
+                 (unsigned)((cur / (1024u * 102u)) % 10u),
+                 (unsigned)(total / (1024u * 1024u)),
+                 (unsigned)((total / (1024u * 102u)) % 10u));
+        lv_label_set_text(s_prog_sub, b);
     }
 }
 
@@ -810,11 +1016,16 @@ static void poll_cb(lv_timer_t *t)
         if (!s_timer) return;      /* 处理过程中流程结束 (定时器已被删), 不再取事件 */
     }
 
-    /* 「正在连接」的点点动画 */
-    if (s_page == WP_CONNECTING && s_dots) {
+    /* 「正在…」的点点动画 (连接页和检查更新页共用同一个标签) */
+    if ((s_page == WP_CONNECTING || s_page == WP_CHECK) && s_dots) {
         static const char *dots[3] = { ".", "..", "..." };
         s_tick++;
         if ((s_tick % 4) == 0) lv_label_set_text(s_dots, dots[(s_tick / 4) % 3]);
+    }
+
+    /* 进度页每 200ms 刷一次 (5Hz): 再快没意义, 文字重绘也不便宜 */
+    if (s_page == WP_PROG && (s_prog_tick++ % 2) == 0) {
+        prog_refresh();
     }
 }
 
@@ -834,7 +1045,7 @@ static void flow_exit(const char *why)
 
     ESP_LOGI(TAG, "退出流程 (%s): 交给 wifi_mgr 释放, 完成后回设置页", why);
 
-    fail_timer_cancel();        /* 失败页的 2 秒定时器一并取消, 免得二次触发;
+    notice_timer_cancel();      /* 提示页的定时器一并取消, 免得二次触发;
                                  * 页面本身留到 ui_wifi_destroy 再删, 免得释放期间
                                  * 露出底下的列表页闪一下 */
     s_session = false;          /* 不再接受扫描/连接命令 */
@@ -858,9 +1069,12 @@ bool ui_wifi_enter(void)
     s_sel[0]  = '\0';
     s_pass[0] = '\0';
     s_tick    = 0;
+    s_prog_tick = 0;
     s_leaving = false;
     s_pass_from_nvs = false;
     s_cred_dropped  = false;
+    s_restart_after_exit = false;
+    update_reset();              /* 版本号/进度/错误码全部归零 */
 
     /* 先只建极简占位页: esp_wifi_init 要 ~28KB DMA 内部堆, 完整列表页要 ~10KB,
      * 先建页会把 init 掐死. 等 WIFI_EV_READY 再换成真正的列表页. */
@@ -914,13 +1128,22 @@ void ui_wifi_back(void)
         ESP_LOGI(TAG, "正在连接, 忽略返回");
         break;
 
-    case WP_FAIL:
-        /* 不等那 2 秒了, 立刻走 —— 和定时器到点是同一个出口 */
-        flow_exit("失败页按返回");
-        break;
-
     case WP_CHECK:
         flow_exit("检查更新页返回");
+        break;
+
+    case WP_VER:
+        /* 查到新版本但用户不想升: 和"检查更新失败"一样整流程退出 */
+        flow_exit("版本页返回");
+        break;
+
+    case WP_PROG:
+        ESP_LOGI(TAG, "下载/写入进行中, 忽略返回");
+        break;
+
+    case WP_NOTICE:
+        /* 不等那几秒了, 立刻走 —— 和定时器到点是同一个出口 */
+        flow_exit("提示页按返回");
         break;
 
     default:
@@ -944,8 +1167,10 @@ void ui_wifi_destroy(void)
     pass_delete();
 
     conn_page_delete();
-    fail_delete();
-    if (s_check_pg) { lv_obj_del(s_check_pg); s_check_pg = NULL; }
+    notice_delete();
+    check_delete();
+    ver_delete();
+    prog_delete();
     boot_delete();
 
     if (s_list_pg) {

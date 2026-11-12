@@ -43,6 +43,10 @@ typedef enum {
     WIFI_EV_SCAN_FAIL,      /* 扫描失败 (arg=esp_err_t) */
     WIFI_EV_CONNECTED,      /* 已连上并拿到 IP */
     WIFI_EV_CONNECT_FAIL,   /* 连接失败 (arg=断开原因码, 负数表示本地超时/参数错误) */
+    WIFI_EV_UPDATE_CHECKED, /* 版本查询结束 (arg=update.h 的 upd_err_t; 0 表示查到了,
+                             * 但"有没有新版本"要看 update_status()->phase == UPD_READY) */
+    WIFI_EV_UPDATE_DONE,    /* 固件已写进备份槽并切好启动项, 可以重启了 */
+    WIFI_EV_UPDATE_FAIL,    /* 下载/写入失败 (arg=upd_err_t), 槽位与 otadata 未动 */
     WIFI_EV_RELEASED,       /* 资源已全部释放, 任务已退出 */
 } wifi_ev_t;
 
@@ -54,6 +58,15 @@ void wifi_mgr_scan(void);
 
 /* 请求连接 (ssid/password 会被拷贝, 调用方可以立刻释放字符串) */
 void wifi_mgr_connect(const char *ssid, const char *password);
+
+/* 请求查版本 (GitHub Releases). 完成后发 WIFI_EV_UPDATE_CHECKED.
+ * 只能在已连上 (WIFI_EV_CONNECTED) 之后投递. */
+void wifi_mgr_update_check(void);
+
+/* 请求下载并写入备份槽. 完成后发 WIFI_EV_UPDATE_DONE / WIFI_EV_UPDATE_FAIL.
+ * 成功时 otadata 已经指向新槽, 由 UI 决定何时 esp_restart().
+ * 进度不在这里推: UI 直接读 update_status() (见 app/update.h). */
+void wifi_mgr_update_start(void);
 
 /* 请求释放: 任务跑完手上的操作后释放全部资源并发 WIFI_EV_RELEASED */
 void wifi_mgr_release(void);

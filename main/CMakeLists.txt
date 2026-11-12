@@ -8,6 +8,7 @@ idf_component_register(SRCS "main.c"
                             "app/lyrics.c"
                             "app/app_mode.c"
                             "app/ota.c"
+                            "app/update.c"
                             "app/wifi_mgr.c"
                             "app/wifi_cred.c"
                             "audio/audio_task.cpp"
@@ -49,8 +50,13 @@ idf_component_register(SRCS "main.c"
                             "resources/lv_font_heart_44.c"
                             "resources/font_part.c"
                     PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_partition app_update
-                                  esp_wifi esp_event esp_netif lwip esp_http_client
+                                  esp_wifi esp_event esp_netif lwip esp_http_client mbedtls
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
+
+# 更新服务器的根证书 (PEM). 里面是"本地自签 CA + ISRG Root X1 (+X2)"拼接,
+# 由 tools/ota_cert.ps1 生成; 换服务器只改这个文件, 不用改代码.
+# 用 TXTFILES 是为了自动补末尾的 NUL —— mbedtls 按字符串取 CN, 需要它.
+target_add_binary_data(${COMPONENT_LIB} "certs/ota_ca.pem" TEXT)
 
 # 测试开关 (build.ps1 -TestCrash): 编译一版"一启动就 abort"的固件,
 # 用来验证 OTA 回退 (镜像能过校验, 但跑不起来).

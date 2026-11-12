@@ -19,13 +19,18 @@
 #include "nvs.h"
 #include "app.h"
 #include "ota.h"
+#include "update.h"
 #include "font_part.h"
 #include "sys_monitor.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 
-#define LINE_BUF_SIZE 64   /* 串口命令行缓冲长度 */
+/* 串口命令行缓冲.
+ * 以前是 64, 装不下一条更新服务器的 URL (GitHub 那条 105 字节), 所以按 URL
+ * 上限来定: "ota server " (11) + api (<=300) + NUL. 这是在 console_task 的
+ * 3072 字节栈上开的, 再大就要加栈了. */
+#define LINE_BUF_SIZE 320
 
 static QueueHandle_t s_app_cmd_queue = NULL;   /* 应用命令队列 (解析出的命令投递到这里) */
 
@@ -417,6 +422,54 @@ static void cmd_font(void)
     }
 }
 
+/* ota server            → 打印当前用的服务器
+ * ota server <api>      → 只设版本接口地址, 下载前缀清空 (= 直接用 JSON 里的绝对地址)
+ * ota server <api> <dlp>→ 同时设下载前缀 (GitHub 要 https://gh-proxy.com/)
+ * ota reset             → 抹掉 NVS, 回到编译期默认值
+ *
+ * 为什么要在串口改: 换局域网调试服务器 / 换镜像 / 上线, 都只是两个字符串,
+ * 不该为了这个重编一版固件. */
+static void cmd_ota_server(const char *args)
+{
+    static char api[320], dlp[320];     /* 不占 console_task 的栈 */
+
+    if (!args || !*args) {
+        update_server_get(api, sizeof api, dlp, sizeof dlp);
+        printf("[OTA] 版本接口: %s\n", api);
+        printf("[OTA] 下载前缀: \"%s\"%s\n", dlp,
+               dlp[0] ? "" : "   (空 = 直接拼 JSON 里的绝对地址)");
+        return;
+    }
+
+    /* URL 里不会有空格 (空格都编码成 %20), 所以第一个空格就是 api 的结尾 */
+    const char *sp = strchr(args, ' ');
+    size_t alen = sp ? (size_t)(sp - args) : strlen(args);
+    if (alen == 0 || alen >= sizeof api) {
+        printf("[OTA] 地址长度为 0 或超过 %u 字节\n", (unsigned)sizeof api - 1);
+        return;
+    }
+    memcpy(api, args, alen);
+    api[alen] = '\0';
+
+    if (sp) {
+        while (*sp == ' ') sp++;
+        snprintf(dlp, sizeof dlp, "%s", sp);
+    } else {
+        dlp[0] = '\0';
+    }
+
+    if (update_server_set(api, dlp)) {
+        printf("[OTA] 已保存, 下次「检查更新」生效 (dlp=\"%s\")\n", dlp);
+    }
+}
+
+static void cmd_ota_reset(void)
+{
+    if (update_server_reset()) {
+        printf("[OTA] 已恢复编译期默认值 (gh-proxy + GitHub Releases)\n");
+    }
+}
+
 /* 控制台任务: 非阻塞读串口, 逐字符拼行, 回车后解析执行 */
 static void console_task(void *arg)
 {
@@ -424,7 +477,7 @@ static void console_task(void *arg)
 
     printf("\n=== 音乐播放器 ===\n");
     printf("系统命令: mem | stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名] | memtask\n");
-    printf("升级命令: version | ota | ota boot <0|1> | font crc\n");
+    printf("升级命令: version | ota | ota boot <0|1> | ota server [<api> [<dlp>]] | ota reset | font crc\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     //printf("命令> ");
 
@@ -467,6 +520,12 @@ static void console_task(void *arg)
                         cmd_memtask();
                     } else if (strcmp(line, "version") == 0) {
                         cmd_version();
+                    } else if (strcmp(line, "ota reset") == 0) {
+                        cmd_ota_reset();
+                    } else if (strncmp(line, "ota server", 10) == 0) {
+                        const char *a = line + 10;
+                        while (*a == ' ') a++;
+                        cmd_ota_server(a);
                     } else if (strcmp(line, "ota") == 0) {
                         ota_report();
                     } else if (strcmp(line, "font crc") == 0) {

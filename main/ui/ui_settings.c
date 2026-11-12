@@ -9,10 +9,12 @@
  *
  *   设置列表 ─「固件版本」→ 固件版本详情 ─「检查更新」→ 连接 WiFi ─ 密码(横屏) …
  *      ↑                          ↑                        └→ 正在连接 → 正在检查更新
- *      └──────────────────────────┴───────────────────────────────────┘
+ *      │                          │                                       ↓
+ *      └──────────────────────────┴──────── 版本页 → 下载/写入 → 重启进新固件
  *
  * 「检查更新」之后那几页全在 ui_settings_wifi.c 里 (它自己开关 WiFi、自己管返回),
- * 本文件只负责: 进流程前把列表/详情藏起来, 流程结束时把详情页显示回来. */
+ * 本文件只负责: 进流程前把列表/详情藏起来, 流程结束时把详情页显示回来.
+ * 例外是升级成功: 那条路不回来, 释放完 WiFi 直接 esp_restart(). */
 #include <stdio.h>
 #include <string.h>
 
@@ -345,7 +347,7 @@ static void detail_build(void)
         make_label(s_detail, s_app_mb_str, SET_MUTED, PAD_X, 166, 0, LV_TEXT_ALIGN_LEFT);
     }
 
-    /* 检查更新 (占位: 点了没反应) */
+    /* 检查更新: 进 ui_settings_wifi.c 的子流程 (连 WiFi → 查版本 → 下载/写入) */
     lv_obj_t *btn = lv_btn_create(s_detail);
     lv_obj_set_pos(btn, (TFT_HOR_RES - BTN_W) / 2, BTN_Y);
     lv_obj_set_size(btn, BTN_W, BTN_H);

@@ -24,16 +24,16 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_netif_net_stack.h"     /* esp_netif_get_netif_impl: 只为打日志拿到底层 struct netif */
 #include "esp_wifi.h"
-#include "lwip/netif.h"              /* netif_is_up / netif_is_link_up */
-#include "lwip/pbuf.h"
 
+#include "update.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "WIFI";
 
-#define WIFI_TASK_STACK     5120
+/* 6144: 这个任务现在还跑 TLS 握手 (mbedtls) + esp_http_client 的调用链,
+ * 5120 在握手里余量不够. 任务只在「检查更新」流程里存在, 用完就删. */
+#define WIFI_TASK_STACK     6144
 #define WIFI_TASK_PRIO      2
 #define WIFI_TASK_CORE      0          /* 和 LVGL (core 1) 分开, 扫描时界面照常动 */
 #define WIFI_CONNECT_MS     20000      /* 连接 + 等 IP 的上限 */
@@ -45,6 +45,8 @@ static const char *TAG = "WIFI";
 typedef enum {
     CMD_SCAN = 0,
     CMD_CONNECT,
+    CMD_UPDATE_CHECK,   /* GET 版本接口, 只查不下载 */
+    CMD_UPDATE_START,   /* 下载 + 写备份槽 + 切槽 (成功后由 UI 重启) */
     CMD_RELEASE,
 } wifi_cmd_type_t;
 
@@ -84,140 +86,6 @@ static esp_event_handler_instance_t s_h_ip   = NULL;
 static wifi_ap_t s_ap[WIFI_MGR_MAX_APS];
 static int       s_ap_n = 0;
 
-/* ── 数据帧 TX/RX 观察钩子 (排障用, 定位完可以整块删掉) ──────────────────
- * 现象是"关联成功、DISCOVER 发出去了、但收不到任何回包", 必须分清是
- *   (a) 帧根本没被射频发出去 / 被 AP 丢掉, 还是
- *   (b) 帧出去了、AP 也回了, 但我们没接住.
- * 做法: 包住 lwIP netif 的 linkoutput / input 两个函数指针 —— 它们在
- * esp_netif 里就是"最后一公里"的入口和出口, 每个数据帧都会经过.
- * 打印以太网头的 src/dst MAC 和驱动的返回码, 一眼能看出真伪. */
-static err_t (*s_nf_output)(struct netif *n, struct pbuf *p) = NULL;
-static err_t (*s_nf_input)(struct pbuf *p, struct netif *n)  = NULL;
-static uint32_t s_tx_n = 0;      /* 发出去的数据帧总数 */
-static uint32_t s_rx_n = 0;      /* 收上来的数据帧总数 */
-static uint32_t s_tx_drop = 0;   /* 闸门期丢掉的帧数 */
-/* 闸门关闭到什么时候 (FreeRTOS tick). 关联后的一小段时间里驱动还不接受数据帧,
- * 真递给它会返回 ESP_ERR_NO_MEM 而且缓冲不归还; 连续几帧之后 TX 池就空了,
- * 接下来几十秒一帧都发不出去. 实测: 头 2 帧被拒 -> 第 3 帧能发出去就成功;
- * 头 4 帧被拒 -> 之后 20 秒全灭. 所以这里干脆不递, 等驱动就绪再放行. */
-static volatile TickType_t s_tx_gate_until = 0;
-
-#define TX_GATE_MS  1500
-
-static bool tx_gate_closed(void)
-{
-    return s_tx_gate_until && (xTaskGetTickCount() < s_tx_gate_until);
-}
-
-static void mac_str(const uint8_t *m, char *out)
-{
-    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
-             m[0], m[1], m[2], m[3], m[4], m[5]);
-}
-
-static err_t tx_probe(struct netif *n, struct pbuf *p)
-{
-    const uint8_t *e = (p && p->len >= 14) ? (const uint8_t *)p->payload : NULL;
-    char d[18] = "?", s[18] = "?";
-
-    if (e) {
-        mac_str(e, d);          /* 目的 MAC */
-        mac_str(e + 6, s);      /* 源 MAC */
-    }
-
-    /* 关闸期: 不递给驱动, 直接告诉 lwIP "发成功了".
-     * 上层 (DHCP) 有自己的重试定时器, 等闸门开了自然会再发一遍. */
-    if (tx_gate_closed()) {
-        s_tx_drop++;
-        if (e) {
-            ESP_LOGW(TAG, "TX#%u %uB %s → %s 丢弃 (驱动未就绪, 累计丢 %u)",
-                     (unsigned)s_tx_n, (unsigned)p->tot_len, s, d, (unsigned)s_tx_drop);
-        }
-        return ERR_OK;
-    }
-
-    err_t r = s_nf_output ? s_nf_output(n, p) : ERR_IF;
-    if (e) {
-        s_tx_n++;
-        ESP_LOGI(TAG, "TX#%u %uB %s → %s ret=%d",
-                 (unsigned)s_tx_n, (unsigned)p->tot_len, s, d, (int)r);
-    }
-    /* 驱动还是拒收 (ERR_MEM = TX 池没回收): 立刻再关一会儿闸,
-     * 别继续喂它把池子彻底堵死. */
-    if (r == ERR_MEM) {
-        s_tx_gate_until = xTaskGetTickCount() + pdMS_TO_TICKS(500);
-        ESP_LOGW(TAG, "驱动拒收 (ERR_MEM), 闸门再关 500ms: 内部堆 %u/最大 %u, DMA 堆 %u/最大 %u",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-    }
-    return r;
-}
-
-/* 把收到的帧解到"什么协议、哪个端口"这一层 —— 只为了排障时能一眼认出
- * 那个 342 字节的单播帧到底是不是 DHCP OFFER. */
-static void rx_desc(const uint8_t *e, uint16_t len, char *out, size_t outsz)
-{
-    out[0] = '\0';
-    if (len < 14) return;
-    uint16_t type = (uint16_t)((e[12] << 8) | e[13]);
-
-    if (type == 0x0806) { snprintf(out, outsz, " ARP"); return; }
-    if (type != 0x0800 || len < 34) { snprintf(out, outsz, " type=0x%04x", type); return; }
-
-    const uint8_t *ip  = e + 14;
-    int            ihl = (ip[0] & 0x0f) * 4;
-    int            pr  = ip[9];
-    char           src[16], dst[16];
-    snprintf(src, sizeof src, "%u.%u.%u.%u", ip[12], ip[13], ip[14], ip[15]);
-    snprintf(dst, sizeof dst, "%u.%u.%u.%u", ip[16], ip[17], ip[18], ip[19]);
-
-    if (pr == 17 && ihl >= 20 && len >= 14 + ihl + 4) {
-        const uint8_t *udp = ip + ihl;
-        unsigned sp = (unsigned)((udp[0] << 8) | udp[1]);
-        unsigned dp = (unsigned)((udp[2] << 8) | udp[3]);
-        snprintf(out, outsz, " UDP %s:%u→%s:%u%s", src, sp, dst, dp,
-                 (dp == 68 || sp == 68 || dp == 67 || sp == 67) ? " (DHCP)" : "");
-    } else if (pr == 1) {
-        snprintf(out, outsz, " ICMP %s→%s", src, dst);
-    } else {
-        snprintf(out, outsz, " proto=%d %s→%s", pr, src, dst);
-    }
-}
-
-static err_t rx_probe(struct pbuf *p, struct netif *n)
-{
-    /* 只打印"发给我们的单播" —— 组播/广播 (mDNS 5353、SSDP 1900) 太多,
-     * 而 DHCP OFFER 在这个网络上就是发给本机 MAC 的单播. */
-    if (p && p->len >= 14 && n) {
-        const uint8_t *e = (const uint8_t *)p->payload;
-        s_rx_n++;
-        if (memcmp(e, n->hwaddr, 6) == 0) {
-            char d[18], s[18], info[64];
-            mac_str(e, d);
-            mac_str(e + 6, s);
-            rx_desc(e, (uint16_t)p->len, info, sizeof info);
-            ESP_LOGI(TAG, "RX← %uB %s → %s%s", (unsigned)p->tot_len, s, d, info);
-        }
-    }
-    return s_nf_input ? s_nf_input(p, n) : ERR_IF;
-}
-
-static void probe_install(void)
-{
-    struct netif *n = s_netif ? (struct netif *)esp_netif_get_netif_impl(s_netif) : NULL;
-    if (!n || !n->linkoutput) return;
-    if (n->linkoutput == tx_probe) return;      /* 幂等 */
-    s_nf_output = n->linkoutput;
-    n->linkoutput = tx_probe;
-    if (n->input && n->input != rx_probe) {
-        s_nf_input = n->input;
-        n->input = rx_probe;
-    }
-    ESP_LOGI(TAG, "数据帧观察钩子已装上 (netif=%p)", (void *)n);
-}
-
 /* ── 小工具 ── */
 
 static void post_evt(wifi_ev_t ev, int arg)
@@ -245,14 +113,6 @@ static void wifi_event_cb(void *arg, esp_event_base_t base, int32_t id, void *da
 {
     (void)arg;
 
-    /* STA 启动 (此时还没关联): 装 TX/RX 观察钩子.
-     * 必须早于第一个 DHCP DISCOVER —— 那是 STA_CONNECTED 时由默认 handler
-     * 发的, 而 STA_START 时 esp_netif 的 driver config 已经设好 (linkoutput 可用). */
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        probe_install();
-        return;
-    }
-
     /* 关联成功: 显式叫一次 DHCP 客户端.
      * 本来这活是 esp_netif_create_default_wifi_sta() 注册的默认回调干 (WIFI_EVENT_STA_CONNECTED
      * → esp_netif_action_connected → dhcpc_start), 但那是"进程级只注册一次"的
@@ -261,29 +121,8 @@ static void wifi_event_cb(void *arg, esp_event_base_t base, int32_t id, void *da
      * 可能已经不在了, 表现为: 关联成功、手机显示已连接, 但 20 秒都拿不到 IP. */
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
         if (s_netif) {
-            /* 关联上了: 从这一刻起 1.5 秒后再放行 TX (见 tx_probe 的注释). */
-            s_tx_gate_until = xTaskGetTickCount() + pdMS_TO_TICKS(TX_GATE_MS);
             esp_err_t e = esp_netif_dhcpc_start(s_netif);
-            /* link 标志必须在 DHCP 跑起来之前就已经 up, 否则 lwIP 发不出去包 /
-             * 也不会在链路起来时重启 DHCP. 这里打出来一眼就能判断默认 handler
-             * (esp_netif_action_connected) 到底跑没跑.
-             * 同时比对三个 MAC: 驱动自己的、esp_netif 记的、lwIP 用的 (hwaddr).
-             * 三者必须一致 —— 数据帧的源 MAC 取自 hwaddr, 不一致的话 AP 会当成
-             * 未知站点把我们的数据帧全丢掉 (而关联用的是驱动的 MAC, 照样成功). */
-            struct netif *ln = (struct netif *)esp_netif_get_netif_impl(s_netif);
-            uint8_t mdrv[6] = {0}, mnif[6] = {0};
-            char a[18], b[18], c[18];
-            esp_wifi_get_mac(WIFI_IF_STA, mdrv);
-            esp_netif_get_mac(s_netif, mnif);
-            mac_str(mdrv, a);
-            mac_str(mnif, b);
-            mac_str(ln ? ln->hwaddr : mdrv, c);
-            ESP_LOGI(TAG, "已关联, 启动 DHCP: %s (netif up=%d, link up=%d)",
-                     esp_err_to_name(e),
-                     ln ? (int)netif_is_up(ln) : -1,
-                     ln ? (int)netif_is_link_up(ln) : -1);
-            ESP_LOGI(TAG, "MAC 驱动=%s netif=%s hwaddr=%s%s", a, b, c,
-                     (strcmp(a, c) == 0) ? "" : "  ← 不一致!");
+            ESP_LOGI(TAG, "已关联, 启动 DHCP: %s", esp_err_to_name(e));
         }
         return;
     }
@@ -561,9 +400,6 @@ static void wifi_do_connect(const char *ssid, const char *pass)
              ssid,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-    /* 连接前就关闸: 默认 handler 会在 STA_CONNECTED 里立刻启动 DHCP 并发出第一帧,
-     * 那一帧同样不能被驱动吃掉. 关联成功后会按 1.5 秒重新计时. */
-    s_tx_gate_until = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         s_connecting = false;
@@ -572,43 +408,10 @@ static void wifi_do_connect(const char *ssid, const char *pass)
         return;
     }
 
-    /* 等 IP. 按 5 秒一段等, 每段打一次 DHCP 状态/IP —— 这样 "关联成功但一直 0.0.0.0"
-     * 能直接看出是 DHCP 没跑, 还是跑了但租约迟迟不来 (某些手机热点会这样). */
-    EventBits_t bits = 0;
-    int waited_ms = 0;
-    bool kicked = false;
-    while (waited_ms < WIFI_CONNECT_MS) {
-        bits = xEventGroupWaitBits(s_eg, BIT_GOT_IP | BIT_FAIL, pdTRUE, pdFALSE,
-                                   pdMS_TO_TICKS(5000));
-        waited_ms += 5000;
-        if (bits & (BIT_GOT_IP | BIT_FAIL)) break;
-
-        esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
-        esp_netif_ip_info_t ip = { 0 };
-        if (s_netif) {
-            esp_netif_dhcpc_get_status(s_netif, &st);
-            esp_netif_get_ip_info(s_netif, &ip);
-        }
-        struct netif *ln = s_netif ? (struct netif *)esp_netif_get_netif_impl(s_netif) : NULL;
-        ESP_LOGW(TAG, "等 IP %d 秒: DHCP 状态=%d, IP=" IPSTR ", netif up=%d link up=%d, 数据帧 tx=%u rx=%u drop=%u",
-                 waited_ms / 1000, (int)st, IP2STR(&ip.ip),
-                 ln ? (int)netif_is_up(ln) : -1,
-                 ln ? (int)netif_is_link_up(ln) : -1,
-                 (unsigned)s_tx_n, (unsigned)s_rx_n, (unsigned)s_tx_drop);
-
-        /* 兜底: 5 秒还没 IP, 就把 DHCP 客户端停掉再起一次.
-         * 两种情况都只有好处:
-         *   - 客户端卡在某个状态里 (比如早于链路就绪就发了 DISCOVER): 重启后链路已 up,
-         *     立刻重发 DISCOVER;
-         *   - 服务端有旧绑定、只肯往老 IP 单播 OFFER: 我们收不到, 至少日志里能看到
-         *     第二次 DISCOVER 也没有回包, 直接排除"客户端没跑"这条路. */
-        if (!kicked && s_netif) {
-            kicked = true;
-            esp_netif_dhcpc_stop(s_netif);
-            esp_err_t r = esp_netif_dhcpc_start(s_netif);
-            ESP_LOGW(TAG, "重启 DHCP 客户端: %s", esp_err_to_name(r));
-        }
-    }
+    /* 等 IP: 上限 20 秒. IP 由 WIFI_EVENT_STA_CONNECTED 里显式启动的 DHCP 客户端拿,
+     * 拿到置 BIT_GOT_IP, 被断开置 BIT_FAIL (密码错就是这时知道的). */
+    EventBits_t bits = xEventGroupWaitBits(s_eg, BIT_GOT_IP | BIT_FAIL, pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(WIFI_CONNECT_MS));
     s_connecting = false;
 
     if (bits & BIT_GOT_IP) {
@@ -617,20 +420,12 @@ static void wifi_do_connect(const char *ssid, const char *pass)
         return;
     }
 
-    /* 失败: 主动断开, 别把 4 次握手重传留在后台.
-     * 打印 DHCP 状态和当前 IP —— "关联成功但拿不到 IP" 时, 这两个值能直接区分
-     * 是 DHCP 客户端没启动 (STOPPED/INIT), 还是启动了但租约没拿到 (STARTED + 0.0.0.0). */
-    esp_netif_dhcp_status_t dhcp_st = ESP_NETIF_DHCP_INIT;
-    if (s_netif) esp_netif_dhcpc_get_status(s_netif, &dhcp_st);
-    esp_netif_ip_info_t ip_info = { 0 };
-    if (s_netif) esp_netif_get_ip_info(s_netif, &ip_info);
-
+    /* 失败: 主动断开, 别把 4 次握手重传留在后台 */
     esp_wifi_disconnect();
 
     int reason = (bits & BIT_FAIL) ? s_disc_reason : -1;   /* -1 = 本地超时 */
-    ESP_LOGW(TAG, "连接 \"%s\" 失败 (reason=%d%s), DHCP 状态=%d, IP=" IPSTR, ssid, reason,
-             reason == 15 ? " 密码错误" : (reason == 201 ? " 找不到 AP" : ""),
-             (int)dhcp_st, IP2STR(&ip_info.ip));
+    ESP_LOGW(TAG, "连接 \"%s\" 失败 (reason=%d%s)", ssid, reason,
+             reason == 15 ? " 密码错误" : (reason == 201 ? " 找不到 AP" : ""));
     post_evt(WIFI_EV_CONNECT_FAIL, reason);
 }
 
@@ -656,14 +451,23 @@ static void wifi_task(void *arg)
         if (cmd.type == CMD_RELEASE) break;
 
         if (!s_wifi_inited) {               /* 初始化失败后不该再有新命令 */
-            post_evt(cmd.type == CMD_SCAN ? WIFI_EV_SCAN_FAIL : WIFI_EV_CONNECT_FAIL, -4);
+            int code = (cmd.type == CMD_SCAN)  ? WIFI_EV_SCAN_FAIL
+                     : (cmd.type == CMD_CONNECT) ? WIFI_EV_CONNECT_FAIL
+                     : WIFI_EV_UPDATE_FAIL;
+            post_evt((wifi_ev_t)code, -4);
             continue;
         }
 
         if (cmd.type == CMD_SCAN) {
             wifi_do_scan();
-        } else {
+        } else if (cmd.type == CMD_CONNECT) {
             wifi_do_connect(cmd.ssid, cmd.pass);
+        } else if (cmd.type == CMD_UPDATE_CHECK) {
+            /* 版本查询: 阻塞到拿到结果, 结果码原样回给 UI (0 = 成功, 见 update.h) */
+            post_evt(WIFI_EV_UPDATE_CHECKED, update_check());
+        } else {
+            int r = update_start();
+            post_evt(r == UPD_OK ? WIFI_EV_UPDATE_DONE : WIFI_EV_UPDATE_FAIL, r);
         }
     }
 
@@ -721,6 +525,31 @@ void wifi_mgr_connect(const char *ssid, const char *password)
     if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
         ESP_LOGW(TAG, "连接命令投递失败 (队列满)");
         post_evt(WIFI_EV_CONNECT_FAIL, -5);
+    }
+}
+
+/* 版本查询 / 下载升级: 都只是投命令, 结果走事件 (WIFI_EV_UPDATE_*) */
+void wifi_mgr_update_check(void)
+{
+    if (!s_alive || !s_cmd_q) return;
+    wifi_cmd_t cmd;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.type = CMD_UPDATE_CHECK;
+    if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "版本查询命令投递失败 (队列满)");
+        post_evt(WIFI_EV_UPDATE_FAIL, -5);
+    }
+}
+
+void wifi_mgr_update_start(void)
+{
+    if (!s_alive || !s_cmd_q) return;
+    wifi_cmd_t cmd;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.type = CMD_UPDATE_START;
+    if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "升级命令投递失败 (队列满)");
+        post_evt(WIFI_EV_UPDATE_FAIL, -5);
     }
 }
 

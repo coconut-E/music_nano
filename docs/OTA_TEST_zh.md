@@ -194,7 +194,7 @@ I (16057) POWER: 睡眠抑制 解除
 ## 五、遗留
 
 - 字库分区单槽无备份；字库只由烧录器全烧时写入，不做在线更新。
-- **网络 OTA（app 自己下载 .bin 写进备用槽）尚未实现**，本轮只做线烧链路。
+- ~~**网络 OTA（app 自己下载 .bin 写进备用槽）尚未实现**~~ → 0.7.8 已实现，见第八节。
 - 烧录速度受限于这颗 Puya flash 的擦除（约 14 KB/s），全套 5MB 仍需 6~8 分钟。
 
 ## 六、分区改造后复验（0.7.1 / 2026-11-7）
@@ -278,3 +278,96 @@ R4 结束后两个槽都是 `VALID`，设备跑在 ota_1 的 0.8.0 上。
 - 坏固件只污染它自己那个槽，运行槽和 otadata 都没事，回退全自动
 
 
+
+
+## 八、网络 OTA（0.7.8 / 2026-11-12）
+
+前七节的"写进另一个槽"都是烧录器代劳的。这一节是**设备自己上网下载 .bin**。
+
+### 8.1 链路
+
+```
+设置 → 固件版本 → [检查更新]
+  → 连接 WiFi（扫描/密码/连接，见 ui_settings_wifi.c）
+  → 正在检查更新         GET  releases 接口（JSON）
+  → 版本页               当前 0.7.8 / 最新 0.7.9 + 「更新」
+  → 下载 + 写入           256KB 一块进 PSRAM → 停读 → 4KB 一步写 ota_x
+  → 更新完成，正在重启    释放 WiFi 后 esp_restart()
+  → 新固件首启            第六/七节那套 15 秒校验窗口 → VALID（没确认就回退）
+```
+
+服务器走 GitHub Releases，但**都经 gh-proxy 转发**（`https://gh-proxy.com/` + 原始地址），
+国内可直连。两个接口路径固定：
+
+| 用途 | 地址 |
+|---|---|
+| 版本 | `https://gh-proxy.com/https://api.github.com/repos/coconut-E/music_nano/releases?per_page=5` |
+| 下载 | `https://gh-proxy.com/` + JSON 里的 `browser_download_url` |
+
+资产命名约定 `music_nano 0.7.9.bin`（空格/下划线/短横都认），版本号取自**文件名**。
+两个串存在 NVS（`ota/api`、`ota/dlp`），串口可以改：
+
+```
+ota server                          # 看当前用的是哪个
+ota server <api>                    # 只改版本接口（下载前缀清空 = 直接用 JSON 里的绝对地址）
+ota server <api> <dlp>              # 同时改下载前缀（GitHub 要 https://gh-proxy.com/）
+ota reset                           # 抹掉，回到编译期默认值
+```
+
+### 8.2 设备端三个关键决定（都有源码依据）
+
+1. **`esp_ota_begin` 必须传 `OTA_WITH_SEQUENTIAL_WRITES`**。
+   给了具体 `image_size` 会先 `esp_partition_erase_range()` 把整包擦掉
+   （`esp_ota_ops.c:190`），2.2MB 连续擦除十几秒不可中断。sequential 是
+   "写到哪里擦到哪里"（同文件 `:314` 的 `need_erase` 分支）。
+
+2. **PSRAM 指针不能直接喂 `esp_ota_write`**。
+   ESP32 主 flash（SPI1）的 `supports_direct_write()` 恒为 false
+   （`hal/spi_flash_hal.c:155`），`esp_flash_api.c:1128` 于是走 `direct_write=false`
+   分支，退化成 **32 字节一次**的栈上拷贝 —— 2.2MB 就是 6.9 万次 cache 开关。
+   所以先 memcpy 进 4KB 内部 RAM，再写。
+
+3. **每 4KB 让出一次 CPU**。写 flash 的窗口里 cache 是关的，另一个核取不到指令；
+   一次扇区擦写 25~50ms，连着写就是整机卡死。`vTaskDelay(2ms)` 把停顿切碎，
+   界面/音频/蓝牙都能拿到 CPU（`CONFIG_FREERTOS_HZ=1000`，2ms 是 2 个 tick）。
+
+失败路径：**otadata 只在最后一步 `esp_ota_set_boot_partition()` 写一次**。
+下载中断/写入失败/校验失败都只会在备份槽里留一段垃圾，下次启动照旧跑老槽。
+
+### 8.3 已经验证过的（主机侧，2026-11-12）
+
+| 项 | 结果 |
+|---|---|
+| 编译 | `0x244730` = **2,377,520 B**，槽 2,425,600 B，剩 `0xb8d0`（**2%**）|
+| TLS 代价 | 2,377,520 − 2,200,256 = **+177,264 B**（esp-tls + mbedtls TLS1.2 + x509）|
+| 局域网 mock 服务器 + pin 的 CA | python `ssl.create_default_context(cafile=main/certs/ota_ca.pem)` 走完整 TLS：JSON 200 / 501 B，固件 2,377,520 B |
+| gh-proxy 的 API | 200，`[]`（仓库还没有 release）|
+| gh-proxy 的资产 | 200，`application/octet-stream`，带 `Content-Length`，**没有 302** |
+| gh-proxy 的证书链 | `gh-proxy.com` ← YE2 ← Root YE ← ISRG Root X2 ← **ISRG Root X1**（2035-06-04）|
+
+因为只有 `gh-proxy.com` 一个 TLS 出口，固件里只 pin **ISRG Root X1 + X2**
+（外加局域网调试用的自签 CA，三张拼在 `main/certs/ota_ca.pem`，~4KB）。
+证书**有效期不校验**（`CONFIG_MBEDTLS_HAVE_TIME_DATE=n`）：本机没有 RTC/SNTP，
+开了会让 1970 年的系统时间把所有证书判成"还没生效"。
+
+### 8.4 待上机验证
+
+| # | 场景 | 期望 |
+|---|---|---|
+| 1 | 局域网 mock 发布与本机同版本 | 「已是最新版本」2 秒 → 回设置 |
+| 2 | 发布更高版本 | 版本页显示两个版本 → 点更新 → 进度走 → 自动重启 → 15 秒窗口 → `ota report` 显示切槽 |
+| 3 | `build.ps1 -TestCrash` 发布坏固件 | OTA 成功后启动即崩 → bootloader 自动退回旧槽（复用第七节链路）|
+| 4 | 下载中途杀掉 mock 服务器 | 「更新失败：下载中断」→ 自动退出，`ota report` 两槽/otadata 均未变 |
+| 5 | 换一张 CA 重编 | 「更新失败：证书校验失败」|
+| 6 | 升级前后 `free` / `psram` | 暂存块（256KB PSRAM）与弹跳块（4KB 内部）都释放；WiFi 释放后内部堆回到 ~37KB |
+| 7 | 写入阶段盯界面 | 进度条 5Hz 在动，最长卡顿应 ≈ 一次 4KB 擦写（目标 < 100ms）|
+
+### 8.5 已知取舍
+
+- 发布后最多 **60 秒**才可见：gh-proxy 走 Cloudflare，API 响应带
+  `cache-control: max-age=60`，这不是设备的问题。
+- GitHub API 有速率限制，而且 gh-proxy 的出口 IP 是共享的（实测撞到过
+  `API rate limit exceeded`）。所以 403 要按"服务器繁忙，稍后再试"处理，
+  **不要重试轰炸**。
+- 字库分区依然不参与 OTA（`main` 只写 app 槽），改字库仍要烧录器。
+- 没做固件签名（secure boot）：信任链 = TLS pin + `esp_ota_end` 的镜像校验和。

@@ -59,10 +59,29 @@ CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=n
 CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
 # 再腾 ~8KB: 非 ISR 的 FreeRTOS 函数放 flash (IDF 官方给的手段, 只挪标了安全的那部分)
 CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
-# 网络升级不做 TLS: 走明文 http + 镜像 SHA256 校验 (HTTPS 会拉进 mbedtls TLS 栈和
-# 60KB 的 CA 证书包, app 分区放不下, 也用不上)
-CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=n
+# ── 网络升级 (OTA) 的 TLS: 要 https, 但只 pin 自己的 CA ──────────────
+# 更新服务器是 gh-proxy (代理 api.github.com / github.com), 必须 https.
+# 之前"走明文 http"的想法作废: 明文下镜像内容全靠 SHA256 校验, 而 sha 也是从
+# 网络拿的, 等于没有信任根.
+#
+# 为什么不开证书包 (CERTIFICATE_BUNDLE): 整个 Mozilla 根证书包 ~60KB flash,
+# 而我们只需要两张 —— ISRG Root X1/X2 (Let's Encrypt 系). 证书由
+# tools/ota_cert.ps1 拼进 main/certs/ota_ca.pem, 和局域网调试服务器的自签 CA
+# 共用一个文件 (mbedtls 支持一个 PEM buffer 里放多张证书).
+#
+# 为什么关掉证书有效期检查 (HAVE_TIME_DATE): 本机没有 RTC, 也没做 SNTP,
+# 系统时间是 1970, 开了这一项所有证书都会"还没生效". 关掉之后 mbedtls 不比对
+# notBefore/notAfter, 信任完全来自"pin 的根证书"+ 镜像自带的 SHA256 校验.
+# 代价: 过期证书也会被接受 —— 对"只连自己 pin 的两个域名"来说可以接受,
+# 以后要是做 SNTP, 把这一项改回 y 即可 (局域网调试服务器就会验不过).
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+CONFIG_MBEDTLS_HAVE_TIME_DATE=n
+# TLS 的收发缓冲 (16KB IN + 4KB OUT) 放 PSRAM: WiFi 起来后内部堆只剩十几 KB,
+# 放内部会把握手直接挤死. 这两块只被 CPU 读写, 不参与 DMA, 放 PSRAM 没有副作用.
+# 同时不保留对端证书 (省 ~1.5KB RAM, 本流程不看证书内容).
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 # 只用 IPv4; IPv6 在 lwip 里占 26KB flash
 CONFIG_LWIP_IPV6=n
 # ── WiFi 运行期内部 RAM: 默认缓冲数太奢侈, 按默认值 esp_wifi_init 会直接
