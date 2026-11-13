@@ -1,20 +1,24 @@
-/* 字库分区加载: 把 font16.bin 映射进来填 font_dsc
+﻿/* 字库分区加载: 把 font16.bin 映射进来填 font_dsc
  *
  * 背景
  * ----
- * 字库 3.27MB (glyph_bitmap 2.80MB + glyph_dsc 0.46MB) 占原 app 的 66%,
- * 而 OTA 双槽每个只有 2.19MB, 所以这两块搬到独立分区 (见 tools/split_font.py)。
+ * 字库 1.88MB (glyph_bitmap 1.50MB + glyph_dsc 0.46MB) 若留在 app 里会吃掉
+ * 大半个 2.875MB 的 OTA 槽, 所以这两块搬到独立分区 (见 tools/split_font.py)。
+ * 0.7.13 起位深从 4bpp 降到 2bpp, bitmap 2.80MB → 1.50MB: 16px 在 1.47"/247ppi
+ * 屏上只有 1.645mm, 4 级灰的损失在实机距离下分辨不出来 (放大 5 倍才明显),
+ * 换来的 1.3MB 给了两个 app 槽。
  *
  * 为什么用 mmap 而不是拷进 PSRAM
  * -----------------------------
- * 本机 PSRAM 只有 2MB (README "ESP32 双核 240MHz 2M PSRAM"), 装不下 3.2MB;
- * 而且拷一份等于把启动时的 3.2MB 读盘时间白花。mmap 是零拷贝, 读路径和
+ * 本机 PSRAM 只有 2MB (README "ESP32 双核 240MHz 2M PSRAM"), 装不下 1.88MB 之外
+ * 还要放播放缓冲; 而且拷一份等于把启动时的读盘时间白花。mmap 是零拷贝, 读路径和
  * 原来放在 app .rodata 里完全一样, 性能不变。
  *
- * 唯一约束是 ESP32 的 DROM 窗口只有 4MB (0x3F400000-0x3F800000):
- * 拆完 app 的 .rodata 约 620KB, 窗口剩 3.40MB, 本字库映射要 50 页 =
- * 3.125MB, 余量 4 页。若以后 .rodata 涨到 0.87MB 以上, mmap 会失败,
- * 开机日志会打 "资源不足", 届时必须回头压 .rodata。
+ * 唯一约束是 ESP32 的 DROM 窗口只有 4MB (0x3F400000-0x3F800000 = 64 页):
+ * 拆完 app 的 .rodata 13 页 (829KB), 窗口剩 51 页, 本字库映射要 30 页 =
+ * 1.97MB, **余量 21 页**。这 21 页也是 OTA 校验要用的 (esp_image_verify 至少
+ * 要 2 页, 见 docs/ERRATA_zh.md 第六节第 5 条); 若以后 .rodata 涨到 1.3MB 以上,
+ * mmap 会失败, 开机日志会打 "资源不足", 届时必须回头压 .rodata。
  *
  * 分区格式
  * ----

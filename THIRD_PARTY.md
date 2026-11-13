@@ -6,7 +6,7 @@
 
 | 组件 | 版本 | 许可证 | 来源 |
 | --- | --- | --- | --- |
-| [ESP-IDF](https://github.com/espressif/esp-idf) | ≥ 5.5.5 | Apache-2.0 | Espressif |
+| [ESP-IDF](https://github.com/espressif/esp-idf) | 5.5.5（必须同版本，见下） | Apache-2.0 | Espressif |
 | [LVGL](https://github.com/lvgl/lvgl) | 8.3.11 | MIT | LVGL |
 | [esp_lcd_jd9853](https://components.espressif.com/components/mydazy/esp_lcd_jd9853) | 2.0.0 | 以上游仓库为准（Apache-2.0） | mydazy |
 | [micro-mp3](https://components.espressif.com/components/esphome/micro-mp3) | 0.4.0 | 以上游仓库为准 | esphome |
@@ -16,3 +16,9 @@
 > 注：`third_party/jpegdec` 为本地覆盖版本（修复了三分量 1x2 采样封面的支持），其许可证见
 > [third_party/jpegdec/LICENSE](third_party/jpegdec/LICENSE)。其余组件在首次构建时由组件管理器下载，
 > 对应许可证文件位于各自组件目录内。
+
+> **ESP-IDF 必须正好是 5.5.5，不能升级也不能降级。** WiFi 协议栈
+> （`libnet80211.a` / `libpp.a` / `libcoexist.a` / `libcore.a`）是随 IDF 一起发布的预编译库，
+> 与同版本的 `wifi_os_adapter.h` 表布局严格绑定；`main/app/wifi_arena.c` 还会整表
+> `memcpy` 后替换分配器，并用 `-Wl,--wrap=free` 截获 libpp 对 libc `free` 的直接调用，
+> 换版本时表项顺序/数量一变就会踩到空函数指针。低版本另有 SPI 总线死锁 bug。

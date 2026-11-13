@@ -113,6 +113,28 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 # 公共 DMA 堆 (私有堆优先, 见 main/app/wifi_arena.c).
 CONFIG_ESP_WIFI_RX_BA_WIN=8
 
+# ── 防呆: 这几项一旦丢, 固件直接不能用, 所以也写进 defaults ─────────────
+# 2026-11-13 有人误操作把 sdkconfig 重置成 IDF 默认, 丢了 121 行, 其中:
+#   - CONFIG_SPIRAM 丢了 → 编出来是"没有 PSRAM"的固件 (app 一启动就分配失败)
+#   - CONFIG_PARTITION_TABLE_CUSTOM 丢了 → 变成 single-app 表, 双槽/字库分区全没
+#   - CONFIG_FREERTOS_HZ 1000 → 100
+# sdkconfig 本身在版本控制里 (git checkout -- sdkconfig 能救回来), 但这几项写进
+# defaults 之后, 即使再被重置成默认值, 至少下次生成配置时还是对的.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+CONFIG_ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND=y
+CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED=y
+CONFIG_PM_SLP_SPIRAM_HALFSLEEP_EXIT_WAIT_DELAY=150
+
 # ── lwIP TCP: 按官方 speed 指南 (examples/wifi/iperf) 放开 ──────────────
 # 默认 WND=5760 只有 4 个 MSS: 2.3MB 的 OTA 下载实测每 4KB 要等 10~30 秒,
 # 服务器侧 sendall 一直阻塞 (对端窗口关着). 23040 = 16 个 MSS.

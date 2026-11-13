@@ -4,7 +4,7 @@
 
 /* 字库分区加载 (main/resources/font16.bin -> 分区表里的 font 分区)
  *
- * app 里不再包含 glyph_bitmap / glyph_dsc (共 3.27MB), 开机时把 font 分区
+ * app 里不再包含 glyph_bitmap / glyph_dsc (共 1.88MB, 2bpp), 开机时把 font 分区
  * 通过 MMU 映射进 DROM 窗口, 再把指针填进字库的 font_dsc。
  * 读路径和原来完全一样 (都是 flash cache 映射), 渲染性能不变。
  *

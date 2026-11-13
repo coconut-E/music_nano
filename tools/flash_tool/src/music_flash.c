@@ -1,8 +1,8 @@
-/*
+﻿/*
  * music_nano 烧录工具  (Windows x86-64 / MinGW-w64)
  *
  * 只服务本仓库这套固件 (分区布局见仓库根 partitions.csv):
- *   bootloader@0x1000 / 分区表@0x8000 / ota_0@0x30000 / ota_1@0x280000 / font@0x4D0000
+ *   bootloader@0x1000 / 分区表@0x8000 / ota_0@0x30000 / ota_1@0x310000 / font@0x5F0000
  *
  * 定位: 只做两件事
  *   (1) 芯片全空时的首次全量烧录 (bootloader + 分区表 + ota_0 + 字库)
@@ -61,8 +61,8 @@
 /* 固定布局 (partitions.csv). 这几个不是"默认值"而是硬约束:
  * 这个工程只有这一套合法布局, 写错地址会直接写成砖。 */
 #define APP0_ADDR           0x030000u   /* ota_0 */
-#define APP1_ADDR           0x280000u   /* ota_1 */
-#define FONT_ADDR           0x4D0000u   /* font (字库) */
+#define APP1_ADDR           0x310000u   /* ota_1 */
+#define FONT_ADDR           0x5F0000u   /* font (字库) */
 /* 系统区上界: 0x030000 以下只有 bootloader/分区表/nvs/phy_init/otadata,
  * 没有任何空隙可以写别的东西。旧布局这里还有 0x22000-0x40000 的 64KB 对齐空洞,
  * nvs 扩到 144KB 之后空洞消失, 判定规则反而变简单了。 */
@@ -2013,7 +2013,7 @@ int main(int argc, char **argv)
     if (check_targets() != 0) {
         ERR_LINE("拒绝烧录: %s", g_err);
         SAY("     低于 0x30000 只允许 bootloader(0x1000) / 分区表(0x8000) / phy_init(0x2D000)\n");
-        SAY("     / otadata(0x2E000); app 从 0x30000 起, 字库从 0x4D0000 起。\n");
+        SAY("     / otadata(0x2E000); app 从 0x30000 起, 字库从 0x5F0000 起。\n");
         SAY("     这份 flash_args 是旧分区布局留下的, 用 tools\\flash_step.ps1 重新摆镜像。\n");
         rc = 1;
         goto out;

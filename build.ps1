@@ -115,7 +115,9 @@ function Import-IdfEnvironment {
 if (-not (Test-IdfReady)) {
     if (-not (Import-IdfEnvironment)) {
         Write-Host "未找到可用的 ESP-IDF 环境。" -ForegroundColor Yellow
-        Write-Host "请先安装 ESP-IDF (>=5.5.5), 或手动导出环境后再运行:" -ForegroundColor Yellow
+        # 必须正好 5.5.5: WiFi 预编译库 (libnet80211/libpp) 与同版本 wifi_os_adapter.h 绑定,
+        # 本工程还整表替换了 osi_funcs 并 --wrap=free, 换版本会踩到空函数指针.
+        Write-Host "请先安装 ESP-IDF 5.5.5 (必须正好这个版本), 或手动导出环境后再运行:" -ForegroundColor Yellow
         Write-Host "  . <IDF_DIR>\export.ps1" -ForegroundColor Yellow
         Write-Host "也可直接指定路径:  .\build.ps1 -IdfPath <IDF_DIR> [-IdfToolsPath <TOOLS_DIR>]" -ForegroundColor Yellow
         exit 1

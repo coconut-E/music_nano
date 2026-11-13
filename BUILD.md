@@ -2,7 +2,9 @@
 
 ## 环境准备
 
-安装 **ESP-IDF ≥ 5.5.5**（低版本存在 SPI 总线死锁 bug），然后导出环境：
+安装 **ESP-IDF 5.5.5**（必须正好这个版本，不能升也不能降：WiFi 协议栈是随 IDF 发布的
+预编译库，与同版本 `wifi_os_adapter.h` 的表布局绑定，本工程整表替换了分配器并
+`--wrap=free`；低版本另有 SPI 总线死锁 bug），然后导出环境：
 
 ```powershell
 # Windows PowerShell（将 <IDF_DIR> 替换为你的 esp-idf 路径）

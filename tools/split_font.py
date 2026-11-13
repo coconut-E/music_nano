@@ -1,19 +1,23 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """把 lv_font_conv 生成的巨型字库 .c 拆成「瘦 .c + 独立二进制」。
 
 背景
 ----
-app 要压进 2.19MB 的 OTA 槽, 而字库存量 3.33MB:
-    glyph_bitmap 2,803,930 B  (2.80MB)
+app 要压进 2.875MB 的 OTA 槽 (0.7.13 起), 而字库存量 1.88MB (2bpp):
+    glyph_bitmap 1,504,277 B  (1.43MB)
     glyph_dsc      462,032 B  (28,877 条 x 16B)
-占了 app 的 66%。把这两块搬进独立的 font 分区, app 侧只剩
-cmaps / kern / unicode_list 这些小表 (二进制约 67KB)。
+留在 app 里会吃掉大半个槽。把这两块搬进独立的 font 分区, app 侧只剩
+cmaps / kern / unicode_list 这些小表 (二进制约 275KB 源码 / 67KB 数据)。
 
-注意 ESP32 的 DROM 窗口只有 4MB (0x3F400000-0x3F800000), 现在 .rodata
-占了 3.96MB。拆完后 .rodata 约 620KB, 窗口剩 3.40MB, 字库 mmap 需要
-50 页 = 3.125MB —— 余量只有 4 页, 所以这两块必须原样搬走, 不能在 app
-里留任何副本。
+0.7.12 及以前是 4bpp (bitmap 2,803,930 B, 合计 3.27MB); 降到 2bpp 后
+DROM 占用从 50 页降到 30 页, 顺带把 OTA 校验要的空闲页腾出来了
+(见 docs/ERRATA_zh.md 第六节第 5 条)。位深由生成文件里的 .bpp 决定,
+本脚本不假设是 4。
+
+注意 ESP32 的 DROM 窗口只有 4MB (0x3F400000-0x3F800000 = 64 页):
+拆完 .rodata 13 页, 字库 mmap 30 页, 余量 21 页 —— 这两块必须原样搬走,
+不能在 app 里留任何副本。
 
 产物
 ----
@@ -32,7 +36,7 @@ font16.bin 布局 (全部小端)
   0x18  bmp_off     64 + dsc_len
   0x1C  bmp_len
   0x20  glyph_count
-  0x24  bpp         4
+  0x24  bpp         从生成文件的 .bpp 读 (当前 2)
   0x28  reserved[6] 补到 64 字节
   0x40  payload     glyph_dsc[] 紧跟 glyph_bitmap[]
 
@@ -64,7 +68,11 @@ MAGIC_BYTES = b"FNT1"
 VERSION = 1
 HDR_SIZE = 64
 DSC_ENTRY_SIZE = 16
-BPP = 4
+# 位深不写死: 从生成文件的 font_dsc.bpp 读 (4bpp 换 2bpp 时这里不用手改,
+# 免得头和内容对不上; 固件侧真正用的是 .c 里的 .bpp, 这个字段只是留档)
+BPP_DEFAULT = 4
+# 分区大小 (见 partitions.csv 的 font 行), 只用于打印"占分区多少"
+FONT_PART_BYTES = 0x200000
 
 
 # --------------------------------------------------------------------------
@@ -194,7 +202,7 @@ RE_DSC_ITEM = re.compile(
 )
 
 
-def build_bin(lines, i_bmp, i_bmp_end, i_dsc, i_dsc_end):
+def build_bin(lines, i_bmp, i_bmp_end, i_dsc, i_dsc_end, bpp):
     bitmap_text = "".join(lines[i_bmp + 1:i_bmp_end])
     if "/*" in bitmap_text:
         bitmap_text = re.sub(r"/\*.*?\*/", "", bitmap_text, flags=re.S)
@@ -223,11 +231,22 @@ def build_bin(lines, i_bmp, i_bmp_end, i_dsc, i_dsc_end):
     hdr = struct.pack(
         "<10I6I", int.from_bytes(MAGIC_BYTES, "little"), VERSION, total, crc,
         HDR_SIZE, len(dsc), HDR_SIZE + len(dsc), len(bitmap),
-        len(dsc_items), BPP, 0, 0, 0, 0, 0, 0,
+        len(dsc_items), bpp, 0, 0, 0, 0, 0, 0,
     )
     if len(hdr) != HDR_SIZE:
         die("header 长度 %d != %d" % (len(hdr), HDR_SIZE))
     return hdr + payload, bitmap, dsc, len(dsc_items)
+
+
+def detect_bpp(lines, i_fdsc, i_fdsc_end):
+    blk = "".join(lines[i_fdsc:i_fdsc_end + 1])
+    m = re.search(r"\.bpp\s*=\s*(\d+)", blk)
+    if not m:
+        return BPP_DEFAULT
+    v = int(m.group(1))
+    if v not in (1, 2, 4, 8):
+        die("font_dsc.bpp = %d 不是 LVGL 支持的位深" % v)
+    return v
 
 
 # --------------------------------------------------------------------------
@@ -250,12 +269,15 @@ def main():
         i_fdsc -= 1
     i_fdsc_end = find_close_brace(lines, i_fdsc)
 
+    bpp = detect_bpp(lines, i_fdsc, i_fdsc_end)
+    print("  bpp           %d" % bpp)
+
     print("  glyph_bitmap  %6d .. %6d" % (i_bmp + 1, i_bmp_end + 1))
     print("  glyph_dsc     %6d .. %6d" % (i_dsc + 1, i_dsc_end + 1))
     print("  font_dsc      %6d .. %6d" % (i_fdsc + 1, i_fdsc_end + 1))
 
     slim = build_slim(lines, i_bmp, i_dsc_end, i_fdsc, i_fdsc_end)
-    binary, bitmap, dsc, ncount = build_bin(lines, i_bmp, i_bmp_end, i_dsc, i_dsc_end)
+    binary, bitmap, dsc, ncount = build_bin(lines, i_bmp, i_bmp_end, i_dsc, i_dsc_end, bpp)
 
     if ncount * DSC_ENTRY_SIZE != len(dsc):
         die("glyph_dsc 长度不符")
@@ -285,7 +307,7 @@ def main():
     chk(struct.unpack_from("<I", binary, 0x0C)[0] == crc32_std(binary[HDR_SIZE:]),
         "CRC 回读不一致")
     got = struct.unpack_from("<6I", binary, 0x10)
-    want = (HDR_SIZE, len(dsc), HDR_SIZE + len(dsc), len(bitmap), ncount, BPP)
+    want = (HDR_SIZE, len(dsc), HDR_SIZE + len(dsc), len(bitmap), ncount, bpp)
     chk(got == want, "头字段 %s != %s" % (got, want))
     first = struct.unpack_from("<IIHHhh", binary, HDR_SIZE)
     last = struct.unpack_from("<IIHHhh", binary, HDR_SIZE + (ncount - 1) * DSC_ENTRY_SIZE)
@@ -302,9 +324,10 @@ def main():
         "main/resources/font16.bin", len(binary), len(binary) / 1048576.0))
     print("      header    %d B" % HDR_SIZE)
     print("      glyph_dsc %d 条 x %d B = %d B" % (ncount, DSC_ENTRY_SIZE, len(dsc)))
-    print("      bitmap    %d B" % len(bitmap))
+    print("      bitmap    %d B (%d bpp)" % (len(bitmap), bpp))
     print("      crc32     0x%08X" % struct.unpack_from("<I", binary, 0x0C)[0])
-    print("      bin 占分区 3.25MB 的 %.1f%%" % (len(binary) / (0x340000 / 100.0)))
+    print("      bin 占分区 0x%X 的 %.1f%%" % (FONT_PART_BYTES,
+                                            len(binary) / (FONT_PART_BYTES / 100.0)))
     print()
     if not ok:
         die("自检未通过")

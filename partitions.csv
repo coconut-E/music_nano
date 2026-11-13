@@ -2,21 +2,31 @@
 # 8MB flash / OTA 双槽布局.
 #   nvs      0x9000, 144KB: 起点不变, 换分区表不动用户设置
 #   phy_init/otadata 紧随 nvs, 收在 0x9000-0x30000 这 0x27000 里, 不留空洞
-#   ota_0/1  各 2.3125MB (0x250000), 装 ~2.27MB 的 app (剩 6%)
-#   font     3.1875MB (0x330000), 装 3.11MB 字库 (剩 2.3%), 开工时 mmap 进 DROM 窗口
+#   ota_0/1  各 2.875MB (0x2E0000), 装 ~2.28MB 的 app (剩 20.8%)
+#   font     2.0625MB (0x210000), 装 1.88MB 的 2bpp 字库 (余 9.1%), 开工时 mmap 进 DROM 窗口
 #
 # 注意:
 #   1) app 分区必须 64KB 对齐 —— 决定 ota_0 起点的是"前面所有小分区的终点向上取整到
 #      64KB", 不是某个固定地址. 旧表把 phy_init 放在 0x21000, 终点越过 0x20000, 于是
 #      ota_0 只能退到 0x40000, 白扔 0x22000-0x40000 共 120KB(其中 56KB 因为不对齐永远
 #      用不上). 现在把 nvs 扩到 144KB 顶到 0x2D000, 小分区终点正好 0x30000, 空洞为 0.
-#   2) 表尾正好用完 8MB: ota_1 结束 0x4D0000 + font 0x330000 = 0x800000, 无剩余空间.
+#   2) 表尾正好用完 8MB: ota_1 结束 0x5F0000 + font 0x210000 = 0x800000, 无剩余空间.
 #   3) 去掉 factory: 烧录后 otadata 为空时 bootloader 会自动选 ota_0
 #      并写入 {seq=1, state=VALID}, 不需要应用参与.
 #   4) font 是自定义 data 子类型 0x40, 只读, 由 font_part.c mmap.
+#
+# 布局沿革 (每次都是"偏移变了, 必须 USB 整片重烧", OTA 跨不过去):
+#   0.7.12: ota 0x250000 x2, font 0x330000 @0x4D0000 (4bpp 字库 3.11MB)
+#   0.7.13: 字库降 2bpp (1.88MB), 把空出来的空间还给 app —— ota 0x2E0000 x2,
+#           font 0x210000 @0x5F0000 (再要空间只能动字库内容, flash 已经没有余量)
+#
+# 为什么 app 是 0x2E0000 而不是 0x2E8000: gen_esp32part.py 要求 app 分区 offset 对齐
+# 0x10000, 而 0x30000+0x2E8000=0x318000 只对齐到 0x8000, 直接报
+# "Partition ota_1 invalid: Offset ... is not aligned to 0x10000".
+# 所以 app 大小必须是 64KB 的整数倍; 0x2E0000 正好 = 2.875 MiB.
 nvs,      data, nvs,   0x9000,   0x24000,
 phy_init, data, phy,   0x2D000,  0x1000,
 otadata,  data, ota,   0x2E000,  0x2000,
-ota_0,    app,  ota_0, 0x30000,  0x250000,
-ota_1,    app,  ota_1, 0x280000, 0x250000,
-font,     data, 0x40,  0x4D0000, 0x330000,
+ota_0,    app,  ota_0, 0x30000,  0x2E0000,
+ota_1,    app,  ota_1, 0x310000, 0x2E0000,
+font,     data, 0x40,  0x5F0000, 0x210000,
