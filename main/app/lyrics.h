@@ -8,8 +8,10 @@
 extern "C" {
 #endif
 
-/* 单首歌词最大条目数 (实测最多 152 行, 留余量) */
-#define LYRICS_MAX_ENTRIES 192
+/* 单首歌词最大条目数.
+ * 实测: 匿名M(ピノキオピー) 内嵌 LRC 有 206 行(日文行 + 中文译行), 192 会截掉
+ * 尾部 14 行; 256 留出余量. 数组随条目数走 12B/条, 192→256 只多 768B (PSRAM). */
+#define LYRICS_MAX_ENTRIES 256
 
 /* 一条带时间轴的歌词. text 指向 lyrics_parse 的输入缓冲 (原地 NUL 结尾), 生命周期随缓冲 */
 typedef struct {

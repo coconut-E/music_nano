@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "lvgl.h"
@@ -25,11 +26,11 @@ extern const lv_font_t lv_font_global_16;
 #define LYR_NLABELS     (LYR_WIN * 2 + 1)
 #define LYR_MAX_ROWS    10                   /* 单条最多显示 10 行 */
 #define LYR_DISP_MAX    65536                /* 折行显示缓冲 (PSRAM) */
-#define LYR_TOTAL_MAX   30000                /* lv_coord_t 上限内 */
+#define LYR_TOTAL_MAX   30000                /* 累计高度上限 (s_y 是 uint16; 也防止病态歌词撑爆) */
 #define LYR_LATENCY_MS  250                  /* 蓝牙/PCM 缓冲补偿, 实测可调 */
 #define LYR_MERGE_MS    50                   /* 时间戳差在此范围内视为同一句的多语言行, 合并显示 */
 #define LYR_BLANK_H     12                   /* 空行/占位行占的高度 (半行), 用作段落间距 */
-#define LYR_MAX_SEGS    4                    /* 一句最多按文字体系拆成几行 */
+#define LYR_MAX_SEGS    5                    /* 一句最多拆成几段 (含"中日同行"被切开的那一刀) */
 #define LYR_MAX_BLOCK_ROWS 12                /* 一个显示块最多几行 (防止极端歌词撑爆) */
 
 /* 透明点击层比歌词区略小, 避免边缘误触/挡住左右侧栏 */
@@ -42,7 +43,7 @@ static char *s_raw = NULL;                   /* 原始歌词 UTF-8 (PSRAM) */
 static char *s_disp = NULL;                  /* 折行后的显示文本 (PSRAM) */
 static size_t s_disp_used = 0;
 
-/* 条目/行高/坐标数组约 3.8KB: 放 PSRAM, 否则内部 DRAM 的 .bss 会链接溢出 */
+/* 条目/行高/坐标数组约 5.1KB (256 条): 放 PSRAM, 否则内部 DRAM 的 .bss 会链接溢出 */
 typedef struct {
     lyric_entry_t entries[LYRICS_MAX_ENTRIES];
     uint16_t      h[LYRICS_MAX_ENTRIES];
@@ -66,10 +67,11 @@ static uint8_t  s_retry = 0;
 static int64_t  s_missing_since = 0;
 
 static lv_obj_t   *s_area = NULL;
-static lv_obj_t   *s_content = NULL;
 static lv_obj_t   *s_none = NULL;
 static lv_obj_t   *s_overlay = NULL;
 static lv_obj_t   *s_labels[LYR_NLABELS];
+static int32_t     s_off = 0;            /* 滚动动画的像素偏移, 稳态 0 */
+static int         s_zero_dbg = -1;      /* 窗口全空自检: 已报过的 cur */
 static lv_timer_t *s_timer = NULL;
 static bool        s_visible = false;
 static void      (*s_back_cb)(void) = NULL;
@@ -126,16 +128,89 @@ static int script_class(int s)
 
 typedef struct { int off; int len; } seg_t;
 
+/* 简体专用字 (日文不用这些写法): 段里命中一个, 基本就能断定这段是中文.
+ * 中文和日文都用汉字, script_of 分不开它们, 只能靠这些字当证据. */
+static const uint16_t k_cn_only[] = {
+    0x7684, 0x4EEC, 0x8FD9, 0x8BF4, 0x4E3A, 0x4E2A, 0x65F6, 0x5BF9, 0x5C31, 0x5F88,
+    0x6CA1, 0x4EC0, 0x4E48, 0x600E, 0x8BA9, 0x8FD8, 0x8FC7, 0x73B0, 0x8BB0, 0x89C9,
+    0x8C22, 0x8BED, 0x8BCD, 0x8C01, 0x7231, 0x542C, 0x8BDD, 0x8BFB, 0x6837, 0x79CD,
+    0x4ECE, 0x5173, 0x5E26, 0x5F00, 0x52A1, 0x8FB9, 0x8FBE, 0x8FDB, 0x8FDC, 0x90A3,
+    0x5417, 0x5462, 0x5566, 0x554A, 0x54E6, 0x55EF
+};
+
+static bool is_cn_only(uint32_t cp)
+{
+    for (size_t i = 0; i < sizeof(k_cn_only) / sizeof(k_cn_only[0]); i++) {
+        if (k_cn_only[i] == cp) return true;
+    }
+    return false;
+}
+
+/* 中日写在同一行时的切点 (返回那个空格的首字节偏移, 没有返回 -1).
+ *
+ * 有些 LRC 把原文和译文塞进同一条 (如 "感じて 今夜は見事さ 用心感受的今夜 旖旎非常"),
+ * 一个时间戳里混着两种语言; 但中文和日文在 script_of 眼里都是"汉字类", 按文字体系
+ * 永远切不开 —— 只能按"空格之后到行尾再没有假名, 而且像中文"来判:
+ *   - 整行必须有假名 (否则不是日文行)
+ *   - 切点之后一个假名都没有
+ *   - 切点之后没有 ASCII 字母 (像 "Fin" 这种结尾词会被跳过, 切在它后面)
+ *   - 切点之后汉字 ≥5 个, 或含一个简体专用字 */
+static int find_cn_break(const char *s, int len)
+{
+    bool has_kana = false;
+    for (int i = 0; i < len; ) {
+        uint32_t cp;
+        int step = utf8_next(s + i, &cp);
+        if (script_of(cp) == SCR_KANA) { has_kana = true; break; }
+        i += step;
+    }
+    if (!has_kana) return -1;
+
+    for (int i = 0; i < len; ) {
+        uint32_t cp;
+        int step = utf8_next(s + i, &cp);
+        if (cp == ' ' || cp == 0x3000) {          /* 空格 / 全角空格 */
+            int han = 0, cn = 0;
+            bool ok = true;
+            for (int j = i + step; j < len; ) {
+                uint32_t c2;
+                int s2 = utf8_next(s + j, &c2);
+                if (script_of(c2) == SCR_KANA ||
+                    (c2 < 0x80 && isalpha((int)c2))) { ok = false; break; }
+                if (script_of(c2) == SCR_HAN) han++;
+                if (is_cn_only(c2)) cn++;
+                j += s2;
+            }
+            if (ok && han >= 2 && (han >= 5 || cn >= 1)) return i;
+        }
+        i += step;
+    }
+    return -1;
+}
+
 /* 把一条歌词按文字体系切成若干段 (最多 max_segs 段), 返回段数.
- * 数字/标点/空格不参与切换, 自动跟随当前段. */
+ * 数字/标点/空格不参与切换, 自动跟随当前段;
+ * 中日同行的情况由 find_cn_break() 指定切点强制断一段. */
 static int split_scripts(const char *s, int len, seg_t *segs, int max_segs)
 {
     int n = 0;
     int i = 0;
     int seg_start = 0;
     int cur = -1;
+    int cn_break = find_cn_break(s, len);
 
     while (i < len) {
+        if (i == cn_break && n + 1 < max_segs) {   /* 中日边界: 在这里断行 */
+            segs[n].off = seg_start;
+            segs[n].len = i - seg_start;
+            n++;
+            uint32_t sp;
+            i += utf8_next(s + i, &sp);            /* 跳过这个空格本身 */
+            seg_start = i;
+            cur = -1;                              /* 让后半段重新认语种 */
+            continue;
+        }
+
         uint32_t cp;
         int step = utf8_next(s + i, &cp);
         int scls = script_of(cp);
@@ -194,69 +269,98 @@ static int wrap_segment(const char *seg, int len, int *first)
     return rows;
 }
 
+static void lyrics_place(void);
+
 static void update_visibility(void)
 {
     if (!s_area) return;
     if (s_count > 0 && s_disp_used > 0) {
-        lv_obj_clear_flag(s_content, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_none, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_add_flag(s_content, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_none, LV_OBJ_FLAG_HIDDEN);
+    }
+    lyrics_place();
+}
+
+/* 把窗口内 9 个 label 摆到歌词容器里.
+ *
+ * 只算"相对当前块的像素差":  y(e) = 半高基准 + (s_y[e] - s_y[cur]) + s_off
+ * 差值最大只到"前后各 4 块的高度和"(几百 px), 与歌词总长无关.
+ *
+ * 旧实现把整篇歌词做成一个 total(=8672) 高的内容层, label 摆绝对坐标、
+ * 再用负的 y 平移它 —— 坐标量级逼近 lv_coord_t(int16) 边界, 长歌词滚到中途
+ * 会整片空白(见 README 更新日志). 现在容器只有窗口大小, 坐标系永远很小. */
+static void lyrics_place(void)
+{
+    if (!s_area) return;
+
+    int vis = 0;
+    if (s_count > 0 && s_disp_used > 0) {
+        if (s_cur >= s_count) s_cur = s_count - 1;
+        if (s_cur < 0) s_cur = 0;
+
+        int base  = (LYR_AREA_H / 2) - (int)s_h[s_cur] / 2;
+        int first = s_cur - LYR_WIN;
+        if (first < 0) first = 0;
+        int last = s_cur + LYR_WIN;
+        if (last >= s_count) last = s_count - 1;
+
+        for (int slot = 0; slot < LYR_NLABELS; slot++) {
+            lv_obj_t *l = s_labels[slot];
+            int e = first + slot;
+            if (e > last) {
+                lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            int y = base + ((int)s_y[e] - (int)s_y[s_cur]) + (int)s_off;
+            lv_label_set_text_static(l, s_disp + s_doff[e]);
+            lv_obj_set_pos(l, LYR_TEXT_X, (lv_coord_t)y);
+            lv_obj_set_size(l, LYR_TEXT_W, s_h[e]);
+            lv_obj_set_style_text_color(l, e == s_cur ? COLOR_FG : COLOR_MUTED, 0);
+            lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+            if (y > -LYR_AREA_H && y < LYR_AREA_H) vis++;
+        }
+    } else {
+        for (int slot = 0; slot < LYR_NLABELS; slot++) {
+            lv_obj_add_flag(s_labels[slot], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    /* 自检: 有歌词却一个可见 label 都没有 = 显示链路断了, 打印一次留证 */
+    if (s_count > 0 && vis == 0) {
+        if (s_zero_dbg != s_cur) {
+            s_zero_dbg = s_cur;
+            printf("[歌词] 窗口全空 cur=%d count=%d y=%d off=%d\n",
+                   s_cur, s_count, (int)s_y[s_cur], (int)s_off);
+        }
+    } else {
+        s_zero_dbg = -1;
     }
 }
 
-static void lyrics_layout_window(void)
+/* 只按当前 s_off 挪 y (滚动动画每帧调这个, 不碰文本/颜色/尺寸:
+ * lv_obj_set_style_* 每次都走一遍样式刷新 + 重绘, 60fps 下没必要) */
+static void lyrics_shift(void)
 {
-    if (!s_area || s_count <= 0) return;
-
+    if (!s_area || s_count <= 0 || s_disp_used == 0) return;
+    int base  = (LYR_AREA_H / 2) - (int)s_h[s_cur] / 2;
     int first = s_cur - LYR_WIN;
     if (first < 0) first = 0;
     int last = s_cur + LYR_WIN;
     if (last >= s_count) last = s_count - 1;
-
     for (int slot = 0; slot < LYR_NLABELS; slot++) {
-        lv_obj_t *l = s_labels[slot];
         int e = first + slot;
-        if (e > last || e >= s_count) {
-            lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-        lv_label_set_text_static(l, s_disp + s_doff[e]);
-        lv_obj_set_pos(l, LYR_TEXT_X, s_y[e]);
-        lv_obj_set_size(l, LYR_TEXT_W, s_h[e]);
-        lv_obj_set_style_text_color(l, e == s_cur ? COLOR_FG : COLOR_MUTED, 0);
-        lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+        if (e > last) continue;
+        int y = base + ((int)s_y[e] - (int)s_y[s_cur]) + (int)s_off;
+        lv_obj_set_pos(s_labels[slot], LYR_TEXT_X, (lv_coord_t)y);
     }
 }
 
-static int lyrics_target_y(void)
+/* 滚动动画: 只动一个像素偏移 */
+static void set_off(void *var, int32_t v)
 {
-    if (s_count <= 0) return 0;
-    return (LYR_AREA_H / 2) - ((int)s_y[s_cur] + (int)s_h[s_cur] / 2);
-}
-
-static void set_content_y(void *obj, int32_t v)
-{
-    lv_obj_set_y((lv_obj_t *)obj, (lv_coord_t)v);
-}
-
-static void lyrics_scroll_to(int target, bool animate)
-{
-    if (!s_content) return;
-    lv_anim_del(s_content, set_content_y);
-    if (!animate) {
-        lv_obj_set_y(s_content, (lv_coord_t)target);
-        return;
-    }
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_content);
-    lv_anim_set_exec_cb(&a, set_content_y);
-    lv_anim_set_values(&a, lv_obj_get_y(s_content), target);
-    lv_anim_set_time(&a, 250);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
+    *(int32_t *)var = v;
+    lyrics_shift();
 }
 
 static int lyrics_index_at(uint32_t ms)
@@ -274,11 +378,37 @@ static void lyrics_apply_time(uint32_t ms, bool force)
 {
     if (s_count <= 0) return;
     int idx = lyrics_index_at(ms);
+    if (idx == s_cur) {
+        /* 稳态: 位置交给滚动动画, 不必每 100ms 重设 9 个 label 的文本和坐标 */
+        if (force) { s_off = 0; lyrics_place(); }
+        return;
+    }
+
     int old = s_cur;
     s_cur = idx;
-    lyrics_layout_window();
-    bool animate = s_visible && !force && abs(idx - old) <= 3;
-    lyrics_scroll_to(lyrics_target_y(), animate);
+    lv_anim_del(&s_off, set_off);
+
+    bool animate = s_visible && !force && (idx > old ? idx - old : old - idx) <= 3;
+    if (!animate) {   /* 跳转/换歌/首次显示: 直接就位 */
+        s_off = 0;
+        lyrics_place();
+        return;
+    }
+
+    /* 先按"旧画面的视觉位置"摆好新窗口, 再滑到 0:
+     * 起始偏移 = 上一帧的残余偏移 + 两块内容差 - 两块半高差.
+     * 稳态时 s_off 是 0, 上一块还没滑完时也接得上, 切换那一帧不会跳. */
+    s_off = s_off + ((int)s_y[idx] - (int)s_y[old]) - (((int)s_h[old] - (int)s_h[idx]) / 2);
+    lyrics_place();
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_off);
+    lv_anim_set_exec_cb(&a, set_off);
+    lv_anim_set_values(&a, s_off, 0);
+    lv_anim_set_time(&a, 250);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
 }
 
 static void lyrics_load(uint32_t hash)
@@ -332,6 +462,11 @@ static void lyrics_load(uint32_t hash)
     int parsed = s_count;
     printf("[歌词] load hash=%08x copy=%u parse=%d store=%p\n",
            (unsigned)hash, (unsigned)n, s_count, (void *)s_store);
+    if (parsed >= LYRICS_MAX_ENTRIES) {
+        /* 撞上限: 后面的行一条都没进内存, 不打印就永远查不出来 */
+        printf("[歌词] 条目 %d 达到上限 %d, 超出的行已丢弃\n",
+               parsed, LYRICS_MAX_ENTRIES);
+    }
     s_retry = 0;
     if (s_count <= 0) {
         update_visibility();
@@ -398,10 +533,11 @@ static void lyrics_load(uint32_t hash)
         return;
     }
 
-    lv_obj_set_size(s_content, LYR_AREA_W, total);
-    update_visibility();
+    lv_anim_del(&s_off, set_off);   /* 换歌: 丢掉上一首还在跑的滚动动画 */
     s_cur = 0;
-    lyrics_layout_window();
+    s_off = 0;
+    s_zero_dbg = -1;
+    update_visibility();   /* 内部会 lyrics_place() */
 }
 
 static void lyrics_tick(bool force)
@@ -476,20 +612,9 @@ void lyrics_view_init(lv_obj_t *parent, void (*back_cb)(void))
      * 吞掉触摸(没挂事件, 点了没反应), 压住下方进度条的判定带. 只保留 s_overlay. */
     lv_obj_clear_flag(s_area, LV_OBJ_FLAG_CLICKABLE);
 
-    s_content = lv_obj_create(s_area);
-    lv_obj_set_pos(s_content, 0, 0);
-    lv_obj_set_size(s_content, LYR_AREA_W, 1);
-    lv_obj_set_style_bg_opa(s_content, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_content, 0, 0);
-    lv_obj_set_style_pad_all(s_content, 0, 0);
-    lv_obj_set_style_radius(s_content, 0, 0);
-    lv_obj_clear_flag(s_content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(s_content, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(s_content, LV_OBJ_FLAG_CLICKABLE);   /* 同上: 内容层也不吃点击 */
-    lv_obj_add_flag(s_content, LV_OBJ_FLAG_HIDDEN);
-
+    /* 9 个 label 直接挂容器: 没有中间内容层, 坐标系就是 172x204 的窗口本身 */
     for (int i = 0; i < LYR_NLABELS; i++) {
-        lv_obj_t *l = lv_label_create(s_content);
+        lv_obj_t *l = lv_label_create(s_area);
         lv_obj_set_pos(l, LYR_TEXT_X, 0);
         lv_obj_set_size(l, LYR_TEXT_W, LYR_LINE_H);
         lv_obj_set_style_text_font(l, &lv_font_global_16, 0);
@@ -531,10 +656,10 @@ void lyrics_view_init(lv_obj_t *parent, void (*back_cb)(void))
 void lyrics_view_destroy(void)
 {
     if (s_timer) { lv_timer_del(s_timer); s_timer = NULL; }
-    if (s_content) lv_anim_del(s_content, set_content_y);
+    lv_anim_del(&s_off, set_off);
+    s_off = 0;
     if (s_area) { lv_obj_del(s_area); s_area = NULL; }
 
-    s_content = NULL;
     s_none = NULL;
     s_overlay = NULL;
     for (int i = 0; i < LYR_NLABELS; i++) s_labels[i] = NULL;
@@ -546,6 +671,8 @@ void lyrics_view_destroy(void)
     s_count = 0;
     s_cur = 0;
     s_disp_used = 0;
+    s_off = 0;
+    s_zero_dbg = -1;
     s_hash = 0;
     s_want_hash = 0;
     s_dbg_hash = 0;
