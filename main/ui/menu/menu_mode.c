@@ -2,24 +2,44 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "lvgl.h"
+#include "autosleep.h"
+#include "power_mgr.h"
 #include "ui_core.h"
 #include "ui_player.h"
 #include "settings.h"
 #include "menu_mode.h"
 
-/* 面板尺寸/位置 (屏幕 172x320, 贴底弹出) */
+/* 面板尺寸/位置 (屏幕 172x320, 贴底弹出)
+ *
+ * 版面从上到下: 自动休眠开关行 → 分隔线 → 说明文字 → 循环次数步进器.
+ * 开关行是后加的, 所以整块面板从 120 长到 152, 原来的说明/步进器整体下移 ——
+ * 下面所有坐标都用同一组常量推出来, 滑入动画也全按 PANEL_W/H/Y 算, 不用改动画. */
 #define PANEL_W       168
-#define PANEL_H       120
+#define PANEL_H       152
 #define PANEL_X       1
-#define PANEL_Y       (TFT_VER_RES - PANEL_H - 8)   /* 192 */
+#define PANEL_Y       (TFT_VER_RES - PANEL_H - 8)   /* 160 */
 #define PANEL_RADIUS  10
+
+/* 顶部: 左侧文案 (自动休眠 / 将在X小时Y分钟后休眠) + 右侧开关 */
+#define LBL_X         8
+#define LBL_Y         6
+#define LBL_W         100                            /* 到 x=108, 给开关留出 12 px 间隙 */
+#define LBL_H         44                             /* 最长文案折两行 (2 x 18) */
+#define SW_W          40
+#define SW_H          22
+#define SW_X          (PANEL_W - 8 - SW_W)           /* 120 */
+#define SW_Y          17                             /* 在文案行里垂直居中 */
+#define ROW_LINE_Y    52                             /* 开关行下方那条 1px 分隔线 */
 
 /* 步进器布局 (面板局部坐标) */
 #define BTN_SIZE      40
-#define BTN_Y         62
+#define BTN_Y         104
 #define MINUS_X       20
 #define NUM_X         64
 #define PLUS_X        108
+
+/* 文案随倒计时变化的刷新周期 (弹框开着时才有这个定时器) */
+#define SLEEP_LABEL_MS 1000
 
 /* 底部滑入动画参数 */
 #define ANIM_MS_OPEN   120
@@ -35,6 +55,9 @@ static lv_obj_t *s_panel     = NULL;   /* 深色面板 */
 static lv_obj_t *s_num_lbl   = NULL;   /* 数字标签 */
 static lv_obj_t *s_minus_btn = NULL;   /* － 按钮 */
 static lv_obj_t *s_plus_btn  = NULL;   /* ＋ 按钮 */
+static lv_obj_t *s_sleep_lbl = NULL;   /* 左上文案 (自动休眠 / 将在X后休眠) */
+static lv_obj_t *s_sleep_sw  = NULL;   /* 右上自动休眠开关 */
+static lv_timer_t *s_sleep_timer = NULL;   /* 弹框开着时按秒刷新左上文案 */
 
 static bool s_open      = false;
 static bool s_animating = false;
@@ -146,6 +169,75 @@ static lv_obj_t *make_step_btn(lv_obj_t *parent, int x, const char *symbol,
     return btn;
 }
 
+/* ── 自动休眠: 左上文案 + 右上开关 ── */
+
+/* 文案: 开 → "将在X小时Y分钟后休眠", 关 → "自动休眠" */
+static void mode_sleep_label_update(void)
+{
+    if (!s_sleep_lbl) return;
+    char buf[40];
+    autosleep_format_left(buf, sizeof buf);
+    lv_label_set_text(s_sleep_lbl, buf);
+}
+
+/* 弹框开着时按秒刷新 (时间在 autosleep 的定时器里走, 这里只负责重画) */
+static void sleep_tick_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    mode_sleep_label_update();
+}
+
+/* 开关: 落 NVS + 立刻刷新文案; 点一下也算一次操作, 续期熄屏计时 */
+static void sleep_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    autosleep_set_on(lv_obj_has_state(sw, LV_STATE_CHECKED));
+    mode_sleep_label_update();
+    power_mgr_notify_activity();
+}
+
+/* 顶部开关行 (文案 + 开关 + 分隔线) + 文案刷新定时器 */
+static void sleep_row_create(void)
+{
+    s_sleep_lbl = lv_label_create(s_panel);
+    lv_obj_set_pos(s_sleep_lbl, LBL_X, LBL_Y);
+    lv_obj_set_size(s_sleep_lbl, LBL_W, LBL_H);
+    lv_label_set_long_mode(s_sleep_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_sleep_lbl, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_font(s_sleep_lbl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(s_sleep_lbl, COLOR_FG, 0);
+    mode_sleep_label_update();
+
+    s_sleep_sw = lv_switch_create(s_panel);
+    lv_obj_set_pos(s_sleep_sw, SW_X, SW_Y);
+    lv_obj_set_size(s_sleep_sw, SW_W, SW_H);
+    /* 深色面板上默认主题的浅色轨道太扎眼, 这里显式给一套:
+     * 轨道深灰 (打开时整体换成强调色), 指示区透明, 滑块近白.
+     * 指示区必须显式透明 —— 主题给它的底色是常驻的, 不关掉的话"关着"也会有一条亮色. */
+    lv_obj_set_style_bg_color(s_sleep_sw, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_sleep_sw, COLOR_ACCENT, LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_sleep_sw, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_sleep_sw, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_sleep_sw, COLOR_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_sleep_sw, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_sleep_sw, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(s_sleep_sw, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_sleep_sw, lv_color_hex(0xF0F0F0), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_sleep_sw, 0, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s_sleep_sw, 0, LV_PART_KNOB);
+    if (autosleep_is_on()) lv_obj_add_state(s_sleep_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(s_sleep_sw, sleep_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *line = lv_obj_create(s_panel);
+    lv_obj_remove_style_all(line);
+    lv_obj_set_pos(line, 8, ROW_LINE_Y);
+    lv_obj_set_size(line, PANEL_W - 16, 1);
+    lv_obj_set_style_bg_color(line, COLOR_BORDER, 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+
+    s_sleep_timer = lv_timer_create(sleep_tick_cb, SLEEP_LABEL_MS, NULL);
+}
+
 /* 创建遮罩 + 面板 (动画 open_real 等价物) */
 static void mode_panel_create(void)
 {
@@ -172,10 +264,13 @@ static void mode_panel_create(void)
     lv_obj_set_style_pad_all(s_panel, 0, 0);
     lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 顶部自动休眠开关行 (占 y=0~52) */
+    sleep_row_create();
+
     /* 文字标签 (较长, 自动折行) */
     lv_obj_t *lbl = lv_label_create(s_panel);
-    lv_obj_set_pos(lbl, 8, 8);
-    lv_obj_set_size(lbl, PANEL_W - 16, 44);
+    lv_obj_set_pos(lbl, 8, 58);
+    lv_obj_set_size(lbl, PANEL_W - 16, 38);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(lbl, COLOR_FG, 0);
@@ -202,12 +297,15 @@ static void mode_panel_create(void)
 /* 销毁遮罩 + 面板 (动画 close_real 等价物) */
 static void mode_panel_destroy(void)
 {
+    if (s_sleep_timer) { lv_timer_del(s_sleep_timer); s_sleep_timer = NULL; }  /* 先停刷新, 再删控件 */
     if (s_overlay) lv_obj_del(s_overlay);
     s_overlay   = NULL;
     s_panel     = NULL;
     s_num_lbl   = NULL;
     s_minus_btn = NULL;
     s_plus_btn  = NULL;
+    s_sleep_lbl = NULL;
+    s_sleep_sw  = NULL;
     s_open      = false;
 }
 

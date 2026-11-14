@@ -1,4 +1,7 @@
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -9,12 +12,15 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_rom_uart.h"
 #include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
 #include "drv_display.h"
 #include "settings.h"
 #include "bt_a2dp.h"
+#include "autosleep.h"
 #include "ui_core.h"
+#include "touch.h"
 #include "mode_anim.h"
 #include "sys_monitor.h"
 #include "app_mode.h"
@@ -65,15 +71,14 @@ static bool                      s_adc_inited = false;  /* ADC 已初始化标�
 /* 长按判定: 按住超过此值进入主菜单 */
 #define PWR_KEY_LONG_US      (800 * 1000)
 
-/* 无操作自动熄屏: 菜单与设置 30 秒 / 音乐封面 2 分钟 / 歌词页 5 分钟 / 小说 5 分钟.
+/* 无操作自动熄屏: "通用 + 特殊"两层次, 单位分钟 (1~10, 设置页可改).
+ *   通用 = 菜单 / 设置 / 音乐封面, 以及以后新加的任何模式;
+ *   特殊 = 小说、音乐歌词页 (各自覆盖通用).
  * 超时后执行与睡眠键短按相同的动作: BT 已连 → 只熄屏; 未连 → 淡出深睡.
- * 菜单/设置里蓝牙任务已被 bt_a2dp_pause 挂起 (状态=断开), 因此 30 秒到点是
- * "淡出后直接深睡"; 深睡前的清理收尾对这几秒没有副作用. */
-#define PWR_IDLE_MENU_US     (30LL * 1000 * 1000)
-#define PWR_IDLE_SETTINGS_US (30LL * 1000 * 1000)
-#define PWR_IDLE_MUSIC_US    (2LL * 60 * 1000 * 1000)
-#define PWR_IDLE_LYRICS_US   (5LL * 60 * 1000 * 1000)
-#define PWR_IDLE_NOVEL_US    (5LL * 60 * 1000 * 1000)
+ * 菜单/设置里蓝牙任务已被 bt_a2dp_pause 挂起 (状态=断开), 所以到点是"淡出后直接深睡".
+ * 这里缓存一份 (1 秒轮询每次都读, 不能读 NVS), 开机由 power_mgr_init 灌入. */
+static int s_idle_min[SETTINGS_IDLE_NUM] = { 2, 5, 5 };   /* 与 settings.c 的默认值一致 */
+
 #define PWR_IDLE_POLL_MS     1000
 
 /* 电源状态机 */
@@ -81,6 +86,7 @@ typedef enum {
     PWR_ACTIVE,       /* 正常: 亮屏 */
     PWR_SCREEN_OFF,   /* 手动息屏 (BT 保持连接, 音频继续) */
     PWR_FAKE_OFF,     /* 淡出中(即将深睡), 忽略按键 */
+    PWR_LIGHT_SLEEP,  /* 淡出/浅睡中 (5 分钟后转深睡), 忽略按键 */
 } pwr_state_t;
 
 /* 睡眠抑制: OTA 新固件校验窗口期间置位.
@@ -291,7 +297,9 @@ static void enter_deep_sleep_now(void)
     gpio_hold_en(PIN_PWR_CUT);             /* 锁定 GPIO22 高电平, 深睡期间不掉 */
     gpio_deep_sleep_hold_en();             /* 允许深睡期间保持 (其余脚已是高阻) */
 
-    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);   /* GPIO37 高电平唤醒 */
+    /* 先清掉所有唤醒源: 浅睡留下的 5 分钟 timer 若不清, 深睡 5 分钟后会自己醒来 */
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);   /* 只剩 GPIO37 高电平唤醒 */
     esp_deep_sleep_start();                          /* 进入深睡 (此处不返回) */
 }
 
@@ -300,6 +308,140 @@ static void enter_deep_sleep(lv_anim_t *a)
 {
     (void)a;
     enter_deep_sleep_now();
+}
+
+/* ─────────────────────── 浅睡 (light sleep) ───────────────────────
+ * 浅睡 = CPU/AHB/APB 停钟, 但 GPIO22 不动、外设一直供电, 程序从断点继续.
+ * 短按(蓝牙断开) / 无操作超时 / 息屏期蓝牙断开 → 先浅睡 N 分钟, 期间按电源键
+ * 立刻淡入亮屏, N 分钟到点再走真正的深睡 (enter_deep_sleep_now).
+ *
+ * N 由设置页「浅睡时长」给 (0~10 分钟), 0 = 不浅睡、直接深睡 (老行为).
+ * 缓存在 s_light_sleep_min, 睡眠路径上不读 flash. */
+static int s_light_sleep_min = LIGHT_SLEEP_MIN_DEFAULT;
+
+static volatile int s_ls_test_sec = 0;   /* console 请求的浅睡秒数 (0=无请求) */
+
+/* 只置请求: 真正的睡眠必须在 LVGL 任务里做 (和深睡同一上下文, 也保证没有别的任务
+ * 正卡在 LVGL/FATFS 的锁里), console 任务只写这个 int */
+void power_mgr_light_sleep_test(int sec)
+{
+    if (sec <= 0) return;
+    if (sec > 600) sec = 600;            /* 别让一次测试睡过头 */
+    s_ls_test_sec = sec;
+}
+
+/* ext0 唤醒会把 GPIO37 切成 RTC IO, 浅睡醒来后必须改回普通数字输入 ——
+ * 否则 gpio_get_level 读到的一直是 0, 电源键从此"按不动" (深睡走重启, 不会碰到这个问题). */
+static void key_gpio_restore(void)
+{
+    gpio_config_t key_cfg = {
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = 1ULL << PIN_PWR_KEY,
+    };
+    gpio_config(&key_cfg);
+}
+
+/* 睡前把串口吐干净: 一进浅睡 UART 时钟就停了, 还在驱动/FIFO 里没发出去的字节会被
+ * 截断 —— 日志里只剩半句"淡出后浅睡"就是这个原因. */
+static void uart_flush_before_sleep(void)
+{
+    fflush(stdout);
+    fsync(STDOUT_FILENO);                    /* stdio/VFS 那一层也刷掉 */
+    esp_rom_output_tx_wait_idle(0);          /* UART0: 等到 TX FIFO 真的空 */
+}
+
+/* Phase 0 自检: 睡前在 PSRAM / 内部 RAM 各写一块图案, 醒来逐项核对.
+ * 任何一项挂掉都说明"浅睡后从断点继续"在这台机器上不成立, 先别接线. */static void light_sleep_test_run(int sec)
+{
+    enum { PS_BYTES = 1024, IN_BYTES = 256 };
+
+    uint8_t *ps = heap_caps_malloc(PS_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *in = heap_caps_malloc(IN_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (ps) for (int i = 0; i < PS_BYTES; i++) ps[i] = (uint8_t)(i * 31 + 7);
+    if (in) for (int i = 0; i < IN_BYTES; i++) in[i] = (uint8_t)(i ^ 0x5A);
+
+    printf("[ls] 请求浅睡 %d 秒 (PSRAM=%p, 内部=%p), 按电源键可提前唤醒\n",
+           sec, (void *)ps, (void *)in);
+    uart_flush_before_sleep();                             /* 睡前把串口吐干净 */
+
+    const int64_t    t0 = esp_timer_get_time();
+    const TickType_t k0 = xTaskGetTickCount();
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);          /* 电源键高电平 */
+    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+
+    esp_err_t err = esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); /* 别把 timer 留在武器库 */
+
+    /* 醒来时按键多半还按着: 按"已按住"记账, 否则 10ms 轮询会把它当短按,
+     * 醒来立刻又睡回去 */
+    key_gpio_restore();
+    s_key_prev    = (gpio_get_level(PIN_PWR_KEY) == 1);
+    s_key_pending = false;
+
+    const int64_t    dt_us = esp_timer_get_time() - t0;
+    const TickType_t dt_tk = xTaskGetTickCount() - k0;
+
+    printf("[ls] 醒来: err=%s cause=%d (%s) esp_timer +%d ms  tick +%d ms\n",
+           esp_err_to_name(err), (int)cause,
+           cause == ESP_SLEEP_WAKEUP_EXT0  ? "按键" :
+           cause == ESP_SLEEP_WAKEUP_TIMER ? "定时" : "其它",
+           (int)(dt_us / 1000), (int)(dt_tk * portTICK_PERIOD_MS));
+
+    /* 1) PSRAM: 半睡后内容是否保住 (本工程开了 PSRAM half-sleep) */
+    if (!ps) {
+        printf("[ls] 1 PSRAM: 分配失败 (跳过)\n");
+    } else {
+        int bad = -1;
+        for (int i = 0; i < PS_BYTES; i++) {
+            if (ps[i] != (uint8_t)(i * 31 + 7)) { bad = i; break; }
+        }
+        if (bad < 0) {
+            printf("[ls] 1 PSRAM 1KB: OK\n");
+        } else {
+            printf("[ls] 1 PSRAM 1KB: 坏 @%d (期望 0x%02X 实际 0x%02X)\n",
+                   bad, (uint8_t)(bad * 31 + 7), ps[bad]);
+        }
+    }
+
+    /* 2) 内部 RAM 对照组: 它坏了说明问题不在 PSRAM 半睡, 而是整个 RTC/DRAM 不保 */
+    if (!in) {
+        printf("[ls] 2 内部 RAM: 分配失败 (跳过)\n");
+    } else {
+        int bad = -1;
+        for (int i = 0; i < IN_BYTES; i++) {
+            if (in[i] != (uint8_t)(i ^ 0x5A)) { bad = i; break; }
+        }
+        if (bad < 0) printf("[ls] 2 内部 RAM 256B: OK\n");
+        else         printf("[ls] 2 内部 RAM 256B: 坏 @%d\n", bad);
+    }
+
+    /* 3) 屏幕: 整屏重画一帧, 人眼确认有没有花屏/偏移 (GRAM 与 SPI 主机状态) */
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(NULL);
+    fflush(stdout);
+    printf("[ls] 3 屏幕: 已整屏重画, 看有没有花屏/偏移\n");
+
+    /* 4) 触摸: 只有 INT 触发或按住时才读 I2C, 空闲时不碰总线 */
+    int32_t tx = -1, ty = -1;
+    bool pressed = touch_poll(&tx, &ty);
+    printf("[ls] 4 触摸: %s (%d,%d)\n", pressed ? "按下" : "空闲", (int)tx, (int)ty);
+
+    /* 5) SD: 走 sd_fs_lock, 避免和 sys_monitor/解码器抢 FATFS */
+    struct stat st;
+    int sr = -1;
+    sd_fs_lock();
+    if (sdmmc_disk_is_mounted()) sr = stat("/sdcard", &st);
+    const bool mounted = sdmmc_disk_is_mounted();
+    sd_fs_unlock();
+    printf("[ls] 5 SD: mounted=%d stat=%d\n", (int)mounted, sr);
+
+    if (ps) heap_caps_free(ps);
+    if (in) heap_caps_free(in);
 }
 
 /* 息屏: 淡出 + 降刷新 + 关触摸 (BT 保持连接) */
@@ -323,7 +465,77 @@ static void screen_on(void)
     ESP_LOGI(TAG, "亮屏");
 }
 
-/* 执行与之前相同的短按动作 (息屏/亮屏/深睡) */
+/* 浅睡: 屏幕已经淡出到 0 (或本来就是息屏), 触摸/刷新已关; 这里只负责睡和醒来.
+ * **不碰 GPIO22** —— 浅睡期间外设一直供电, 醒来程序从断点继续.
+ * 醒来两种: 定时到点 → 转深睡; 按键 → 淡入亮屏回原界面. */
+static void enter_light_sleep(lv_anim_t *a)
+{
+    (void)a;
+
+    s_state = PWR_LIGHT_SLEEP;
+    set_lvgl_slow_refresh(true);          /* 与息屏一致, 醒来由 screen_on 恢复 */
+    ui_touch_set_enabled(false);
+
+    if (s_light_sleep_min <= 0) {         /* 设置成 0 了却还进来: 直接深睡兜底 */
+        s_state = PWR_FAKE_OFF;
+        enter_deep_sleep_now();
+    }
+
+    ESP_LOGI(TAG, "浅睡 %d 分钟 (按键唤醒 / 到点深睡)", s_light_sleep_min);
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);            /* 电源键高电平 */
+    esp_sleep_enable_timer_wakeup((uint64_t)s_light_sleep_min * 60ULL * 1000000ULL);
+
+    uart_flush_before_sleep();          /* 这一行必须在 esp_light_sleep_start() 之前 */
+
+    esp_err_t err = esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);   /* 别把 5 分钟 timer 带到深睡 */
+
+    /* 醒来时按键多半还按着: 按"已按住"记账, 否则 10ms 轮询会把这一下当短按,
+     * 亮屏后立刻又睡回去 */
+    key_gpio_restore();
+    s_key_prev       = (gpio_get_level(PIN_PWR_KEY) == 1);
+    s_key_pending    = false;
+    s_key_long_fired = true;
+
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {   /* 5 分钟到点: 走原来的关机路径 */
+        ESP_LOGI(TAG, "浅睡到点, 转深睡");
+        s_state = PWR_FAKE_OFF;
+        enter_deep_sleep_now();              /* 不返回 */
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "浅睡异常 (%s), 直接亮屏", esp_err_to_name(err));
+    }
+
+    /* 按键唤醒: 浅睡这段不算进自动休眠的剩余量, 然后淡入亮屏 */
+    autosleep_on_wake();
+    screen_on();                             /* notify_activity + 恢复刷新/触摸 + 淡入 */
+}
+
+/* 屏幕已黑 (淡出完成, 或本来就息屏) 之后的统一分派: 0 分钟直接深睡, >0 先浅睡.
+ * 三条入口都收在这里, 免得"0 就直睡"这个判断散落好几份. */
+static void sleep_entry(void)
+{
+    if (s_light_sleep_min > 0) {
+        enter_light_sleep(NULL);
+    } else {
+        s_state = PWR_FAKE_OFF;
+        enter_deep_sleep(NULL);
+    }
+}
+
+/* 短按/无操作路径的淡出完成回调 (淡出用的是正常背光渐暗, 不是硬切) */
+static void sleep_fade_done(lv_anim_t *a)
+{
+    (void)a;
+    sleep_entry();
+}
+
+/* 执行与之前相同的短按动作 (息屏/亮屏/浅睡) */
 static void power_short_press_action(void)
 {
     if (s_sleep_inhibit || s_ui_inhibit) {   /* OTA 校验窗口 / WiFi 操作中: 按键直接吞掉 */
@@ -333,13 +545,14 @@ static void power_short_press_action(void)
     switch (s_state) {
     case PWR_ACTIVE:
         if (bt_a2dp_get_state() != BT_STATE_DISCONNECTED) {
-            /* 已连接/连接中 → 手动息屏 */
+            /* 已连接/连接中 → 手动息屏 (音频继续) */
             screen_off();
         } else {
-            /* 蓝牙未连接 → 淡出后进深度睡眠 (小说模式无蓝牙, 直接深睡) */
-            s_state = PWR_FAKE_OFF;
-            ESP_LOGI(TAG, "BT 未连接, 淡出后深睡");
-            screen_fade(0, enter_deep_sleep);
+            /* 蓝牙未连接 → 淡出后按设置浅睡 N 分钟 (0 = 直接深睡), 观感与息屏一致 */
+            const bool light = (s_light_sleep_min > 0);
+            s_state = light ? PWR_LIGHT_SLEEP : PWR_FAKE_OFF;
+            ESP_LOGI(TAG, "BT 未连接, 淡出后%s", light ? "浅睡" : "深睡");
+            screen_fade(0, sleep_fade_done);
         }
         break;
     case PWR_SCREEN_OFF:
@@ -347,7 +560,62 @@ static void power_short_press_action(void)
         break;
     case PWR_FAKE_OFF:
         break;   /* 深睡淡出中: 忽略按键 */
+    case PWR_LIGHT_SLEEP:
+        break;   /* 浅睡淡出中: 忽略按键 (睡眠本身在 LVGL 任务里阻塞, 期间不会有轮询) */
     }
+}
+
+/* 自动熄屏分支时长 (分钟): 读缓存.
+ * branch 取值与 settings.h 的 SETTINGS_IDLE_* 一致 (通用/小说/歌词) */
+int power_mgr_idle_minutes(int branch)
+{
+    if (branch < 0 || branch >= SETTINGS_IDLE_NUM) branch = SETTINGS_IDLE_COMMON;
+    return s_idle_min[branch];
+}
+
+/* 改某个分支的时长: 先改缓存 (立刻生效), 再落 NVS */
+void power_mgr_idle_set(int branch, int minutes)
+{
+    if (branch < 0 || branch >= SETTINGS_IDLE_NUM) return;
+    if (minutes < IDLE_MIN_MIN) minutes = IDLE_MIN_MIN;
+    if (minutes > IDLE_MIN_MAX) minutes = IDLE_MIN_MAX;
+
+    s_idle_min[branch] = minutes;
+    settings_idle_minutes_save(branch, minutes);
+    ESP_LOGI(TAG, "自动熄屏分支 %d → %d 分钟", branch, minutes);
+}
+
+/* 浅睡时长 (分钟, 0 = 不浅睡直接深睡): 读缓存 */
+int power_mgr_light_sleep_minutes(void)
+{
+    return s_light_sleep_min;
+}
+
+/* 改浅睡时长: 先改缓存 (下一次进睡就用新值), 再落 NVS */
+void power_mgr_light_sleep_set_minutes(int minutes)
+{
+    if (minutes < LIGHT_SLEEP_MIN_MIN) minutes = LIGHT_SLEEP_MIN_MIN;
+    if (minutes > LIGHT_SLEEP_MIN_MAX) minutes = LIGHT_SLEEP_MIN_MAX;
+
+    s_light_sleep_min = minutes;
+    settings_light_sleep_minutes_save(minutes);
+    ESP_LOGI(TAG, "浅睡时长 → %d 分钟%s", minutes, minutes ? "" : " (直接深睡)");
+}
+
+/* 定时休眠到点 (autosleep 调用): 走与"蓝牙未连接时短按电源键"同一条淡出→深睡路径,
+ * 但**不看蓝牙状态** —— 用户要的是到点就关机 (GPIO22 断电, 音乐结束), 不是只熄屏.
+ * 抑制标志与短按同规矩: 校验窗口/WiFi 流程期间不睡, 免得把升级打断. */
+void power_mgr_sleep_now(void)
+{
+    if (s_sleep_inhibit || s_ui_inhibit) {
+        ESP_LOGW(TAG, "抑制中 (OTA/WiFi), 忽略定时休眠");
+        return;
+    }
+    if (s_mode_switching || s_state == PWR_FAKE_OFF || s_state == PWR_LIGHT_SLEEP) return;
+
+    s_state = PWR_FAKE_OFF;
+    ESP_LOGI(TAG, "定时休眠到点, 淡出后深睡");
+    screen_fade(0, enter_deep_sleep);
 }
 
 /* 无操作熄屏轮询 (1s): 亮屏且超过时限时, 执行与睡眠键短按相同的动作.
@@ -356,22 +624,35 @@ static void power_short_press_action(void)
 static void idle_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
+
+    /* Phase 0 诊断: console 的 lsp <秒> 请求在这里执行 (必须同 LVGL 任务) */
+    int test_sec = s_ls_test_sec;
+    if (test_sec > 0) {
+        s_ls_test_sec = 0;
+        light_sleep_test_run(test_sec);
+        return;
+    }
+
     if (s_mode_switching) return;
     if (s_sleep_inhibit || s_ui_inhibit) return;   /* OTA 校验 / WiFi 操作中: 不熄屏 */
     if (s_state != PWR_ACTIVE) return;
 
     int64_t timeout_us;
-    if (app_mode_is_menu())          timeout_us = PWR_IDLE_MENU_US;
-    else if (app_mode_is_settings()) timeout_us = PWR_IDLE_SETTINGS_US;
-    else if (app_mode_is_novel())    timeout_us = PWR_IDLE_NOVEL_US;
-    else if (s_lyrics_active)      timeout_us = PWR_IDLE_LYRICS_US;
-    else                           timeout_us = PWR_IDLE_MUSIC_US;
+    {
+        /* 只列举两条特殊分支, 其余一律走通用 —— 以后加新模式不用再动这里 */
+        int br;
+        if (app_mode_is_novel()) br = SETTINGS_IDLE_NOVEL;
+        else if (s_lyrics_active) br = SETTINGS_IDLE_LYRICS;
+        else                      br = SETTINGS_IDLE_COMMON;
+
+        timeout_us = (int64_t)s_idle_min[br] * 60LL * 1000 * 1000;
+    }
     int64_t now = esp_timer_get_time();
     if (now - s_last_activity_us < timeout_us) return;
 
     s_last_activity_us = now;   /* 先续期, 动作/淡出期间不重复触发 */
-    ESP_LOGI(TAG, "无操作 %d 秒, 自动执行睡眠键短按动作",
-             (int)(timeout_us / 1000000));
+    ESP_LOGI(TAG, "无操作 %d 分钟, 自动执行睡眠键短按动作",
+             (int)(timeout_us / 60000000LL));
     power_short_press_action();
 }
 
@@ -511,16 +792,16 @@ void power_mgr_mode_transition(void (*work)(void), bool backlight_fade)
     bri_fade_start(0, MODE_FADE_OUT_MS, mode_switch_dark_done);
 }
 
-/* 息屏期 BT 状态轮询 (1s): 从已连/连接中变为未连接 → 深睡 */
+/* 息屏期 BT 状态轮询 (1s): 从已连/连接中变为未连接 → 浅睡 (到点转深睡) */
 static void bt_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (s_mode_switching) return;            /* 模式切换过渡中不处理 */
     if (s_state != PWR_SCREEN_OFF) return;   /* 非息屏态不处理 */
     if (bt_a2dp_get_state() == BT_STATE_DISCONNECTED) {
-        ESP_LOGI(TAG, "息屏期间蓝牙断开, 进入深度睡眠");
-        s_state = PWR_FAKE_OFF;
-        enter_deep_sleep(NULL);
+        ESP_LOGI(TAG, "息屏期间蓝牙断开, 进入%s",
+                 s_light_sleep_min > 0 ? "浅睡" : "深睡");
+        sleep_entry();                       /* 屏幕已黑, 不用再淡出 */
     }
 }
 
@@ -558,6 +839,12 @@ void power_mgr_init(void)
     s_cur_bri = 0;
     lcd_set_brightness(0);
     screen_fade(brightness_get(), NULL);
+
+    /* 自动熄屏的三个时长: 开机从 NVS 灌进缓存, 1 秒轮询里不再碰 flash */
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) {
+        s_idle_min[i] = settings_idle_minutes_load(i);
+    }
+    s_light_sleep_min = settings_light_sleep_minutes_load();   /* 浅睡时长同理由缓存提供 */
 
     /* 息屏期 BT 状态轮询 + 无操作熄屏轮询: 均 1 秒一次 */
     lv_timer_create(bt_poll_cb, 1000, NULL);

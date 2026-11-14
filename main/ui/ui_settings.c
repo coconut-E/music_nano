@@ -8,9 +8,12 @@
  * 页面层级 (电源键短按 = 返回上一级; 已经在「设置列表」这一级时退出设置回菜单):
  *
  *   设置列表 ─「固件版本」→ 固件版本详情 ─「检查更新」→ 连接 WiFi ─ 密码(横屏) …
- *      ↑                          ↑                        └→ 正在连接 → 正在检查更新
- *      │                          │                                       ↓
- *      └──────────────────────────┴──────── 版本页 → 下载/写入 → 重启进新固件
+ *      │  │                       ↑                        └→ 正在连接 → 正在检查更新
+ *      │  │                       │                                       ↓
+ *      │  └───────────────────────┴──────── 版本页 → 下载/写入 → 重启进新固件
+ *      └─「自动休眠」→ 休眠时长子页 (小时 0~3 / 分钟 0~60 步进 10 → 保存到 NVS)
+ *      └─「自动熄屏」→ 熄屏时长子页 (通用 / 小说 / 歌词 三条分支, 1~10 分钟)
+ *      └─「浅睡时长」→ 深睡前先浅睡多久 (0~10 分钟, 0 = 直接深睡)
  *
  * 「检查更新」之后那几页全在 ui_settings_wifi.c 里 (它自己开关 WiFi、自己管返回),
  * 本文件只负责: 进流程前把列表/详情藏起来, 流程结束时把详情页显示回来.
@@ -26,7 +29,9 @@
 #include "lvgl.h"
 
 #include "app_mode.h"
+#include "autosleep.h"
 #include "power_mgr.h"
+#include "settings.h"
 #include "ui_core.h"
 #include "ui_settings.h"
 #include "ui_settings_wifi.h"
@@ -51,10 +56,56 @@ static const char *TAG = "SETTINGS";
 #define BTN_H        44
 #define BTN_Y        252
 
+/* 自动休眠子页: 两个"下拉"按钮 + 保存 */
+#define PICK_BTN_H    38                      /* 下拉按钮高 */
+#define PICK_ROW_H    30                      /* 选择弹层的行高 */
+#define PICK_CARD_W   132                     /* 选择弹层卡片宽 */
+
 extern const lv_font_t lv_font_global_16;     /* 全局中文字库 */
 
 static lv_obj_t *s_list;                      /* 列表页 (整屏, NULL=未构建) */
 static lv_obj_t *s_detail;                    /* 固件版本详情页 (默认隐藏) */
+static lv_obj_t *s_sleep;                     /* 自动休眠子页 (默认隐藏) */
+static lv_obj_t *s_idle;                      /* 自动熄屏子页 (默认隐藏) */
+static lv_obj_t *s_ls;                        /* 浅睡时长子页 (默认隐藏) */
+
+/* 选择弹层要改哪个值: 小时/分钟属于自动休眠, 后三个属于自动熄屏的通用/小说/歌词 */
+typedef enum {
+    PICK_HOUR = 0,
+    PICK_MINUTE,
+    PICK_IDLE_COMMON,
+    PICK_IDLE_NOVEL,
+    PICK_IDLE_LYRICS,
+    PICK_LIGHTSLEEP,
+} pick_id_t;
+
+/* 自动休眠子页的控件与"编辑中的临时值": 只有点「保存」才落盘 */
+static lv_obj_t *s_hour_lbl  = NULL;          /* 小时按钮上的文字 */
+static lv_obj_t *s_min_lbl   = NULL;          /* 分钟按钮上的文字 */
+static lv_obj_t *s_save_btn  = NULL;          /* 保存 (0 小时 0 分时禁用) */
+static lv_obj_t *s_save_lbl  = NULL;          /* 保存按钮上的文字 (禁用态换灰色) */
+static int       s_hour_sel  = 1;             /* 0~3 */
+static int       s_min_sel   = 0;             /* 0~60, 步进 10 */
+
+/* 自动熄屏子页: 通用 / 小说 / 歌词, 下标与 settings.h 的 SETTINGS_IDLE_* 一致 */
+static lv_obj_t *s_idle_lbl[SETTINGS_IDLE_NUM] = { NULL, NULL, NULL };
+static int       s_idle_sel[SETTINGS_IDLE_NUM] = { 2, 5, 5 };
+
+/* 浅睡时长子页: 0~10 分钟 (0 = 不浅睡, 直接深睡) */
+static lv_obj_t *s_ls_lbl = NULL;
+static int       s_ls_sel = LIGHT_SLEEP_MIN_DEFAULT;
+
+/* 选择弹层 (自绘的"下拉"): 白卡 + 若干行, 点行选中, 点卡片外关闭.
+ * 背景完全透明 —— 它只负责接"点外面"这一下, 不盖一层灰. */
+static lv_obj_t *s_pick      = NULL;
+static pick_id_t s_pick_id   = PICK_HOUR;
+static int       s_pick_base = 0;             /* 第一项的值 */
+static int       s_pick_step = 1;             /* 相邻两项的差 */
+static const char *s_pick_fmt = "%d 分钟";    /* 行文字格式 */
+
+static void pick_close(void);                 /* 前向: ui_settings_back 要先关弹层 */
+static void idle_ui_refresh(void);            /* 前向: pick_row_cb 要刷新熄屏页 */
+static void ls_ui_refresh(void);              /* 前向: pick_row_cb 要刷新浅睡页 */
 
 /* 当前运行镜像的版本/大小: 只在第一次进设置时取一次, 之后直接用缓存 */
 static bool     s_info_ready = false;
@@ -177,23 +228,36 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *txt, lv_color_t color,
 typedef enum {
     PG_LIST = 0,      /* 根: 再返回就是退出设置 */
     PG_VERSION,       /* 固件版本详情 */
+    PG_SLEEP,         /* 自动休眠子页 */
+    PG_IDLE,          /* 自动熄屏子页 */
+    PG_LIGHTSLEEP,    /* 浅睡时长子页 */
 } page_t;
 
 static page_t s_page = PG_LIST;
 
+/* 五页互斥显示: 先全隐, 再放一个出来 */
+static void hide_all(void)
+{
+    if (s_list)   lv_obj_add_flag(s_list,   LV_OBJ_FLAG_HIDDEN);
+    if (s_detail) lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+    if (s_sleep)  lv_obj_add_flag(s_sleep,  LV_OBJ_FLAG_HIDDEN);
+    if (s_idle)   lv_obj_add_flag(s_idle,   LV_OBJ_FLAG_HIDDEN);
+    if (s_ls)     lv_obj_add_flag(s_ls,     LV_OBJ_FLAG_HIDDEN);
+}
+
 static void list_show(void)
 {
-    if (s_list)   lv_obj_clear_flag(s_list, LV_OBJ_FLAG_HIDDEN);
-    if (s_detail) lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+    hide_all();
+    if (s_list) lv_obj_clear_flag(s_list, LV_OBJ_FLAG_HIDDEN);
     s_page = PG_LIST;
 }
 
 static void detail_show(void)
 {
     if (!s_detail) return;
+    hide_all();
     lv_obj_move_foreground(s_detail);              /* 压住列表页 */
     lv_obj_clear_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
-    if (s_list) lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
     s_page = PG_VERSION;
 }
 
@@ -204,6 +268,21 @@ static void version_row_cb(lv_event_t *e)
     detail_show();
     power_mgr_notify_activity();                   /* 点按也算操作, 续期熄屏计时 */
 }
+
+/* 点「自动休眠」行: 进休眠时长子页 (定义在后面, 这里先声明) */
+static void sleep_show(void);
+static void sleep_row_cb(lv_event_t *e)
+{
+    (void)e;
+    sleep_show();
+    power_mgr_notify_activity();
+}
+
+/* 点「自动熄屏」行: 进熄屏时长子页 */
+static void idle_row_cb(lv_event_t *e);
+
+/* 点「浅睡时长」行: 进浅睡时长子页 */
+static void ls_row_cb(lv_event_t *e);
 
 /* 详情页左上角「‹」: 回列表 (模式本身不动) */
 static void back_cb(lv_event_t *e)
@@ -224,8 +303,7 @@ static void check_update_cb(lv_event_t *e)
         ESP_LOGW(TAG, "进入 WiFi 流程失败 (上一次会话可能还在释放)");
         return;
     }
-    if (s_list)   lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
-    if (s_detail) lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+    hide_all();                                    /* 列表/详情/休眠页都先藏起来 */
 }
 
 /* WiFi 流程结束 (扫描页/检查更新页返回, 资源已释放): 回到固件版本详情 */
@@ -236,15 +314,23 @@ static void wifi_flow_end_cb(void)
 }
 
 /* 电源键短按: 返回上一级; 已经在设置列表这一级 → 退出设置 (回菜单).
+ * 选择弹层开着时先关弹层 (这一按只用来退弹层, 不退页面).
  * 扫描/连接/释放期间由 ui_wifi_back() 自己拦掉 (按了没反应). */
 void ui_settings_back(void)
 {
+    if (s_pick) {                                  /* 自绘下拉开着 */
+        pick_close();
+        power_mgr_notify_activity();
+        return;
+    }
+
     if (ui_wifi_active()) {
         ui_wifi_back();
         return;
     }
 
-    if (s_page == PG_VERSION) {
+    if (s_page == PG_VERSION || s_page == PG_SLEEP || s_page == PG_IDLE ||
+        s_page == PG_LIGHTSLEEP) {
         list_show();
         power_mgr_notify_activity();
         return;
@@ -254,24 +340,10 @@ void ui_settings_back(void)
     app_mode_request(APP_MODE_MENU);
 }
 
-/* ── 列表页 ── */
-static void list_build(void)
+/* 列表行: 文字 + 行尾箭头 (固件版本 / 自动休眠 共用一套样式) */
+static void add_row(lv_obj_t *list, const char *text, lv_event_cb_t cb)
 {
-    s_list = page_create();
-
-    lv_obj_t *list = lv_list_create(s_list);
-    lv_obj_set_size(list, TFT_HOR_RES, TFT_VER_RES);
-    lv_obj_set_pos(list, 0, 0);
-    lv_obj_set_style_bg_color(list, SET_BG, 0);
-    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(list, 0, 0);
-    lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_all(list, 0, 0);
-    lv_obj_set_style_pad_row(list, 0, 0);
-    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
-
-    /* 唯一一行: 固件版本  › */
-    lv_obj_t *btn = lv_list_add_btn(list, NULL, "固件版本");
+    lv_obj_t *btn = lv_list_add_btn(list, NULL, text);
     lv_obj_set_size(btn, TFT_HOR_RES, ROW_H);
     lv_obj_set_style_bg_color(btn, SET_BG, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
@@ -299,17 +371,35 @@ static void list_build(void)
     lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(arrow, SET_ARROW, 0);
 
-    lv_obj_add_event_cb(btn, version_row_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
 }
 
-/* ── 固件版本详情页 ── */
-static void detail_build(void)
+/* ── 列表页 ── */
+static void list_build(void)
 {
-    s_detail = page_create();
-    lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);   /* 进来先停在列表页 */
+    s_list = page_create();
 
-    /* 顶栏: 返回 + 标题 + 1px 分隔线 */
-    lv_obj_t *back = lv_btn_create(s_detail);
+    lv_obj_t *list = lv_list_create(s_list);
+    lv_obj_set_size(list, TFT_HOR_RES, TFT_VER_RES);
+    lv_obj_set_pos(list, 0, 0);
+    lv_obj_set_style_bg_color(list, SET_BG, 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(list, 0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_row(list, 0, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+
+    add_row(list, "固件版本", version_row_cb);
+    add_row(list, "自动休眠", sleep_row_cb);
+    add_row(list, "自动熄屏", idle_row_cb);
+    add_row(list, "浅睡时长", ls_row_cb);
+}
+
+/* 子页顶栏: 返回按钮 + 居中标题 + 1px 分隔线 (固件版本 / 自动休眠 共用) */
+static void title_bar_create(lv_obj_t *page, const char *title)
+{
+    lv_obj_t *back = lv_btn_create(page);
     lv_obj_set_pos(back, 0, 0);
     lv_obj_set_size(back, TITLE_H, TITLE_H);
     lv_obj_set_style_bg_opa(back, LV_OPA_TRANSP, 0);
@@ -324,15 +414,24 @@ static void detail_build(void)
     lv_obj_set_style_text_color(back_lbl, SET_TEXT, 0);
     lv_obj_center(back_lbl);
 
-    make_label(s_detail, "固件版本", SET_TEXT, TITLE_H, 15,
+    make_label(page, title, SET_TEXT, TITLE_H, 15,
                TFT_HOR_RES - 2 * TITLE_H, LV_TEXT_ALIGN_CENTER);
 
-    lv_obj_t *line = lv_obj_create(s_detail);
+    lv_obj_t *line = lv_obj_create(page);
     lv_obj_remove_style_all(line);
     lv_obj_set_pos(line, 0, TITLE_H);
     lv_obj_set_size(line, TFT_HOR_RES, 1);
     lv_obj_set_style_bg_color(line, SET_LINE, 0);
     lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+}
+
+/* ── 固件版本详情页 ── */
+static void detail_build(void)
+{
+    s_detail = page_create();
+    lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);   /* 进来先停在列表页 */
+
+    title_bar_create(s_detail, "固件版本");
 
     /* 版本 */
     make_label(s_detail, "版本", SET_MUTED, PAD_X, 62, 0, LV_TEXT_ALIGN_LEFT);
@@ -367,6 +466,439 @@ static void detail_build(void)
     lv_obj_center(btn_lbl);
 }
 
+/* ── 自动休眠子页 ──
+ *
+ * 两个"下拉": 一行按钮写着当前值 + ▾, 点开是居中的白卡弹层列出可选值.
+ * 为什么不用 lv_dropdown: lv_conf.h 里 dropdown/roller 都是 0 (开了要全量重编 LVGL),
+ * 而且 LVGL 8 的下拉列表固定往下展开 —— 分钟这档有 7 项, 在 172x320 上必然探出屏幕.
+ * 自绘弹层还能让"点哪里关、点哪里选"是确定的.
+ *
+ * 编辑中的值只存 s_hour_sel / s_min_sel, 点「保存」才落 NVS: 半路按返回不留痕. */
+
+/* 两颗按钮上的文字 + 保存按钮的可用性 (0 小时 0 分没有意义, 直接不可点) */
+static void sleep_ui_refresh(void)
+{
+    if (s_hour_lbl) lv_label_set_text_fmt(s_hour_lbl, "%d 小时", s_hour_sel);
+    if (s_min_lbl)  lv_label_set_text_fmt(s_min_lbl,  "%d 分钟", s_min_sel);
+
+    const bool zero = (s_hour_sel == 0 && s_min_sel == 0);
+
+    if (s_save_btn) {
+        if (zero) lv_obj_add_state(s_save_btn, LV_STATE_DISABLED);
+        else      lv_obj_clear_state(s_save_btn, LV_STATE_DISABLED);
+    }
+    if (s_save_lbl) {                        /* 禁用态自己不能变灰: 显式换文字色 */
+        lv_obj_set_style_text_color(s_save_lbl, zero ? SET_MUTED : SET_TEXT, 0);
+    }
+}
+
+static void pick_close(void)
+{
+    if (s_pick) { lv_obj_del(s_pick); s_pick = NULL; }
+}
+
+/* 点卡片外: 关掉弹层, 不改任何值 */
+static void pick_overlay_cb(lv_event_t *e)
+{
+    (void)e;
+    pick_close();
+    power_mgr_notify_activity();
+}
+
+/* 点某一项: 更新编辑值, 关弹层 (值不落盘, 等「保存」) */
+static void pick_row_cb(lv_event_t *e)
+{
+    int v = (int)(intptr_t)lv_event_get_user_data(e);
+
+    switch (s_pick_id) {
+    case PICK_HOUR:        s_hour_sel = v;            break;
+    case PICK_MINUTE:      s_min_sel  = v;            break;
+    case PICK_IDLE_COMMON: s_idle_sel[SETTINGS_IDLE_COMMON] = v; break;
+    case PICK_IDLE_NOVEL:  s_idle_sel[SETTINGS_IDLE_NOVEL]  = v; break;
+    case PICK_IDLE_LYRICS: s_idle_sel[SETTINGS_IDLE_LYRICS] = v; break;
+    case PICK_LIGHTSLEEP:  s_ls_sel = v; break;
+    }
+
+    pick_close();
+    switch (s_pick_id) {
+    case PICK_HOUR:
+    case PICK_MINUTE:     sleep_ui_refresh(); break;
+    case PICK_LIGHTSLEEP: ls_ui_refresh();    break;
+    default:              idle_ui_refresh();  break;
+    }
+    power_mgr_notify_activity();
+}
+
+/* 打开选择弹层.
+ * id=改哪个值; sel=当前值; base/step/count=候选值 (base + i*step); fmt=行文字格式.
+ * 自动休眠: (0,1,4,"%d 小时") 与 (0,10,7,"%d 分钟");
+ * 自动熄屏: 三条都是 (1,1,10,"%d 分钟"). */
+static void pick_open(pick_id_t id, int sel, int base, int step, int count, const char *fmt)
+{
+    pick_close();
+    s_pick_id   = id;
+    s_pick_base = base;
+    s_pick_step = step;
+    s_pick_fmt  = fmt;
+
+    /* 10 项时行高收到 26, 否则 10*30+8 = 308 会把卡片顶到屏幕外 */
+    const int row_h  = (count > 7) ? 26 : PICK_ROW_H;
+    const int card_h = count * row_h + 8;
+
+    /* 透明遮罩: 只负责"点外面 = 取消", 不再压一层半透明黑 —— 设置页本来就是白底,
+     * 盖灰会让弹层后整页变暗, 看着像换了张页面. */
+    s_pick = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(s_pick);
+    lv_obj_set_pos(s_pick, 0, 0);
+    lv_obj_set_size(s_pick, TFT_HOR_RES, TFT_VER_RES);
+    lv_obj_set_style_bg_opa(s_pick, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_pick, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_pick, pick_overlay_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *card = lv_obj_create(s_pick);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, PICK_CARD_W, card_h);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, SET_BG, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_border_color(card, SET_LINE, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_shadow_width(card, 14, 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_30, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    /* 卡片本身也接点击: 落在行间的缝里时不要去关弹层 */
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < count; i++) {
+        const int v = base + i * step;
+
+        lv_obj_t *row = lv_btn_create(card);
+        lv_obj_set_pos(row, 4, 4 + i * row_h);
+        lv_obj_set_size(row, PICK_CARD_W - 8, row_h);
+        lv_obj_set_style_radius(row, 0, 0);
+        /* 当前值那一行用浅底标出来, 不用符号: 全局 16 号中文字库里没有 LV_SYMBOL_* */
+        lv_obj_set_style_bg_color(row, (v == sel) ? SET_PRESSED : SET_BG, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(row, SET_PRESSED, LV_STATE_PRESSED);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_color(row, SET_LINE, 0);
+        lv_obj_set_style_border_width(row, (i == count - 1) ? 0 : 1, 0);
+        lv_obj_add_event_cb(row, pick_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)v);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_label_set_text_fmt(lbl, fmt, v);
+        lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
+        lv_obj_set_style_text_color(lbl, SET_TEXT, 0);
+        lv_obj_center(lbl);
+    }
+}
+
+static void hour_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    pick_open(PICK_HOUR, s_hour_sel, 0, 1, 4, "%d 小时");
+    power_mgr_notify_activity();
+}
+
+static void min_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    pick_open(PICK_MINUTE, s_min_sel, 0, 10, 7, "%d 分钟");
+    power_mgr_notify_activity();
+}
+
+/* "下拉"按钮: 左边当前值, 右边 ▾; out_lbl 带回文字标签供刷新.
+ * cb 的 user_data 由调用方给 (自动熄屏三个按钮共用同一个回调, 靠它区分分支). */
+static lv_obj_t *make_picker_btn(lv_obj_t *parent, lv_coord_t y, lv_event_cb_t cb,
+                                 void *user, lv_obj_t **out_lbl)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_pos(btn, PAD_X, y);
+    lv_obj_set_size(btn, TFT_HOR_RES - 2 * PAD_X, PICK_BTN_H);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_set_style_bg_color(btn, SET_BG, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(btn, SET_PRESSED, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, SET_BTN_BR, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(lbl, SET_TEXT, 0);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *arrow = lv_label_create(btn);
+    lv_label_set_text(arrow, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(arrow, SET_ARROW, 0);
+    lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    if (out_lbl) *out_lbl = lbl;
+    return btn;
+}
+
+/* 保存: 写 NVS; 自动休眠开着的话, autosleep 会按新时长重新计时 */
+static void sleep_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_hour_sel == 0 && s_min_sel == 0) return;   /* 按钮已禁用, 这里再兜一次 */
+
+    const int total = s_hour_sel * 60 + s_min_sel;
+    autosleep_set_minutes(total);
+    ESP_LOGI(TAG, "自动休眠时长: %d 小时 %d 分 (共 %d 分钟)", s_hour_sel, s_min_sel, total);
+
+    list_show();
+    power_mgr_notify_activity();
+}
+
+/* 进子页: 每次都从运行时的设定值重取, 半路改过但没保存的值不保留 */
+static void sleep_show(void)
+{
+    if (!s_sleep) return;
+
+    const int total = autosleep_total_minutes();
+    s_hour_sel = total / 60;
+    s_min_sel  = (total % 60) / 10 * 10;
+    if (s_hour_sel > 3) s_hour_sel = 3;
+    sleep_ui_refresh();
+
+    hide_all();
+    lv_obj_move_foreground(s_sleep);
+    lv_obj_clear_flag(s_sleep, LV_OBJ_FLAG_HIDDEN);
+    s_page = PG_SLEEP;
+}
+
+/* ── 自动休眠子页 ── */
+static void sleep_page_build(void)
+{
+    s_sleep = page_create();
+    lv_obj_add_flag(s_sleep, LV_OBJ_FLAG_HIDDEN);
+
+    title_bar_create(s_sleep, "自动休眠");
+
+    make_label(s_sleep, "小时", SET_MUTED, PAD_X, 56, 0, LV_TEXT_ALIGN_LEFT);
+    make_picker_btn(s_sleep, 78, hour_btn_cb, NULL, &s_hour_lbl);
+
+    make_label(s_sleep, "分钟", SET_MUTED, PAD_X, 122, 0, LV_TEXT_ALIGN_LEFT);
+    make_picker_btn(s_sleep, 144, min_btn_cb, NULL, &s_min_lbl);
+
+    /* 保存 (0 小时 0 分时禁用) */
+    s_save_btn = lv_btn_create(s_sleep);
+    lv_obj_set_pos(s_save_btn, (TFT_HOR_RES - BTN_W) / 2, 206);
+    lv_obj_set_size(s_save_btn, BTN_W, BTN_H);
+    lv_obj_set_style_radius(s_save_btn, 6, 0);
+    lv_obj_set_style_bg_color(s_save_btn, SET_BTN_BG, 0);
+    lv_obj_set_style_bg_opa(s_save_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_save_btn, SET_PRESSED, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(s_save_btn, SET_BTN_BR, 0);
+    lv_obj_set_style_border_width(s_save_btn, 1, 0);
+    lv_obj_set_style_shadow_width(s_save_btn, 0, 0);
+    lv_obj_add_event_cb(s_save_btn, sleep_save_cb, LV_EVENT_CLICKED, NULL);
+
+    s_save_lbl = lv_label_create(s_save_btn);
+    lv_label_set_text(s_save_lbl, "保存");
+    lv_obj_set_style_text_font(s_save_lbl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(s_save_lbl, SET_TEXT, 0);
+    lv_obj_center(s_save_lbl);
+
+    make_label(s_sleep, "保存后按新时长重新计时", SET_MUTED, PAD_X, 262,
+               TFT_HOR_RES - 2 * PAD_X, LV_TEXT_ALIGN_CENTER);
+}
+
+/* ── 自动熄屏子页 ──
+ *
+ * 三条: 通用 / 小说 / 歌词, 1~10 分钟. 通用兜住菜单、设置、音乐封面以及以后新加的
+ * 任何模式, 小说和歌词只是两条覆盖 —— 想改全局就改通用, 不需要"跟随通用"这种选项.
+ *
+ * 和自动休眠一样, 编辑值只在内存, 点「保存」才落 NVS; 但 1~10 全都合法,
+ * 保存按钮没有禁用态. */
+
+static void idle_ui_refresh(void)
+{
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) {
+        if (s_idle_lbl[i]) lv_label_set_text_fmt(s_idle_lbl[i], "%d 分钟", s_idle_sel[i]);
+    }
+}
+
+/* 三个按钮共用一个回调: user_data 带回分支号 */
+static void idle_btn_cb(lv_event_t *e)
+{
+    int br = (int)(intptr_t)lv_event_get_user_data(e);
+    if (br < 0 || br >= SETTINGS_IDLE_NUM) return;
+
+    pick_id_t id = (br == SETTINGS_IDLE_NOVEL)  ? PICK_IDLE_NOVEL  :
+                   (br == SETTINGS_IDLE_LYRICS) ? PICK_IDLE_LYRICS : PICK_IDLE_COMMON;
+
+    pick_open(id, s_idle_sel[br], IDLE_MIN_MIN, 1,
+              IDLE_MIN_MAX - IDLE_MIN_MIN + 1, "%d 分钟");
+    power_mgr_notify_activity();
+}
+
+/* 保存: 三条一起落到缓存 + NVS, 立刻生效 (下一次 1 秒轮询就用新值) */
+static void idle_save_cb(lv_event_t *e)
+{
+    (void)e;
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) {
+        power_mgr_idle_set(i, s_idle_sel[i]);
+    }
+    ESP_LOGI(TAG, "自动熄屏: 通用 %d / 小说 %d / 歌词 %d 分钟",
+             s_idle_sel[SETTINGS_IDLE_COMMON], s_idle_sel[SETTINGS_IDLE_NOVEL],
+             s_idle_sel[SETTINGS_IDLE_LYRICS]);
+
+    list_show();
+    power_mgr_notify_activity();
+}
+
+/* 进子页: 从运行时缓存取当前值 (开机已从 NVS 灌入, 保存时同步) */
+static void idle_show(void)
+{
+    if (!s_idle) return;
+
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) {
+        s_idle_sel[i] = power_mgr_idle_minutes(i);
+    }
+    idle_ui_refresh();
+
+    hide_all();
+    lv_obj_move_foreground(s_idle);
+    lv_obj_clear_flag(s_idle, LV_OBJ_FLAG_HIDDEN);
+    s_page = PG_IDLE;
+}
+
+static void idle_row_cb(lv_event_t *e)
+{
+    (void)e;
+    idle_show();
+    power_mgr_notify_activity();
+}
+
+static void idle_page_build(void)
+{
+    s_idle = page_create();
+    lv_obj_add_flag(s_idle, LV_OBJ_FLAG_HIDDEN);
+
+    title_bar_create(s_idle, "自动熄屏");
+
+    static const char *const NAME[SETTINGS_IDLE_NUM] = { "通用", "小说", "歌词" };
+    /* 名字不能叫 BTN_Y / LBL_Y: 上面有同名宏, 预处理器会把数组名换成数字 */
+    static const lv_coord_t CAP_Y[SETTINGS_IDLE_NUM] = { 50, 112, 174 };
+    static const lv_coord_t PICK_Y[SETTINGS_IDLE_NUM] = { 68, 130, 192 };
+
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) {
+        make_label(s_idle, NAME[i], SET_MUTED, PAD_X, CAP_Y[i], 0, LV_TEXT_ALIGN_LEFT);
+        make_picker_btn(s_idle, PICK_Y[i], idle_btn_cb, (void *)(intptr_t)i, &s_idle_lbl[i]);
+    }
+
+    /* 保存 (三条都合法, 始终可点) */
+    lv_obj_t *save = lv_btn_create(s_idle);
+    lv_obj_set_pos(save, (TFT_HOR_RES - BTN_W) / 2, 240);
+    lv_obj_set_size(save, BTN_W, BTN_H);
+    lv_obj_set_style_radius(save, 6, 0);
+    lv_obj_set_style_bg_color(save, SET_BTN_BG, 0);
+    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(save, SET_PRESSED, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(save, SET_BTN_BR, 0);
+    lv_obj_set_style_border_width(save, 1, 0);
+    lv_obj_set_style_shadow_width(save, 0, 0);
+    lv_obj_add_event_cb(save, idle_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "保存");
+    lv_obj_set_style_text_font(sl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(sl, SET_TEXT, 0);
+    lv_obj_center(sl);
+}
+
+/* ── 浅睡时长子页 ──
+ *
+ * 一行: 0~10 分钟. **0 = 不浅睡、直接深睡** (浅睡之前的老行为), 1~10 = 淡出后
+ * 先浅睡 N 分钟再深睡. 只影响"短按(蓝牙断开)/无操作超时/息屏期蓝牙断开"三条入口,
+ * 自动休眠到点与低电量关机仍然直接深睡. */
+
+static void ls_ui_refresh(void)
+{
+    if (s_ls_lbl) lv_label_set_text_fmt(s_ls_lbl, "%d 分钟", s_ls_sel);
+}
+
+static void ls_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    pick_open(PICK_LIGHTSLEEP, s_ls_sel, LIGHT_SLEEP_MIN_MIN, 1,
+              LIGHT_SLEEP_MIN_MAX - LIGHT_SLEEP_MIN_MIN + 1, "%d 分钟");
+    power_mgr_notify_activity();
+}
+
+static void ls_save_cb(lv_event_t *e)
+{
+    (void)e;
+    power_mgr_light_sleep_set_minutes(s_ls_sel);
+    ESP_LOGI(TAG, "浅睡时长: %d 分钟%s", s_ls_sel, s_ls_sel ? "" : " (直接深睡)");
+
+    list_show();
+    power_mgr_notify_activity();
+}
+
+/* 进子页: 从运行时缓存取当前值 (开机已从 NVS 灌入, 保存时同步) */
+static void ls_show(void)
+{
+    if (!s_ls) return;
+
+    s_ls_sel = power_mgr_light_sleep_minutes();
+    ls_ui_refresh();
+
+    hide_all();
+    lv_obj_move_foreground(s_ls);
+    lv_obj_clear_flag(s_ls, LV_OBJ_FLAG_HIDDEN);
+    s_page = PG_LIGHTSLEEP;
+}
+
+static void ls_row_cb(lv_event_t *e)
+{
+    (void)e;
+    ls_show();
+    power_mgr_notify_activity();
+}
+
+static void ls_page_build(void)
+{
+    s_ls = page_create();
+    lv_obj_add_flag(s_ls, LV_OBJ_FLAG_HIDDEN);
+
+    title_bar_create(s_ls, "浅睡时长");
+
+    make_label(s_ls, "浅睡", SET_MUTED, PAD_X, 56, 0, LV_TEXT_ALIGN_LEFT);
+    make_picker_btn(s_ls, 78, ls_btn_cb, NULL, &s_ls_lbl);
+
+    /* 说明: 0 的含义容易误会, 直接写在页面上.
+     * 三行短句 (每行 <= 9 个汉字), 免得折行后压到下面的保存按钮 */
+    make_label(s_ls, "0 = 直接深睡\n1~10 分钟先浅睡\n按电源键可唤醒",
+               SET_MUTED, PAD_X, 118, TFT_HOR_RES - 2 * PAD_X, LV_TEXT_ALIGN_LEFT);
+
+    /* 保存 (0~10 都合法, 始终可点) */
+    lv_obj_t *save = lv_btn_create(s_ls);
+    lv_obj_set_pos(save, (TFT_HOR_RES - BTN_W) / 2, 226);
+    lv_obj_set_size(save, BTN_W, BTN_H);
+    lv_obj_set_style_radius(save, 6, 0);
+    lv_obj_set_style_bg_color(save, SET_BTN_BG, 0);
+    lv_obj_set_style_bg_opa(save, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(save, SET_PRESSED, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(save, SET_BTN_BR, 0);
+    lv_obj_set_style_border_width(save, 1, 0);
+    lv_obj_set_style_shadow_width(save, 0, 0);
+    lv_obj_add_event_cb(save, ls_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "保存");
+    lv_obj_set_style_text_font(sl, &lv_font_global_16, 0);
+    lv_obj_set_style_text_color(sl, SET_TEXT, 0);
+    lv_obj_center(sl);
+}
+
 /* ── 对外接口 ── */
 void ui_settings_build(void)
 {
@@ -375,6 +907,9 @@ void ui_settings_build(void)
     ensure_info();                 /* 版本/大小只取一次 */
     list_build();
     detail_build();
+    sleep_page_build();
+    idle_page_build();
+    ls_page_build();
     ui_wifi_set_end_cb(wifi_flow_end_cb);   /* WiFi 子流程结束时回到详情页 */
     s_page = PG_LIST;
 
@@ -388,8 +923,16 @@ void ui_settings_destroy(void)
      * 必须在删列表/详情之前做 —— 它要把屏幕旋转恢复成竖屏. */
     ui_wifi_destroy();
 
+    pick_close();                     /* 选择弹层挂在屏幕上, 必须单独删 */
+    if (s_sleep)  { lv_obj_del(s_sleep);  s_sleep  = NULL; }
+    if (s_idle)   { lv_obj_del(s_idle);   s_idle   = NULL; }
+    if (s_ls)     { lv_obj_del(s_ls);     s_ls     = NULL; }
     if (s_detail) { lv_obj_del(s_detail); s_detail = NULL; }
     if (s_list)   { lv_obj_del(s_list);   s_list   = NULL; }
+
+    s_hour_lbl = s_min_lbl = s_save_btn = s_save_lbl = NULL;
+    s_ls_lbl = NULL;
+    for (int i = 0; i < SETTINGS_IDLE_NUM; i++) s_idle_lbl[i] = NULL;
     s_page = PG_LIST;
     ESP_LOGI(TAG, "设置页已销毁");
 }

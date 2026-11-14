@@ -20,6 +20,8 @@
 #include "xtensa_context.h"
 #include "nvs.h"
 #include "app.h"
+#include "autosleep.h"
+#include "power_mgr.h"
 #include "bt_a2dp.h"
 #include "ota.h"
 #include "update.h"
@@ -425,6 +427,50 @@ static void cmd_font(void)
     }
 }
 
+/* lsp / 浅睡诊断 (Phase 0):
+ *   lsp <秒>  → 请求浅睡 N 秒, 期间按电源键可提前唤醒; 醒后打印自检结果
+ *              (PSRAM / 内部 RAM / 屏幕重绘 / 触摸 / SD / 时间基准)
+ * 真正的睡眠由 LVGL 任务的 1 秒定时器执行 (见 power_mgr_light_sleep_test). */
+static void cmd_lsp(char *args)
+{
+    if (!args || !*args) {
+        printf("[lsp] 用法: lsp <秒>   (浅睡 N 秒, 按电源键可提前唤醒)\n");
+        return;
+    }
+
+    int sec = atoi(args);
+    if (sec <= 0) {
+        printf("[lsp] 秒数要大于 0\n");
+        return;
+    }
+    power_mgr_light_sleep_test(sec);
+    printf("[lsp] 已请求浅睡 %d 秒 (下一次 1 秒轮询执行)\n", sec);
+}
+
+/* 自动休眠 (测试入口):
+ *   sleep        → 打印开关 / 设定时长 / 剩余秒数
+ *   sleep <sec>  → 把剩余设为 sec 秒并立即开始 (最短一档是 10 分钟, 上机没法等)
+ *
+ * 这里只写一个 int 请求标志, 真正改剩余量的是 autosleep 的 1 秒定时器 (LVGL 任务):
+ * 剩余量是 int64, 跨任务直接写会撕裂. */
+static void cmd_sleep(char *args)
+{
+    if (!args || !*args) {
+        printf("[休眠] 开关 %s | 设定 %d 分钟 | 剩余 %d 秒\n",
+               autosleep_is_on() ? "开" : "关",
+               autosleep_total_minutes(), autosleep_remaining_sec());
+        return;
+    }
+
+    int sec = atoi(args);
+    if (sec <= 0) {
+        printf("[休眠] 秒数要大于 0\n");
+        return;
+    }
+    autosleep_request_sec(sec);
+    printf("[休眠] 已请求 %d 秒后深睡 (下一次结算生效)\n", sec);
+}
+
 /* ota server            → 打印当前用的服务器
  * ota server <api>      → 只设版本接口地址, 下载前缀清空 (= 直接用 JSON 里的绝对地址)
  * ota server <api> <dlp>→ 同时设下载前缀 (GitHub 要 https://gh-proxy.com/)
@@ -736,6 +782,14 @@ static void console_task(void *arg)
                         ota_report();
                     } else if (strcmp(line, "font crc") == 0) {
                         cmd_font();
+                    } else if (strcmp(line, "sleep") == 0) {
+                        cmd_sleep(NULL);
+                    } else if (strncmp(line, "sleep ", 6) == 0) {   /* "sleep <sec>" */
+                        cmd_sleep(line + 6);
+                    } else if (strcmp(line, "lsp") == 0) {
+                        cmd_lsp(NULL);
+                    } else if (strncmp(line, "lsp ", 4) == 0) {     /* "lsp <sec>" */
+                        cmd_lsp(line + 4);
                     } else if (strncmp(line, "ota boot ", 9) == 0) {   /* "ota boot 0/1" */
                         ota_switch(atoi(line + 9));
                     } else {

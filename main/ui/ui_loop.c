@@ -19,6 +19,7 @@
 #include "menu.h"
 #include "app_mode.h"
 #include "power_mgr.h"
+#include "autosleep.h"
 #include "ota.h"
 
 #define LVGL_TAG "LVGL"
@@ -48,6 +49,7 @@ void ui_loop_task(void *arg)
     /* LCD 后半段: 距 SLPOUT ≥120ms 后发寄存器命令 + DISPON (不足则阻塞补齐) */
     lcd_init_finish();
     lv_timer_handler();   /* 跑一帧, 让界面先画出来 */
+    autosleep_init();     /* 自动休眠: 读 NVS + 建 1 秒结算定时器 (同 LVGL 任务) */
     power_mgr_init();     /* 电源管理 (背光渐入/按键) */
     /* 文件浏览器不再一次性阻塞创建 (~100ms), 改为下面的主循环里按时间预算分片完成:
      * 背光渐入动画约 300ms, 每轮只占用一小片, 卡顿被渐入掩盖 */

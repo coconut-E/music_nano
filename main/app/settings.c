@@ -527,3 +527,161 @@ void settings_app_mode_save(int mode)
         nvs_close(h);
     }
 }
+
+/* ──────────────────────────── 自动休眠 ────────────────────────────
+ * 只持久化"开关 + 设定时长"这两件事; 剩余时间是纯内存量, 由 autosleep.c 管,
+ * 重启即归零 —— 用户明确要求"重启了就当没这回事", 所以这里不存它. */
+#define SLEEP_ON_KEY    "sleep_on"    /* 开关 0/1 */
+#define SLEEP_MIN_KEY   "sleep_min"   /* 总分钟数 10~240 */
+
+bool settings_sleep_enabled_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+
+    uint8_t v = 0;
+    esp_err_t ret = nvs_get_u8(h, SLEEP_ON_KEY, &v);
+    nvs_close(h);
+
+    return (ret == ESP_OK && v != 0);
+}
+
+void settings_sleep_enabled_save(bool on)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_u8(h, SLEEP_ON_KEY, on ? 1 : 0);
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+
+    if (ret != ESP_OK) ESP_LOGW(TAG, "保存自动休眠开关失败 (%s)", esp_err_to_name(ret));
+}
+
+int settings_sleep_minutes_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return AUTOSLEEP_MIN_DEFAULT;
+
+    uint16_t v = AUTOSLEEP_MIN_DEFAULT;
+    esp_err_t ret = nvs_get_u16(h, SLEEP_MIN_KEY, &v);
+    nvs_close(h);
+
+    /* 越界/脏数据一律回默认值, 免得算出个 0 分钟就立刻深睡 */
+    if (ret != ESP_OK || v < AUTOSLEEP_MIN_MIN || v > AUTOSLEEP_MIN_MAX) return AUTOSLEEP_MIN_DEFAULT;
+    return (int)v;
+}
+
+void settings_sleep_minutes_save(int total_min)
+{
+    if (total_min < AUTOSLEEP_MIN_MIN) total_min = AUTOSLEEP_MIN_MIN;
+    if (total_min > AUTOSLEEP_MIN_MAX) total_min = AUTOSLEEP_MIN_MAX;
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_u16(h, SLEEP_MIN_KEY, (uint16_t)total_min);
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "已保存自动休眠时长: %d 分钟 (%d 小时 %d 分)",
+                 total_min, total_min / 60, total_min % 60);
+    } else {
+        ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
+    }
+}
+
+/* ──────────────────────────── 自动熄屏 ────────────────────────────
+ * 三条分支各一个键, 值就是分钟数 (1~10). 键名短一点: NVS 键上限 15 字节,
+ * 且这三个值每次进设置页都会读, 字号无所谓. */
+static const char *const IDLE_KEYS[SETTINGS_IDLE_NUM] = {
+    "off_common", "off_novel", "off_lyr",
+};
+
+/* 默认值 = 旧行为: 音乐封面 2 分钟 / 小说 5 分钟 / 歌词 5 分钟.
+ * 菜单和设置原来是 30 秒, 现在并入"通用"分支, 取 2 分钟 (范围下限 1 分钟). */
+static const int IDLE_DEFAULTS[SETTINGS_IDLE_NUM] = { 2, 5, 5 };
+
+int settings_idle_minutes_load(int branch)
+{
+    if (branch < 0 || branch >= SETTINGS_IDLE_NUM) return IDLE_DEFAULTS[SETTINGS_IDLE_COMMON];
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return IDLE_DEFAULTS[branch];
+
+    uint8_t v = 0;
+    esp_err_t ret = nvs_get_u8(h, IDLE_KEYS[branch], &v);
+    nvs_close(h);
+
+    if (ret != ESP_OK || v < IDLE_MIN_MIN || v > IDLE_MIN_MAX) return IDLE_DEFAULTS[branch];
+    return (int)v;
+}
+
+void settings_idle_minutes_save(int branch, int minutes)
+{
+    if (branch < 0 || branch >= SETTINGS_IDLE_NUM) return;
+    if (minutes < IDLE_MIN_MIN) minutes = IDLE_MIN_MIN;
+    if (minutes > IDLE_MIN_MAX) minutes = IDLE_MIN_MAX;
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_u8(h, IDLE_KEYS[branch], (uint8_t)minutes);
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "已保存自动熄屏 (%s): %d 分钟", IDLE_KEYS[branch], minutes);
+    } else {
+        ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
+    }
+}
+
+/* ──────────────────────────── 浅睡时长 ──────────────────────────── */
+#define LIGHT_SLEEP_KEY   "ls_min"
+
+int settings_light_sleep_minutes_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return LIGHT_SLEEP_MIN_DEFAULT;
+
+    uint8_t v = LIGHT_SLEEP_MIN_DEFAULT;
+    esp_err_t ret = nvs_get_u8(h, LIGHT_SLEEP_KEY, &v);
+    nvs_close(h);
+
+    if (ret != ESP_OK || v > LIGHT_SLEEP_MIN_MAX) return LIGHT_SLEEP_MIN_DEFAULT;
+    return (int)v;
+}
+
+void settings_light_sleep_minutes_save(int minutes)
+{
+    if (minutes < LIGHT_SLEEP_MIN_MIN) minutes = LIGHT_SLEEP_MIN_MIN;
+    if (minutes > LIGHT_SLEEP_MIN_MAX) minutes = LIGHT_SLEEP_MIN_MAX;
+
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_u8(h, LIGHT_SLEEP_KEY, (uint8_t)minutes);
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "已保存浅睡时长: %d 分钟%s", minutes,
+                 minutes ? "" : " (直接深睡)");
+    } else {
+        ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
+    }
+}

@@ -85,6 +85,50 @@ void settings_loop_count_save(int n);           /* 保存循环次数到 NVS (�
 int  settings_app_mode_load(void);              /* 读上次模式, 无记录/越界返回 0 (音乐) */
 void settings_app_mode_save(int mode);          /* 保存当前模式到 NVS */
 
+/* ── 自动休眠 ──
+ * 设定值 = 小时 (0~3) + 分钟 (0~60, 步进 10), 但落盘只存一个"总分钟数":
+ * 两个下拉各自归一化会存出两个等价状态 (1小时60分 与 2小时0分), 存总分钟数
+ * 就只有一个真值, 显示时再拆成 小时=总/60, 分钟=总%60.
+ * 小时与分钟同时为 0 没有意义, UI 那边直接禁用保存, 所以可保存区间是 10~240. */
+#define AUTOSLEEP_MIN_DEFAULT   60    /* 无记录时的默认时长 (1 小时) */
+#define AUTOSLEEP_MIN_MIN       10    /* 最小可保存值 (0 小时 10 分钟) */
+#define AUTOSLEEP_MIN_MAX      240    /* 最大可保存值 (3 小时 60 分钟) */
+
+bool settings_sleep_enabled_load(void);         /* 读开关, 无记录返回 false */
+void settings_sleep_enabled_save(bool on);      /* 保存开关 */
+int  settings_sleep_minutes_load(void);         /* 读设定时长 (分钟), 越界回默认 60 */
+void settings_sleep_minutes_save(int total_min);/* 保存设定时长 (钳制 10~240) */
+
+/* ── 自动熄屏 (无操作超时) ──
+ * "通用 + 特殊"两层次, 单位分钟 1~10:
+ *   通用   = 菜单 / 设置 / 音乐封面, 以及以后新加的任何模式 (默认走这条);
+ *   小说   = 特殊覆盖 APP_MODE_NOVEL;
+ *   歌词   = 特殊覆盖音乐里的歌词页.
+ * 判定顺序写在 power_mgr.c 的 idle_poll_cb 里: 只列举两条特殊分支, 其余一律通用 ——
+ * 以后加新模式不用再动那个 if.
+ * 注意: 菜单和设置以前是固定 30 秒, 并进通用分支后最短一档是 1 分钟. */
+#define SETTINGS_IDLE_COMMON   0   /* 通用分支 */
+#define SETTINGS_IDLE_NOVEL    1   /* 特殊: 小说 */
+#define SETTINGS_IDLE_LYRICS   2   /* 特殊: 歌词 */
+#define SETTINGS_IDLE_NUM      3
+
+#define IDLE_MIN_MIN           1   /* 最短 1 分钟 */
+#define IDLE_MIN_MAX           10  /* 最长 10 分钟 */
+
+int  settings_idle_minutes_load(int branch);           /* 读某分支的分钟数, 越界回默认 */
+void settings_idle_minutes_save(int branch, int minutes);   /* 保存 (钳制 1~10) */
+
+/* ── 浅睡时长 ──
+ * 深睡前先浅睡多久 (浅睡时外设不断电, 按键可立刻唤醒), 0 = 不浅睡、直接深睡.
+ * 只影响"短按(蓝牙断开) / 无操作超时 / 息屏期蓝牙断开"三条入口;
+ * 自动休眠到点与低电量关机仍然直接深睡. */
+#define LIGHT_SLEEP_MIN_MIN      0   /* 0 = 直接深睡 (老行为) */
+#define LIGHT_SLEEP_MIN_MAX      10
+#define LIGHT_SLEEP_MIN_DEFAULT  5
+
+int  settings_light_sleep_minutes_load(void);           /* 0~10, 越界回默认 5 */
+void settings_light_sleep_minutes_save(int minutes);    /* 保存 (钳制 0~10) */
+
 #ifdef __cplusplus
 }
 #endif
