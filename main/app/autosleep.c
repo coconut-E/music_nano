@@ -80,12 +80,12 @@ static void tick_cb(lv_timer_t *tmr)
     }
 
     if (d > 0) s_left_us -= d;
-    if (s_left_us <= 0) {                     /* 到点: 直接深睡 */
+    if (s_left_us <= 0) {                     /* 到点: 报一个 TIMER 事件, 由决策表去关 */
         s_left_us  = 0;
         s_left_sec = 0;
-        s_firing   = true;
-        ESP_LOGI(TAG, "定时到点, 进入休眠");
-        power_mgr_sleep_now();
+        s_firing   = true;                    /* 只报一次: 抑制(OTA/WiFi)期间被拦下也不重试 */
+        ESP_LOGI(TAG, "定时到点, 请求休眠");
+        power_mgr_sleep_event(PWR_EV_TIMER);
         return;
     }
     s_left_sec = (int)(s_left_us / US_PER_S);

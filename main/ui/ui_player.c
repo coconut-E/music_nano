@@ -23,6 +23,7 @@
 #include "menu_like.h"
 #include "menu_mode.h"
 #include "power_mgr.h"
+#include "power_fade.h"
 #include "played_bits.h"
 #include "song_hash.h"
 #include "likes.h"
@@ -919,7 +920,7 @@ static void bri_slider_cb(lv_event_t *e)
         uint8_t v = (uint8_t)lv_slider_get_value(sl);
         lcd_set_brightness(v);           /* 立即生效 */
         brightness_set(v);               /* 更新内存值 */
-        power_mgr_set_cur_bri(v);        /* 同步电源管理的淡入/淡出起点 */
+        pwr_fade_set(v);                 /* 同步淡入/淡出的起点 */
         lv_label_set_text_fmt(s_bri_val, "%d", (int)v);
     } else if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
         brightness_save_to_nvs();        /* 松手落盘 */

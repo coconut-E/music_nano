@@ -18,6 +18,7 @@
 #include "audio_task.h"
 #include "played_bits.h"
 #include "power_mgr.h"
+#include "power_fade.h"
 #include "drv_display.h"
 
 extern const lv_font_t lv_font_montserrat_14;
@@ -250,7 +251,7 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
                 if (b > BRIGHTNESS_MAX) b = BRIGHTNESS_MAX;
                 brightness_set((uint8_t)b);
                 lcd_set_brightness((uint8_t)b);   /* 立即写背光 (之前只改内存值, 屏幕不变) */
-                power_mgr_set_cur_bri((uint8_t)b);
+                pwr_fade_set(b);
             } else {
                 volume_inc(dir * VOLUME_STEP);   /* 每次 ±1 档, 实际值查表 */
             }

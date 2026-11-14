@@ -198,14 +198,24 @@ ota_0   0x030000 2.88MB   ota_1    0x310000 2.88MB   font    0x5F0000 2.06MB
 **浅睡（0.7.16）**
 - 电源键短按（蓝牙断开）/ 无操作超时 / 息屏期蓝牙断开：**背光正常淡出** → **浅睡 5 分钟** → 期间按电源键立刻淡入亮屏，程序从断点继续；5 分钟到点才走原来的深睡（GPIO22 断电）。蓝牙已连接时仍然只熄屏，不睡 —— 浅睡会掐断 A2DP 流
 - 浅睡不关外设电源：GPIO22 全程保持低，只停 CPU/AHB/APB 时钟（`esp_light_sleep_start()` + ext0(GPIO37 高) + 5 分钟 timer）
-- 上机实测（`lsp` 自检命令）：PSRAM 1KB / 内部 RAM 256B 内容全保（靠 `CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND` + `CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED`，IDF 醒来调 `esp_psram_impl_resume_from_halfsleep_mode`）；整屏重绘无花屏；触摸 I2C 正常；SD 仍挂载、`stat("/sdcard")=0`；音乐在浅睡前后继续播
-- **`esp_timer +10000 ms` 而 `FreeRTOS tick +1 ms`**：IDF 只把系统时间补上来，不补 tick。所以醒来必须自己处理两处计时 —— 无操作计时靠 `power_mgr_notify_activity()`（`screen_on()` 里已有），自动休眠靠 `autosleep_on_wake()` 把结算基准挪到"现在"，浅睡那段不扣剩余量
+- 上机实测（当时的 `lsp` 自检命令，已随睡眠路径统一删除）：PSRAM 1KB / 内部 RAM 256B 内容全保（靠 `CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND` + `CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED`，IDF 醒来调 `esp_psram_impl_resume_from_halfsleep_mode`）；整屏重绘无花屏；触摸 I2C 正常；SD 仍挂载、`stat("/sdcard")=0`；音乐在浅睡前后继续播
+- **`esp_timer +10000 ms` 而 `FreeRTOS tick +1 ms`**：IDF 只把系统时间补上来，不补 tick。所以醒来必须自己处理两处计时 —— 无操作计时靠 `power_mgr_notify_activity()`（`pwr_wake()` 里已有），自动休眠靠 `autosleep_on_wake()` 把结算基准挪到"现在"，浅睡那段不扣剩余量
 - 两个坑：ext0 唤醒后 GPIO37 停在 RTC IO，必须 `gpio_config()` 复原成普通输入，否则电源键从此读不到；深睡前要 `esp_sleep_disable_wakeup_source(ALL)`，否则浅睡留下的 5 分钟 timer 会让深睡 5 分钟后自己醒来
 
 **浅睡时长可调（0.7.17）**
 - 设置页第四项「浅睡时长」：**0~10 分钟**，存 NVS（`ls_min`）。**0 = 不浅睡、直接深睡**（浅睡之前的老行为），1~10 = 正常淡出后先浅睡 N 分钟再深睡
 - 只影响三条入口（短按且蓝牙断开 / 无操作超时 / 息屏期蓝牙断开）；自动休眠到点、低电量关机仍然直接深睡
 - 时长缓存在 `power_mgr`（开机从 NVS 灌一次，睡眠路径不碰 flash），保存后下一次进睡就用新值，不用重启
+
+**睡眠路径统一**
+- 息屏 / 浅睡 / 深睡不再是三条并列分支，改成**一条三级梯**：一级 `pwr_off()` 灭屏（背光淡出 + 关触摸 + 刷新降到 100s）→ 二级 `pwr_light_sleep()` 浅睡（CPU 停钟、外设照供电）→ 三级 `power_mgr_shutdown_now()` 深睡（GPIO22 断电）。只能顺着往下走，不存在"从深睡跳回息屏"
+- 所有触发方式收敛成 4 个事件（`PWR_EV_KEY` / `IDLE` / `BT_LOST` / `TIMER`）+ **一张决策表** `pwr_decide()`（20 行）：抑制、过渡、已在下电三行闸门之后，每种事件该干什么一眼看完。"要不要看蓝牙""要不要浅睡"只有这一处判断，以后加触发方式 = 加一个事件
+- 状态 4 → 3（亮屏 / 灭屏 / 下电中）：`PWR_FAKE_OFF`、`PWR_LIGHT_SLEEP` 两个"淡出中"临时态删掉，凡是 `== FAKE_OFF || == LIGHT_SLEEP` 的双重判断一并消失；`s_state` 写入点 12 → 4（都在梯子的执行体里）
+- 每次决策打一行日志：`事件 KEY | 状态 亮屏 | BT 断开 → SLEEP`，串口直接看得出是谁让它睡的
+- 拆出两个模块：`power/power_fade.c`（全工程唯一的背光淡入淡出，6ms 一步；`lv_anim` 版 `screen_fade` 删掉）、`power/power_batt.c`（电池 ADC + 开机低压 + 紧急关机）。`power_mgr.c` 992 → 666 行，只剩"什么时候睡、怎么睡"
+- 删掉三个 `lv_anim` 形状的空壳回调（`sleep_entry` / `sleep_fade_done` / `enter_deep_sleep` / `enter_light_sleep`）和手工传 `NULL` 的调用；无操作超时与蓝牙断开两个 1 秒定时器合并成一个看门 `pwr_watch_cb`
+- 两处行为修正：① 息屏期蓝牙断开现在也受 OTA/WiFi 抑制约束（原来 `bt_poll_cb → sleep_entry()` 完全绕过抑制，升级窗口里蓝牙一断就照睡）；② 自动休眠到点仍然直接深睡、不走浅睡这一级（保留"到点就关机"，也避免"刚被叫醒又立刻睡"的连锁）
+- 删掉调试代码：`lsp` 浅睡自检（Phase 0，95 行）、`flashspd` flash 擦写测速探针（197 行，会写非运行槽）；`console.c` 855 → 631 行。保留 `sleep <秒>`（现在唯一能现场验证自动休眠链路的钩子，且已走统一事件）
 
 ### 2026.11.13
 

@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include "esp_heap_caps.h"
 #include "atomic_utils.h"
-#include "power_mgr.h"
+#include "power_batt.h"
 #include "played_bits.h"
 #include "audio_task.h"
 #include "sys_monitor.h"
@@ -422,7 +422,7 @@ static void sample_sensors(void)
         temp_sum += read_cpu_temp();
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
 
-        float v = power_mgr_vbat_read_once();
+        float v = power_batt_read_once();
         if (v >= 0.0f) { vbat_sum += v; vbat_valid++; }   /* 只累加有效采样 */
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
     }
@@ -497,7 +497,7 @@ static void sys_monitor_task(void *arg)
             /* 周期低压检测: 低于临界值 → 无动画直接深睡 (深度睡眠即重启系统, 无需善后).
              * g_vbat<0 表示 ADC 不可用, 必须排除, 否则会被误判为低压 */
             if (g_vbat > 0.0f && g_vbat < VBAT_CRITICAL_LOW_V) {
-                power_mgr_critical_shutdown();
+                power_batt_critical_shutdown();
             }
         }
 

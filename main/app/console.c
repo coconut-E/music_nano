@@ -21,7 +21,6 @@
 #include "nvs.h"
 #include "app.h"
 #include "autosleep.h"
-#include "power_mgr.h"
 #include "bt_a2dp.h"
 #include "ota.h"
 #include "update.h"
@@ -427,26 +426,6 @@ static void cmd_font(void)
     }
 }
 
-/* lsp / 浅睡诊断 (Phase 0):
- *   lsp <秒>  → 请求浅睡 N 秒, 期间按电源键可提前唤醒; 醒后打印自检结果
- *              (PSRAM / 内部 RAM / 屏幕重绘 / 触摸 / SD / 时间基准)
- * 真正的睡眠由 LVGL 任务的 1 秒定时器执行 (见 power_mgr_light_sleep_test). */
-static void cmd_lsp(char *args)
-{
-    if (!args || !*args) {
-        printf("[lsp] 用法: lsp <秒>   (浅睡 N 秒, 按电源键可提前唤醒)\n");
-        return;
-    }
-
-    int sec = atoi(args);
-    if (sec <= 0) {
-        printf("[lsp] 秒数要大于 0\n");
-        return;
-    }
-    power_mgr_light_sleep_test(sec);
-    printf("[lsp] 已请求浅睡 %d 秒 (下一次 1 秒轮询执行)\n", sec);
-}
-
 /* 自动休眠 (测试入口):
  *   sleep        → 打印开关 / 设定时长 / 剩余秒数
  *   sleep <sec>  → 把剩余设为 sec 秒并立即开始 (最短一档是 10 分钟, 上机没法等)
@@ -522,203 +501,6 @@ static void cmd_ota_reset(void)
     }
 }
 
-/* ── flashspd: 量这颗 flash 的真实擦/写速度 (v2: 每一步都回读校验) ──
- *
- * 第一版的教训: 只计时不回读, 拿到一个"64KB 块擦 18ms"(3.5MB/s)的荒谬数字,
- * 分不清是芯片真这么快, 还是 0xD8 命令被忽略、WIP 从没置起、wait_idle 立刻返回
- * (spi_flash_chip_generic.c:262). 现在每步都读回来对:
- *   擦 → 必须全 0xFF
- *   写 → 必须和源 memcmp 相等
- * 不通过的数字直接作废, 并打印首个不符的字节偏移.
- *
- * 第二版教训: D/E 用 0xA5 图案喂 esp_ota_write 会被镜像头校验挡掉
- * ("invalid magic byte (expected 0xE9)") —— 改成从运行分区读真实的前 16KB.
- *
- * 项目:
- *   A  擦 16KB  (4×4KB 扇区)          ← OTA 顺序写每次自动做的
- *   B  擦 64KB  (1×64KB 块)           ← esp_flash_erase_region 的对齐块擦
- *   C  写 16KB, 源内部 RAM            ← direct_write 快路径
- *   C2 写 16KB, 源 PSRAM              ← 线上 OTA 走的就是这条 (32 字节中转)
- *   C3 写 16KB, 4KB 内部中转分 4 次   ← 验证"先搬到内部 RAM"的方案
- *   D  esp_ota_begin(顺序写) + 写 16KB
- *   E  esp_ota_resume + 写 16KB       ← 不擦的 OTA 写
- *
- * 测试目标是"非运行槽"分区 (esp_ota_get_next_update_partition), otadata 不动,
- * 写脏了也不影响启动; 收尾把开头 64KB 擦回 0xFF. */
-static void fs_report(const char *desc, esp_err_t e, int64_t us, size_t bytes)
-{
-    if (e != ESP_OK) {
-        printf("[fs] %-26s 失败: %s\n", desc, esp_err_to_name(e));
-        return;
-    }
-    double kbs = (us > 0) ? (double)bytes / 1024.0 * 1000000.0 / (double)us : 0.0;
-    printf("[fs] %-26s %8lld us  %7.1f KB/s\n", desc, (long long)us, kbs);
-}
-
-/* 回读校验: exp==NULL 表示期望全 0xFF (擦除), 否则要求和 exp 逐字节相等.
- * rb 是调用方给的 4KB 内部缓冲, 分块读回来比对. */
-static void fs_verify(const esp_partition_t *part, size_t off,
-                      const uint8_t *exp, size_t len, uint8_t *rb)
-{
-    if (!rb) {
-        printf("[fs]   校验跳过 (没有内部 4KB 缓冲)\n");
-        return;
-    }
-    for (size_t o = 0; o < len; o += 4096) {
-        size_t n = (len - o > 4096) ? 4096 : (len - o);
-        if (esp_partition_read(part, off + o, rb, n) != ESP_OK) {
-            printf("[fs]   校验: ✗ 读回失败 @+%u\n", (unsigned)o);
-            return;
-        }
-        for (size_t i = 0; i < n; i++) {
-            bool bad = exp ? (rb[i] != exp[o + i]) : (rb[i] != 0xFF);
-            if (bad) {
-                printf("[fs]   校验: ✗ %s @+%u (读回 0x%02x)\n",
-                       exp ? "内容不符" : "不是 0xFF",
-                       (unsigned)(o + i), rb[i]);
-                return;
-            }
-        }
-    }
-    printf("[fs]   校验: ✓ %s\n", exp ? "内容一致" : "全 0xFF");
-}
-
-/* 擦一段 + 计时 + 回读确认真的擦成了 0xFF */
-static void fs_erase(const esp_partition_t *part, size_t off, size_t len,
-                     const char *desc, uint8_t *rb)
-{
-    int64_t t = esp_timer_get_time();
-    esp_err_t e = esp_partition_erase_range(part, off, len);
-    int64_t us = esp_timer_get_time() - t;
-    fs_report(desc, e, us, len);
-    if (e == ESP_OK) fs_verify(part, off, NULL, len, rb);
-}
-
-static void cmd_flashspd(void)
-{
-    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
-    const esp_partition_t *run  = esp_ota_get_running_partition();
-    int64_t t = 0;
-    esp_err_t e = ESP_OK;
-    esp_ota_handle_t h = 0;
-
-    uint8_t *bi  = NULL;   /* 16KB 内部: 图案 / 真实镜像头 */
-    uint8_t *bp  = NULL;   /* 16KB PSRAM: 源在 PSRAM 的对照组 */
-    uint8_t *mid = NULL;   /* 4KB 内部: C3 的中转 */
-    uint8_t *rb  = NULL;   /* 4KB 内部: 回读校验 */
-
-    if (!part || !run) {
-        printf("[fs] 分区没找到\n");
-        return;
-    }
-    /* 升级正在进行时不能碰 flash: 两边都在写同一个槽, 而且 cache 会被反复关掉 */
-    const upd_status_t *st = update_status();
-    if (st->phase == UPD_DOWNLOADING || st->phase == UPD_WRITING) {
-        printf("[fs] 正在升级 (phase=%d), 拒绝\n", (int)st->phase);
-        return;
-    }
-    if (part->size < 64 * 1024) {
-        printf("[fs] 分区太小 (%u B)\n", (unsigned)part->size);
-        return;
-    }
-
-    const size_t KB4  = 4 * 1024;
-    const size_t KB16 = 16 * 1024;
-    const size_t KB64 = 64 * 1024;
-
-    bi  = heap_caps_malloc(KB16, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    bp  = heap_caps_malloc(KB16, MALLOC_CAP_SPIRAM);
-    mid = heap_caps_malloc(KB4,  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    rb  = heap_caps_malloc(KB4,  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!bi || !rb) {
-        printf("[fs] 内部缓冲申请失败 (bi=%p rb=%p, 内部空闲 %u)\n", bi, rb,
-               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        goto out;
-    }
-    memset(bi, 0xA5, KB16);
-    if (bp) memset(bp, 0x5A, KB16);
-
-    printf("[fs] 目标 %s @0x%06x size=%u erase=%u | 运行槽 %s\n",
-           part->label, (unsigned)part->address, (unsigned)part->size,
-           (unsigned)part->erase_size, run->label);
-
-    /* A / B: 擦除, 并回读确认真的擦了 */
-    fs_erase(part, 0, KB16, "A 擦16K (4x4K扇区)", rb);
-    fs_erase(part, 0, KB64, "B 擦64K (1x64K块)", rb);
-
-    /* C: 写 16KB, 源在内部 RAM (direct_write 快路径) */
-    t = esp_timer_get_time();
-    e = esp_partition_write(part, 0, bi, KB16);
-    fs_report("C 写16K (源内部RAM)", e, esp_timer_get_time() - t, KB16);
-    if (e == ESP_OK) fs_verify(part, 0, bi, KB16, rb);
-
-    /* C2: 同样的写, 源在 PSRAM (32 字节中转慢路径) */
-    if (bp) {
-        fs_erase(part, KB16, KB16, "C2 前置擦16K", rb);
-        t = esp_timer_get_time();
-        e = esp_partition_write(part, KB16, bp, KB16);
-        fs_report("C2 写16K (源PSRAM)", e, esp_timer_get_time() - t, KB16);
-        if (e == ESP_OK) fs_verify(part, KB16, bp, KB16, rb);
-    }
-
-    /* C3: 4KB 内部中转, 分 4 次写 16KB —— 验证"先搬到内部 RAM"是否能提速 */
-    if (mid) {
-        fs_erase(part, 2 * KB16, KB16, "C3 前置擦16K", rb);
-        t = esp_timer_get_time();
-        e = ESP_OK;
-        for (size_t o = 0; o < KB16 && e == ESP_OK; o += KB4) {
-            memcpy(mid, bi + o, KB4);
-            e = esp_partition_write(part, 2 * KB16 + o, mid, KB4);
-        }
-        fs_report("C3 写16K (4KB内部中转)", e, esp_timer_get_time() - t, KB16);
-        if (e == ESP_OK) fs_verify(part, 2 * KB16, bi, KB16, rb);
-    }
-
-    /* D/E 要过镜像头校验, 所以用运行分区真实的前 16KB */
-    e = esp_partition_read(run, 0, bi, KB16);
-    if (e != ESP_OK) {
-        printf("[fs] 读运行分区失败 (%s), 跳过 D/E\n", esp_err_to_name(e));
-        goto out;
-    }
-    printf("[fs] D/E 用运行分区前 16KB (首字节 0x%02x, 期望 0xE9)\n", bi[0]);
-
-    /* D: 顺序写模式的 OTA 写 (每次自带擦除), 和线上那 1.223s 同一条路 */
-    h = 0;
-    e = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &h);
-    if (e == ESP_OK) {
-        t = esp_timer_get_time();
-        e = esp_ota_write(h, bi, KB16);
-        fs_report("D OTA顺序写16K(带擦)", e, esp_timer_get_time() - t, KB16);
-        esp_ota_abort(h);
-    } else {
-        printf("[fs] D esp_ota_begin 失败: %s\n", esp_err_to_name(e));
-    }
-
-    /* E: resume 模式, 不擦. esp_ota_resume(part, erase_size, offset, &h) 里
-     *    erase_size 只要不是 OTA_WITH_SEQUENTIAL_WRITES 就置 need_erase=false
-     *    (esp_ota_ops.c:255). 先手动擦好 16KB 再写, 所以这里只有编程时间. */
-    fs_erase(part, 0, KB16, "E 前置擦16K", rb);
-    h = 0;
-    e = esp_ota_resume(part, part->size, 0, &h);
-    if (e == ESP_OK) {
-        t = esp_timer_get_time();
-        e = esp_ota_write(h, bi, KB16);
-        fs_report("E resume写16K(不擦)", e, esp_timer_get_time() - t, KB16);
-        esp_ota_abort(h);
-    } else {
-        printf("[fs] E esp_ota_resume 失败: %s\n", esp_err_to_name(e));
-    }
-
-out:
-    /* 收尾: 开头 64KB 擦回 0xFF, 别给下次 OTA 留半截镜像头 */
-    esp_partition_erase_range(part, 0, KB64);
-    heap_caps_free(bi);
-    heap_caps_free(bp);
-    heap_caps_free(mid);
-    heap_caps_free(rb);
-    printf("[fs] 完成 (分区开头 64K 已擦回 0xFF, otadata 未动)\n");
-}
-
 /* 控制台任务: 非阻塞读串口, 逐字符拼行, 回车后解析执行 */
 static void console_task(void *arg)
 {
@@ -726,8 +508,9 @@ static void console_task(void *arg)
 
     printf("\n=== 音乐播放器 ===\n");
     printf("系统命令: mem | stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名] | memtask\n");
-    printf("升级命令: version | ota | ota boot <0|1> | ota server [<api> [<dlp>]] | ota reset | font crc | flashspd\n");
+    printf("升级命令: version | ota | ota boot <0|1> | ota server [<api> [<dlp>]] | ota reset | font crc\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
+    printf("休眠命令: sleep | sleep <秒>\n");
     //printf("命令> ");
 
     char line[LINE_BUF_SIZE];   /* 当前行缓冲 */
@@ -755,9 +538,6 @@ static void console_task(void *arg)
                         cmd_psram();
                     } else if (strcmp(line, "nvs") == 0) {
                         cmd_nvs();
-                    } else if (strcmp(line, "flashspd") == 0) {
-                        /* 拆开量这颗 flash 的擦/写真实速度 (会写非运行槽, 见函数注释) */
-                        cmd_flashspd();
                     } else if (strcmp(line, "bt") == 0) {
                         cmd_backtrace_all();
                     } else if (strncmp(line, "bt ", 3) == 0) {   /* "bt <任务名>" */
@@ -786,10 +566,6 @@ static void console_task(void *arg)
                         cmd_sleep(NULL);
                     } else if (strncmp(line, "sleep ", 6) == 0) {   /* "sleep <sec>" */
                         cmd_sleep(line + 6);
-                    } else if (strcmp(line, "lsp") == 0) {
-                        cmd_lsp(NULL);
-                    } else if (strncmp(line, "lsp ", 4) == 0) {     /* "lsp <sec>" */
-                        cmd_lsp(line + 4);
                     } else if (strncmp(line, "ota boot ", 9) == 0) {   /* "ota boot 0/1" */
                         ota_switch(atoi(line + 9));
                     } else {

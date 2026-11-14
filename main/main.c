@@ -7,6 +7,7 @@
 #include "app.h"
 #include "drv_display.h"
 #include "power_mgr.h"
+#include "power_batt.h"
 #include "ui_core.h"
 #include "audio_task.h"
 #include "bt_a2dp.h"
@@ -43,7 +44,7 @@ void app_main(void)
     /* 开机低电量检测: 初始化 ADC + 3 次采样平均 → g_vbat.
      * 电压 < 3.35V 时: 显示低电量图 2 秒后进入深度睡眠 (此处不返回);
      * 电压正常: 直接返回, 继续正常启动 (lcd_init_finish 在 LVGL 任务完成). */
-    power_mgr_boot_battery_check();
+    power_batt_boot_check();
 
     nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
 
