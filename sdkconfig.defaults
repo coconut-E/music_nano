@@ -124,6 +124,11 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# 小于这个值的 malloc 一律从内部 RAM 拿. 默认 16384 意味着 TLS 那个 4KB 的发送
+# 缓冲也落在内部 —— OTA 实测握手后 DMA 池从 12.7KB 掉到 6.5KB, 最大连续块只剩
+# 4.6KB, 而 WiFi 收一帧要 1.6KB. 降到 4096 之后, 4KB 及以上的分配会走 PSRAM,
+# 把 DMA 池还给 WiFi 收包. (WiFi/驱动的 DMA 分配是显式 MALLOC_CAP_DMA, 不受影响)
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_FREERTOS_HZ=1000
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -135,12 +140,24 @@ CONFIG_PM_SLP_IRAM_OPT=y
 CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED=y
 CONFIG_PM_SLP_SPIRAM_HALFSLEEP_EXIT_WAIT_DELAY=150
 
-# ── lwIP TCP: 按官方 speed 指南 (examples/wifi/iperf) 放开 ──────────────
-# 默认 WND=5760 只有 4 个 MSS: 2.3MB 的 OTA 下载实测每 4KB 要等 10~30 秒,
-# 服务器侧 sendall 一直阻塞 (对端窗口关着). 23040 = 16 个 MSS.
-# RECVMBOX 6 → 16: tcpip 线程收包队列太浅时, 应用读得再快也会被邮箱卡住.
-CONFIG_LWIP_TCP_WND_DEFAULT=23040
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+# ── lwIP TCP: 窗口按"内部 RAM 装得下"来定, 不是越大越好 ────────────────
+# 0.7.x 时代从默认 5760 提到 23040 (16 个 MSS), 当时 OTA 走 gh-proxy, 效果明显.
+# 0.8.x 换成自建服务器后, 同样的 23040 反而更慢: 实测每 4KB 要等 1~20 秒,
+# 出现 RTO 指数退避 (1s→2s→4s→8s→16s), 20 秒只挤进 11 字节.
+# 先排除了链路 (PC 直连同一域名实测 304 KB/s), 于是问题落在设备内部:
+#   下载时内部只剩 22.8KB / DMA 12.5KB (最大连续块 10.7KB)
+# 23040 的窗口要 16 个 pbuf, 分不出来 → 窗口长期关死, 读不到数据.
+# 所以降到 11520 (8 个 MSS), 让它稳定分得出来; RECVMBOX 同步 16 → 8.
+# 如果这版反而更慢, 说明瓶颈不在 pbuf (那就往链路 RTT / WiFi 收包方向查).
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=8
+# SACK: 设备是接收方, 不开这一项的话丢一个包, 对端就要把整个窗口重传一遍 ——
+# 跨境高 RTT 路径上这是最要命的放大项. 开了以后设备只报"缺第 N 个", 对端补那一个.
+# 依赖 LWIP_TCP_QUEUE_OOSEQ (默认已开).
+CONFIG_LWIP_TCP_SACK_OUT=y
+# 乱序队列 4 → 8: 公网抖动时乱序是常态, 4 个 pbuf (约 5.7KB) 很快填满,
+# 填满后乱序到达的包直接丢 → 又变回重传. 要和 SACK 配对才有意义.
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=8
 
 # ── DHCP 的地址冲突检查: 全关 ────────────────────────────────────────────
 # 这是 Kconfig 里的一个 choice (3 选 1), 所以不能写成 "ARP_CHECK=n" —— 那样

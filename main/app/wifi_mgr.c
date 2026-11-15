@@ -34,9 +34,11 @@
 
 static const char *TAG = "WIFI";
 
-/* 6144: 这个任务现在还跑 TLS 握手 (mbedtls) + esp_http_client 的调用链,
- * 5120 在握手里余量不够. 任务只在「检查更新」流程里存在, 用完就删. */
-#define WIFI_TASK_STACK     6144
+/* 8192: 这个任务现在还跑 TLS 握手 (mbedtls) + esp_http_client 的调用链,
+ * 5120 在握手里余量不够. OTA 实测余量一直贴着 1900~2000 B, 而下载路径上
+ * 还叠了 5 段 Range 的循环变量, 留 2KB 保险. 任务只在「检查更新」流程里存在,
+ * 用完就删, 平时不占. */
+#define WIFI_TASK_STACK     8192
 #define WIFI_TASK_PRIO      2
 #define WIFI_TASK_CORE      0          /* 和 LVGL (core 1) 分开, 扫描时界面照常动 */
 #define WIFI_CONNECT_MS     20000      /* 连接 + 等 IP 的上限 */

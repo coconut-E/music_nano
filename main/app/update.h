@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-/* 网络 OTA: 查版本 + 下载 + 写入备份槽
+/* 网络 OTA: 查自建服务器的版本清单 + 分段下载 + 写入备份槽
  *
  * 调用约束
  * --------
@@ -18,12 +18,20 @@ extern "C" {
  *   - 写 flash 时 cache 会关, 必须能主动让出 CPU (见 update.c 的"分步写").
  * UI 侧只读 update_status() (100ms 轮询), 绝不跨任务碰 LVGL.
  *
+ * 两个 API (服务器和固件是配套的, 见 docs/OTA_TEST_zh.md)
+ * -----------------------------------------------------
+ *   1) 清单:  GET https://coconute.dpdns.org/ota/v1/manifest.json?channel=stable&device=<MAC>
+ *             → {"schema":1,"version":…,"size":…,"sha256":…,"url":…, …}
+ *   2) 固件:  GET <清单里的 url>, 带 Range, 分 OTA_BLOCKS(5) 段拉
+ * 地址编译期写死 (update.c 的 UPD_API), 不存 NVS, 也没有串口命令能改 ——
+ * 换服务器 = 改那一行 + 重编一版.
+ *
  * 一次流程
  * --------
- *   update_check(): GET 版本接口 → 解析出"最新版本 + 下载地址 + 大小"
- *      → 比本机版本: 不新 → phase=UPD_LATEST; 更新 → phase=UPD_READY 等用户点按钮
- *   update_start(): 下载 256KB 一块进 PSRAM → 停读 → 4KB 一步写进备份槽
- *      → esp_ota_end 校验 → sha256 对账 → esp_ota_set_boot_partition 写 otadata
+ *   update_check(): GET 清单 → 比本机版本: 不新 → phase=UPD_LATEST;
+ *      更新 → phase=UPD_READY 等用户点按钮
+ *   update_start(): 5 段 Range 下载, 每段 64KB 一块进 PSRAM → 停读 → 16KB 一步
+ *      写进备份槽 → esp_ota_end 校验 → sha256 对账 → esp_ota_set_boot_partition
  *
  * 失败时 otadata 与两个槽都不会被"切走": update_start() 只在最后一步写 otadata,
  * 中途失败只留下备份槽里的一段垃圾, 下次启动照旧跑老槽. */
@@ -31,12 +39,12 @@ extern "C" {
 typedef enum {
     UPD_OK = 0,
     UPD_E_NET       = -1,   /* 连不上 / TLS 握手失败 / 读超时 */
-    UPD_E_HTTP      = -2,   /* 状态码不是 200 (403 限流、404 都在这里, 具体看 http 字段) */
-    UPD_E_PARSE     = -3,   /* 返回内容过大, 或里面找不到需要的字段 */
-    UPD_E_NO_REL    = -4,   /* 还没有发布版本 */
-    UPD_E_NO_ASSET  = -5,   /* 有发布, 但里面没有 music_nano x.y.z.bin */
+    UPD_E_HTTP      = -2,   /* 状态码不对 (清单要 200, 下载要 206; 403/404 也在这里) */
+    UPD_E_PARSE     = -3,   /* 清单过大 / 缺字段 / schema 不是 1 */
+    UPD_E_NO_REL    = -4,   /* 该频道没有发布 (服务器 404) */
+    UPD_E_NO_ASSET  = -5,   /* 清单里没有可用的下载地址 (缺 url, 或固件 404) */
     UPD_E_NOMEM     = -6,   /* PSRAM 暂存块 / 内部 RAM 弹跳块申请失败 */
-    UPD_E_SHORT     = -7,   /* 下载中断, 字节数和预期不符 */
+    UPD_E_SHORT     = -7,   /* 某一段没收全: 长度不符 / 提前 EOF / 总长对不上 */
     UPD_E_WRITE     = -8,   /* esp_ota_begin / esp_ota_write 失败 */
     UPD_E_VERIFY    = -9,   /* 镜像校验失败 (esp_ota_end 或 sha256 对不上) */
     UPD_E_SWITCH    = -10,  /* 找备份槽 / 写 otadata 失败 */
@@ -79,18 +87,9 @@ int update_check(void);
  * 返回 upd_err_t; 成功时 otadata 已指向新槽, 由调用方决定何时重启. */
 int update_start(void);
 
-/* 服务器地址字符串上限. GitHub 那条 URL 是 105 字节, gh-proxy 前缀 21 —— 256 够放
- * 两倍余量, 同时限定串口命令行的长度. */
+/* URL 字符串上限 (清单地址 = UPD_API + "&device=" + 12 位 MAC ≈ 81 字节;
+ * 256 留三倍余量, 也顺带限定了下载地址的长度) */
 #define UPDATE_URL_MAX 256
-
-/* 服务器地址 (存 NVS, 换服务器不用重编):
- *   api = 版本接口的完整 URL
- *   dlp = 下载地址前缀; 局域网调试服务器可以直接给绝对地址, 这里留空串
- * 没设置过就用编译期默认值 (gh-proxy + GitHub Releases).
- * 任一参数为 NULL 表示"这个不取". */
-void update_server_get(char *api, size_t api_sz, char *dlp, size_t dlp_sz);
-bool update_server_set(const char *api, const char *dlp);
-bool update_server_reset(void);   /* 抹掉 NVS 里的两个键, 回到编译期默认值 */
 
 /* 失败原因的中文文案 (不含 HTTP 状态码, UI 自己拼) */
 const char *update_err_text(int err);

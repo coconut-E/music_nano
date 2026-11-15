@@ -53,7 +53,7 @@ idf_component_register(SRCS "main.c"
                             "resources/lv_font_global_16.c"
                             "resources/lv_font_heart_44.c"
                             "resources/font_part.c"
-                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_partition app_update
+                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_partition app_update esp_rom
                                   esp_wifi esp_event esp_netif lwip esp_http_client mbedtls
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
 

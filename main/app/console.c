@@ -23,7 +23,6 @@
 #include "autosleep.h"
 #include "bt_a2dp.h"
 #include "ota.h"
-#include "update.h"
 #include "font_part.h"
 #include "sys_monitor.h"
 #include "esp_app_desc.h"
@@ -450,57 +449,6 @@ static void cmd_sleep(char *args)
     printf("[休眠] 已请求 %d 秒后深睡 (下一次结算生效)\n", sec);
 }
 
-/* ota server            → 打印当前用的服务器
- * ota server <api>      → 只设版本接口地址, 下载前缀清空 (= 直接用 JSON 里的绝对地址)
- * ota server <api> <dlp>→ 同时设下载前缀 (GitHub 要 https://gh-proxy.com/)
- * ota reset             → 抹掉 NVS, 回到编译期默认值
- *
- * 为什么要在串口改: 换局域网调试服务器 / 换镜像 / 上线, 都只是两个字符串,
- * 不该为了这个重编一版固件.
- *
- * 不设 static 缓冲: .bss 里每 1 字节都从 DRAM 池里扣, 而 DRAM 正是 WiFi 收发
- * 缓冲要用的池子 (实测多 1.5KB 就让连接时的最大连续块掉到 1KB, DHCP 直接失败).
- * 这里直接在命令行缓冲上就地切开 API 和前缀, 打印时借一个栈上的小缓冲. */
-static void cmd_ota_server(char *args)
-{
-    if (!args || !*args) {
-        char buf[UPDATE_URL_MAX];
-        update_server_get(buf, sizeof buf, NULL, 0);
-        printf("[OTA] 版本接口: %s\n", buf);
-        update_server_get(NULL, 0, buf, sizeof buf);
-        printf("[OTA] 下载前缀: \"%s\"%s\n", buf,
-               buf[0] ? "" : "   (空 = 直接拼 JSON 里的绝对地址)");
-        return;
-    }
-
-    /* URL 里不会有空格 (都编码成 %20), 所以第一个空格就是 API 的结尾.
-     * 就地把它改成 '\0', 后半段就是下载前缀. */
-    char *dlp = (char *)"";
-    char *sp  = strchr(args, ' ');
-    if (sp) {
-        *sp = '\0';
-        dlp = sp + 1;
-        while (*dlp == ' ') dlp++;
-    }
-
-    size_t alen = strlen(args);
-    if (alen == 0 || alen >= UPDATE_URL_MAX) {
-        printf("[OTA] 地址长度为 0 或超过 %u 字节\n", (unsigned)UPDATE_URL_MAX - 1);
-        return;
-    }
-
-    if (update_server_set(args, dlp)) {
-        printf("[OTA] 已保存, 下次「检查更新」生效 (dlp=\"%s\")\n", dlp);
-    }
-}
-
-static void cmd_ota_reset(void)
-{
-    if (update_server_reset()) {
-        printf("[OTA] 已恢复编译期默认值 (gh-proxy + GitHub Releases)\n");
-    }
-}
-
 /* 控制台任务: 非阻塞读串口, 逐字符拼行, 回车后解析执行 */
 static void console_task(void *arg)
 {
@@ -508,7 +456,7 @@ static void console_task(void *arg)
 
     printf("\n=== 音乐播放器 ===\n");
     printf("系统命令: mem | stats | ram | psram | nvs | vbat | temp | bt [任务名] | taskmem [任务名] | memtask\n");
-    printf("升级命令: version | ota | ota boot <0|1> | ota server [<api> [<dlp>]] | ota reset | font crc\n");
+    printf("升级命令: version | ota | ota boot <0|1> | font crc\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     printf("休眠命令: sleep | sleep <秒>\n");
     //printf("命令> ");
@@ -552,12 +500,6 @@ static void console_task(void *arg)
                         cmd_memtask();
                     } else if (strcmp(line, "version") == 0) {
                         cmd_version();
-                    } else if (strcmp(line, "ota reset") == 0) {
-                        cmd_ota_reset();
-                    } else if (strncmp(line, "ota server", 10) == 0) {
-                        char *a = line + 10;
-                        while (*a == ' ') a++;
-                        cmd_ota_server(a);
                     } else if (strcmp(line, "ota") == 0) {
                         ota_report();
                     } else if (strcmp(line, "font crc") == 0) {
