@@ -18,12 +18,13 @@ firmware/
 tools/flash_tool/out/
 tools/flash_tool/tmp/
 
-# OTA 调试服务器的本机材料: CA 私钥/服务器私钥不进仓库
-# 进仓库的只有公共证书: tools/ota_cert/ca.pem、tools/ota_cert/isrg.pem、
-# main/certs/ota_ca.pem (后者是前两者拼出来的, 是固件的构建依赖)
-tools/ota_cert/*.key
-tools/ota_cert/*.crt
-tools/ota_cert/*.csr
-tools/ota_cert/*.srl
-tools/ota_cert/server.ip
-tools/ota_cert/*.js
+# 私钥和凭据材料一律不进仓库.
+# 服务器侧的脚本/证书原本在 tools/ota_cert/ 和 tools/ota_server.py, 现在整体
+# 移到仓库外维护; 这几条留着是兜底 —— 谁再把 .key / .p12 放进工作区也不会被提交.
+*.key
+*.p12
+*.pfx
+*.jks
+*.csr
+secrets/
+.env

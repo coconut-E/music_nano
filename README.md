@@ -181,6 +181,27 @@ ota_0   0x030000 2.88MB   ota_1    0x310000 2.88MB   font    0x5F0000 2.06MB
 > 所有自己写的脚本都在 `tools/` 下，**不要放进 `build/`**：那是编译目录，
 > `idf.py fullclean` 或 IDE 的清理会整个删掉。
 
+### 网络升级（OTA）
+
+固件从**自建的手机服务器**拉，不再走 GitHub Releases。服务器端代码（清单服务、
+分块压缩、发布脚本、证书）**不在本仓库**；仓库里只有 `main/certs/ota_ca.pem`，
+是构建依赖（ISRG Root X1/X2 两张公共根证书，纯公钥）。
+
+| | |
+| --- | --- |
+| 查版本 | `https://coconute.dpdns.org/ota/v1/manifest.json?channel=stable&device=<MAC>` |
+| 下载 | `http://` 同域名，10 个独立 zlib 压缩块，每块约 150KB |
+
+两个刻意的设计，理由和实测数据都在 [docs/OTA_TEST_zh.md](docs/OTA_TEST_zh.md)：
+
+- **下载走明文 HTTP**：TLS 握手会把内部 DMA 池从 8.7KB 打碎到 1.4KB，比 WiFi 收
+  一帧（1.6KB）还小，设备会彻底收不到包。查版本那一步仍然走 HTTPS。
+- **10 块独立压缩**：deflate 有状态，整包压成一个流就没法分块；每块独立压之后
+  传输量降到 62%（2.40MB → 1.48MB），而且单块失败只重下那一块，最多重试 3 次。
+
+服务器地址在 `main/app/update.c` 的 `UPD_API`，**编译期写死**——没有 NVS 存的地址，
+也没有 `ota server` 之类的串口命令，换服务器就是改那一行重编一版。
+
 ## 更新日志
 
 ### 2026.11.14

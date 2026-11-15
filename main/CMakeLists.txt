@@ -57,8 +57,9 @@ idf_component_register(SRCS "main.c"
                                   esp_wifi esp_event esp_netif lwip esp_http_client mbedtls
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
 
-# 更新服务器的根证书 (PEM). 里面是"本地自签 CA + ISRG Root X1 (+X2)"拼接,
-# 由 tools/ota_cert.ps1 生成; 换服务器只改这个文件, 不用改代码.
+# 更新服务器的根证书 (PEM): 内容是 ISRG Root X1 + X2 (纯公钥, 从 letsencrypt.org
+# 下载的公共根证书). 已提交, 是构建依赖; 生成/拼接的工具在服务器侧维护, 不在本仓库.
+# 换 OTA 域名时, 只要新域名还在 Let's Encrypt 体系里, 这个文件就不用动.
 # 用 TXTFILES 是为了自动补末尾的 NUL —— mbedtls 按字符串取 CN, 需要它.
 target_add_binary_data(${COMPONENT_LIB} "certs/ota_ca.pem" TEXT)
 
