@@ -2,406 +2,399 @@
 
 # music_nano
 
-比拇指大小的迷你音乐播放器 · ESP32 + 蓝牙 Classic A2DP
+**拇指大小的开源蓝牙音乐播放器**
+
+<img src="https://img.shields.io/badge/ESP--IDF-5.5.5-2f6feb?style=flat-square" alt="ESP-IDF 5.5.5" />
+<img src="https://img.shields.io/badge/LVGL-8.3-e5534b?style=flat-square" alt="LVGL 8.3" />
+<img src="https://img.shields.io/badge/software-MIT-2da44e?style=flat-square" alt="MIT" />
+<img src="https://img.shields.io/badge/hardware-GPL--3.0-a371f7?style=flat-square" alt="GPL-3.0" />
 
 </div>
 
-## 项目概述
+<p align="center"><img src="docs/images/product-1.jpg" width="840" alt="music_nano" /></p>
+<p align="center"><sub>图 1　music_nano，22 × 42 × 8 mm(不含电池)</sub></p>
 
-music_nano 是一款比拇指大小的迷你音乐播放器，整机仅 2.2cm × 4.2cm、厚 8mm（不含电池），能轻松塞进任何口袋。它由 ESP32 驱动，通过蓝牙 Classic A2DP 把音乐无线推送给耳机或音箱。
+<p align="center">复刻成本 <b>≈ ¥50</b>　·　固件 <b>MIT</b>　·　硬件 <b>GPL-3.0</b></p>
 
-<p align="center">
-  <img src="docs/images/overview-1.jpg" width="180" alt="music_nano 外观 1" />
-  <img src="docs/images/overview-2.jpg" width="180" alt="music_nano 外观 2" />
-  <img src="docs/images/overview-3.jpg" width="180" alt="music_nano 外观 3" />
-  <img src="docs/images/overview-4.jpg" width="180" alt="music_nano 外观 4" />
-</p>
+## 文档信息
 
-## 演示视频
+|  |  |
+| --- | --- |
+| 作者 | coconut |
+| 建立 | 2026-09 |
+| 更新 | 2026-11 |
+| 固件版本 | 0.8.1 |
+| 源码 | [github.com/coconut-E/music_nano](https://github.com/coconut-E/music_nano) |
+| 硬件工程 | [oshwhub.com/coconet/project_bxhxmpkd](https://oshwhub.com/coconet/project_bxhxmpkd) |
+| 在线烧录 | [coconute.dpdns.org/flash](https://coconute.dpdns.org/flash/) |
+| 演示视频 | [哔哩哔哩 BV1nEtp6qE72](https://www.bilibili.com/video/BV1nEtp6qE72) |
 
-[哔哩哔哩 · BV1nEtp6qE72](https://www.bilibili.com/video/BV1nEtp6qE72?t=42.2)
+## 目录
 
-## 硬件开源
+| | | |
+| :--- | :--- | :--- |
+| **01** | 介绍 | [1.1 概述](#11-概述) |
+| **02** | 设计 | [2.1 外观](#21-外观) · [2.2 电路](#22-电路) · [2.3 软件设计](#23-软件设计) |
+| **03** | 复刻 | [3.1 物料](#31-物料) · [3.2 打样与焊接](#32-打样与焊接) · [3.3 烧录](#33-烧录) |
+| **04** | 更新 | 版本时间线 |
+| **05** | 链接 | 文档索引 |
 
-PCB 与 3D 外壳已在立创开源硬件平台开源：
+---
 
-**[立创开源硬件平台 · music_nano](https://oshwhub.com/coconet/project_bxhxmpkd)**
+## 01 / 介绍
 
-## 功能特性
+### 1.1 概述
 
-- **音频解码**：MP3 / FLAC / WAV，最高支持 48kHz / 16bit / 320kbps
-- **蓝牙输出**：Classic A2DP 无线播放，支持设备扫描与一键连接
-- **耳机控制**：通过 AVRCP 在耳机上直接播放/暂停/上一曲/下一曲/音量±
-- **文件浏览**：MicroSD 音乐库，按目录分组，支持热插拔检测与自动扫描缓存
-- **专辑封面**：自动解析 MP3/FLAC 内嵌封面并显示
-- **歌词显示**：读取 MP3（USLT）/ FLAC 内嵌歌词，按时间轴逐行滚动并高亮当前行
-- **播放模式**：顺序 / 单曲循环 / 随机
-- **设置持久化**：音量、亮度、上次播放歌曲、播放模式、启动模式（音乐/小说）掉电保存（NVS）
-- **主菜单**：长按睡眠键进入三图标主菜单（音乐 / 小说 / 设置），点图标进对应模式；设置页目前只有「固件版本」一项
-- **系统监视**：实时显示电池电压与 CPU 温度
-- **电源管理**：背光渐变、一键息屏（蓝牙保持连接）、深度睡眠
-- **OTA 双槽**：`ota_0` / `ota_1` + otadata 选槽，新固件首次启动跑 15 秒校验窗口，未确认就崩溃/断电由 bootloader 自动退回旧槽
-- **串口控制台**：内置命令可直接操作扫描/连接/播放/调试
+music_nano 是一台拇指大小的蓝牙音乐播放器，22 × 42 × 8 mm，可以塞进任何口袋。
+MicroSD 卡里的 MP3 / FLAC / WAV 由 ESP32 直接解码，经**蓝牙 Classic A2DP** 推给耳机或音箱；
+1.47 寸屏上用 LVGL 做界面，顺带能看歌词、读小说。
 
-## 硬件平台
+- **没有喇叭，也没有耳机孔** —— 声音只走蓝牙。
+- **电池是滑块式的** —— 像推卡片一样插进取，带一块听一块，没电就换
+- **OTA 双槽** —— 网上升级，新固件跑不起来会自动退回旧槽
 
 | 项目 | 规格 |
 | --- | --- |
-| 主控 | ESP32 双核 240MHz 2M PSRAM |
-| 显示屏 | 172×320 全彩 LCD（JD9853，SPI 接口） |
-| 音频输出 | 蓝牙 Classic A2DP（无线） |
-| 外部存储 | MicroSD 卡（热插拔检测） |
-| 电池 | 滑块式可插拔，无内置固定电池 |
-| 按键 | 息屏 / 唤醒键 |
-| 交互 | 全图形化 LVGL 界面 |
-
-## 尺寸与外观
-
-- 宽：2.2cm
-- 长：4.2cm
-- 厚：8mm（不含电池）
-
-## 电池与续航
-
-采用**滑块式可插拔电池**设计，电池像推卡片一样滑入滑出，随时可更换。整机不带固定电池。
-续航取决于你随身带几块电池——带一块听一块，没电了换一块接着听。
-
-## 功耗
-
-以下功耗均在播放 MP3 44.1kHz / 128kbps 音乐的条件下实测：
-
-不使用蓝牙：
-
-| 场景 | 功耗 |
-| --- | --- |
-| 不使用蓝牙，亮度最大 | ≈ 0.7W |
-| 不使用蓝牙，亮度中等 | ≈ 0.3W |
-| 不使用蓝牙，亮度最低 | ≈ 0.25W |
-| 关闭蓝牙并休眠 | ≈ 3mW |
-
-开启蓝牙：
-
-| 场景 | 功耗 |
-| --- | --- |
-| 开启蓝牙，亮度最低 | ≈ 0.6W |
-| 开启蓝牙，亮度中等 | ≈ 0.7W |
-| 开启蓝牙，亮度最大 | ≈ 1.0W |
-| 开启蓝牙，播放音乐并息屏 | ≈ 0.6W |
-
-## 解码能力
-
-- 最高支持 **48kHz / 16bit / 320kbps** 的 MP3 与 FLAC
-- 播放该规格音乐时，音频解码任务 CPU 占用约 **60%**，中间转换层约 **15%**
-- 再高（例如 96kHz）会开始卡顿
-
-ESP32 无 FPU，所有解码与重采样均为纯整数定点实现，音频最终统一重采样到 44.1kHz / 16bit / 立体声后通过蓝牙推送。
-
-## 软件架构
-
-基于 ESP-IDF + FreeRTOS，按功能域拆分为多个独立任务，任务间通过队列解耦：
-
-- **蓝牙任务**：A2DP / AVRCP 协议栈、设备扫描与连接管理
-- **音频任务**：解码（MP3/FLAC/WAV）→ 定点重采样 → 推流
-- **UI 任务**：LVGL 图形界面与交互
-- **封面解码任务**：独立解码内嵌专辑封面，不阻塞播放
-- **系统监视任务**：SD 卡管理、电池电压 / CPU 温度采样
-
-启动流程做了专门优化：bootloader 阶段即完成 LCD 硬件上电时序，把开机黑屏时间压缩到最短。
-
-## 目录结构
-
-- `main/audio/` 解码器与定点重采样
-- `main/bt/` 蓝牙 A2DP
-- `main/ui/` LVGL 界面
-- `main/power/` 电源管理
-- `main/storage/` SD 卡与音乐扫描
-- `main/drivers/` 显示屏驱动
-- `main/app/` 设置持久化、串口控制台、OTA 校验窗口
-- `main/resources/font_part.c` 字库分区加载（mmap 进 DROM 窗口）
-- `tools/flash_tool/` 一键烧录器（Windows x86-64，MinGW 编译）
-- `tools/flash_step.ps1` 分步烧录脚本（首次全量 / 只写某槽 / 只擦某段）
-- `tools/serial_cmd.ps1` 串口助手（给设备控制台发命令）
-- `tools/reset_log.ps1` 复位并抓启动日志
-- `tools/make_variants.ps1` 批量生成 OTA 测试用的版本变体
-
-## 构建说明
-
-需要 **ESP-IDF 5.5.5**（必须正好这个版本：WiFi 协议栈是随 IDF 发布的预编译库，
-与同版本 `wifi_os_adapter.h` 的表布局绑定，本工程还整表替换了分配器并 `--wrap=free`；
-低版本另有 SPI 总线死锁 bug）。
-
-```powershell
-. $env:IDF_PATH\export.ps1   # 导出 ESP-IDF 环境
-idf.py set-target esp32
-idf.py build
-idf.py -p COMx flash monitor
-```
-
-本仓库还提供 `build.ps1`（过滤噪声的构建包装脚本）与 `mem-analyze.ps1`（ELF 内存占用分析），详见 [BUILD.md](BUILD.md)。
-
-## 烧录与升级
-
-两者是分开的两条链路，不要混用：
-
-| 用途 | 手段 |
-| --- | --- |
-| 芯片全空 / 换分区表 | 线烧全量：`tools\flash_step.ps1 once`（bootloader + 分区表 + ota_0 + 字库） |
-| 保留设置的重新烧录 | `tools\flash_step.ps1 base`（同上去掉字库，可加 `-NoFont`） |
-| 日常升级 | OTA（写备用槽，见下） |
-| 调试 | `app2 -Slot 0\|1` 写指定槽 / `erase` 只擦一段 / `raw` 单文件单地址 |
-
-分区表（8MB，OTA 双槽，0.7.13 起）：
-
-```
-nvs     0x009000 144KB    phy_init 0x02D000 4KB     otadata 0x02E000 8KB
-ota_0   0x030000 2.88MB   ota_1    0x310000 2.88MB   font    0x5F0000 2.06MB
-```
-
-> 决定 `ota_0` 起点的是"前面所有小分区的终点向上取整到 64KB"，而不是某个固定地址。
-> 旧表把 `phy_init` 放在 `0x21000`，终点越过 `0x20000`，`ota_0` 就只能退到 `0x40000`，
-> 白扔 `0x22000-0x40000` 这 120KB。现在 nvs 扩到 144KB 顶到 `0x2D000`，小分区终点
-> 正好 `0x30000`，**对齐空洞为 0，8MB 一字节不剩**。
->
-> 烧录器会拦截任何落到 `0x30000` 以下、又不在白名单（`0x1000` bootloader /
-> `0x8000` 分区表 / `0x2D000` phy_init / `0x2E000` otadata）里的地址——旧版
-> `flash_args`（app 曾经在 `0x20000`，现在那里是 nvs）会被直接拒绝，而不是像以前
-> 那样写进去、回读 MD5 还全对、重启才发现设备起不来。
-
-字库单独占一个 **2.0625MB**的只读分区，开机 mmap 进 DROM 窗口（1.88MB / **31 页**）。它**只由
-烧录器全量烧写时写入**，OTA 不碰它，所以换字库必须线烧。
-
-> 字库分区按"定型"来做：内容 1,966,373 B，分区 2,162,688 B，余 **9.1%**（约 1,900 个字形）。
-> 0.7.13 把字库从 4bpp 降到 **2bpp**（bitmap 2,803,930 → 1,504,277 B），DROM 占用 50 → 31 页，
-> 同时把分区从 3.19MB 收到 2.0625MB，**腾出的 520KB 全给了 app 槽**（各 +256KB，
-> `0x250000`（2.31 MiB）→ `0x2E0000`（2.875 MiB），app 余量 6% → 20.8%。
-> 16px 在 1.47"/247ppi 屏上只有 1.645mm，2bpp 的灰阶损失在实机距离下看不出来（放大 5× 才明显）。
-> **这是布局变更**，从旧版升上来必须 `tools\flash_step.ps1 once` 整片擦除重烧，OTA 跨不过去。
-> flash 到此再无余量：以后想要更多 app 空间，只能动字库内容（删韩文/裁字表）。
-
-> 所有自己写的脚本都在 `tools/` 下，**不要放进 `build/`**：那是编译目录，
-> `idf.py fullclean` 或 IDE 的清理会整个删掉。
-
-### 网络升级（OTA）
-
-固件从**自建的手机服务器**拉，不再走 GitHub Releases。服务器端代码（清单服务、
-分块压缩、发布脚本、证书）**不在本仓库**；仓库里只有 `main/certs/ota_ca.pem`，
-是构建依赖（ISRG Root X1/X2 两张公共根证书，纯公钥）。
-
-| | |
-| --- | --- |
-| 查版本 | `https://coconute.dpdns.org/ota/v1/manifest.json?channel=stable&device=<MAC>` |
-| 下载 | `http://` 同域名，10 个独立 zlib 压缩块，每块约 150KB |
-
-两个刻意的设计，理由和实测数据都在 [docs/OTA_TEST_zh.md](docs/OTA_TEST_zh.md)：
-
-- **下载走明文 HTTP**：TLS 握手会把内部 DMA 池从 8.7KB 打碎到 1.4KB，比 WiFi 收
-  一帧（1.6KB）还小，设备会彻底收不到包。查版本那一步仍然走 HTTPS。
-- **10 块独立压缩**：deflate 有状态，整包压成一个流就没法分块；每块独立压之后
-  传输量降到 62%（2.40MB → 1.48MB），而且单块失败只重下那一块，最多重试 3 次。
-
-服务器地址在 `main/app/update.c` 的 `UPD_API`，**编译期写死**——没有 NVS 存的地址，
-也没有 `ota server` 之类的串口命令，换服务器就是改那一行重编一版。
-
-## 更新日志
-
-### 2026.11.14
-
-**自动熄屏（0.7.15）**
-- 设置页第三项「自动熄屏」：**通用 / 小说 / 歌词** 三条分支，各 **1~10 分钟**，存 NVS（`off_common` / `off_novel` / `off_lyr`）
-- "通用 + 特殊"两层次：通用兜住菜单、设置、音乐封面**以及以后新加的任何模式**；小说和歌词只是两条覆盖 —— `idle_poll_cb` 里只列举两条特殊分支，其余默认走通用，加新模式不用再动那个 if
-- 菜单和设置原来固定 30 秒，并进通用分支后最短一档就是 1 分钟（默认 2 分钟），这是"通用"带来的必然变化
-- 时长缓存在 RAM（开机从 NVS 灌一次），1 秒轮询不碰 flash；保存后立刻生效，不用重启
-- 数值弹层去掉半透明黑背景：只留一张白卡，点卡片外仍然关闭 —— 遮罩对象还在，只是 `bg_opa = LV_OPA_TRANSP`，白底设置页不再整页压暗
-
-**下拉弹层（0.7.14 的自动休眠同款）**
-- 小时/分钟/三条熄屏分支共用一个通用下拉：`pick_open(id, sel, base, step, count, fmt)`，候选项由 `base + i*step` 生成，行高在 7 项以上收到 26px（10 项才能塞进 320 的高度）
-
-**浅睡（0.7.16）**
-- 电源键短按（蓝牙断开）/ 无操作超时 / 息屏期蓝牙断开：**背光正常淡出** → **浅睡 5 分钟** → 期间按电源键立刻淡入亮屏，程序从断点继续；5 分钟到点才走原来的深睡（GPIO22 断电）。蓝牙已连接时仍然只熄屏，不睡 —— 浅睡会掐断 A2DP 流
-- 浅睡不关外设电源：GPIO22 全程保持低，只停 CPU/AHB/APB 时钟（`esp_light_sleep_start()` + ext0(GPIO37 高) + 5 分钟 timer）
-- 上机实测（当时的 `lsp` 自检命令，已随睡眠路径统一删除）：PSRAM 1KB / 内部 RAM 256B 内容全保（靠 `CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND` + `CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED`，IDF 醒来调 `esp_psram_impl_resume_from_halfsleep_mode`）；整屏重绘无花屏；触摸 I2C 正常；SD 仍挂载、`stat("/sdcard")=0`；音乐在浅睡前后继续播
-- **`esp_timer +10000 ms` 而 `FreeRTOS tick +1 ms`**：IDF 只把系统时间补上来，不补 tick。所以醒来必须自己处理两处计时 —— 无操作计时靠 `power_mgr_notify_activity()`（`pwr_wake()` 里已有），自动休眠靠 `autosleep_on_wake()` 把结算基准挪到"现在"，浅睡那段不扣剩余量
-- 两个坑：ext0 唤醒后 GPIO37 停在 RTC IO，必须 `gpio_config()` 复原成普通输入，否则电源键从此读不到；深睡前要 `esp_sleep_disable_wakeup_source(ALL)`，否则浅睡留下的 5 分钟 timer 会让深睡 5 分钟后自己醒来
-
-**浅睡时长可调（0.7.17）**
-- 设置页第四项「浅睡时长」：**0~10 分钟**，存 NVS（`ls_min`）。**0 = 不浅睡、直接深睡**（浅睡之前的老行为），1~10 = 正常淡出后先浅睡 N 分钟再深睡
-- 只影响三条入口（短按且蓝牙断开 / 无操作超时 / 息屏期蓝牙断开）；自动休眠到点、低电量关机仍然直接深睡
-- 时长缓存在 `power_mgr`（开机从 NVS 灌一次，睡眠路径不碰 flash），保存后下一次进睡就用新值，不用重启
-
-**睡眠路径统一**
-- 息屏 / 浅睡 / 深睡不再是三条并列分支，改成**一条三级梯**：一级 `pwr_off()` 灭屏（背光淡出 + 关触摸 + 刷新降到 100s）→ 二级 `pwr_light_sleep()` 浅睡（CPU 停钟、外设照供电）→ 三级 `power_mgr_shutdown_now()` 深睡（GPIO22 断电）。只能顺着往下走，不存在"从深睡跳回息屏"
-- 所有触发方式收敛成 4 个事件（`PWR_EV_KEY` / `IDLE` / `BT_LOST` / `TIMER`）+ **一张决策表** `pwr_decide()`（20 行）：抑制、过渡、已在下电三行闸门之后，每种事件该干什么一眼看完。"要不要看蓝牙""要不要浅睡"只有这一处判断，以后加触发方式 = 加一个事件
-- 状态 4 → 3（亮屏 / 灭屏 / 下电中）：`PWR_FAKE_OFF`、`PWR_LIGHT_SLEEP` 两个"淡出中"临时态删掉，凡是 `== FAKE_OFF || == LIGHT_SLEEP` 的双重判断一并消失；`s_state` 写入点 12 → 4（都在梯子的执行体里）
-- 每次决策打一行日志：`事件 KEY | 状态 亮屏 | BT 断开 → SLEEP`，串口直接看得出是谁让它睡的
-- 拆出两个模块：`power/power_fade.c`（全工程唯一的背光淡入淡出，6ms 一步；`lv_anim` 版 `screen_fade` 删掉）、`power/power_batt.c`（电池 ADC + 开机低压 + 紧急关机）。`power_mgr.c` 992 → 666 行，只剩"什么时候睡、怎么睡"
-- 删掉三个 `lv_anim` 形状的空壳回调（`sleep_entry` / `sleep_fade_done` / `enter_deep_sleep` / `enter_light_sleep`）和手工传 `NULL` 的调用；无操作超时与蓝牙断开两个 1 秒定时器合并成一个看门 `pwr_watch_cb`
-- 两处行为修正：① 息屏期蓝牙断开现在也受 OTA/WiFi 抑制约束（原来 `bt_poll_cb → sleep_entry()` 完全绕过抑制，升级窗口里蓝牙一断就照睡）；② 自动休眠到点仍然直接深睡、不走浅睡这一级（保留"到点就关机"，也避免"刚被叫醒又立刻睡"的连锁）
-- 删掉调试代码：`lsp` 浅睡自检（Phase 0，95 行）、`flashspd` flash 擦写测速探针（197 行，会写非运行槽）；`console.c` 855 → 631 行。保留 `sleep <秒>`（现在唯一能现场验证自动休眠链路的钩子，且已走统一事件）
-
-**歌词页改窗口渲染（0.7.18）**
-- 现场症状：`匿名M`（206 行歌词）播到第 12 块、约 **00:14** 之后歌词区整片空白（连当前句的高亮都没了），但滚动动画照旧；库里其它歌都正常 —— 最大的《Dusk Till Dawn》152 行 / 76 块也没事
-- 根因是渲染方式，不是数据：旧实现把整篇歌词做成一个 `s_content` 内容层（这首歌 `total = 8672 px` 高），9 个 label 摆**绝对坐标**（最大 8672），再对这个内容层做**负的 y 平移**（一路到 −8558）。`LV_USE_LARGE_COORD 0` 下 `lv_coord_t` 是 int16，坐标量级已经逼近边界；再叠上"每 100 ms 把 9 个 label 的位置和文本重设一遍"，长歌词滚到中途就整片失效。歌词越短越到不了那个量级，所以只有这首触发
-- 现在 label **直接挂 172×204 的歌词容器**，没有中间内容层：位置 = 半高基准 + `(s_y[e] − s_y[cur])` + 一个滚动偏移 `s_off`。差值最大只到"前后各 4 块的高度和"（几百 px），与歌词总长无关；滚动 = 对 `s_off` 做 250 ms `lv_anim`，每帧只重摆这 9 个 label
-- 稳态优化：块没换的 tick 直接返回，不再每 100 ms 重设 9 份文本和坐标；换块时把上一帧的动画残余量接着算，切换那一帧不跳
-- `LYRICS_MAX_ENTRIES` **192 → 256**：这首歌 206 行，原来尾部 14 行（`[02:23.46]` 之后）是静默丢掉的；现在撞上限会打一行 `[歌词] 条目 N 达到上限 256, 超出的行已丢弃`
-- 加了自检：有歌词却一个可见 label 都没有时打 `[歌词] 窗口全空 cur= count= y= off=`. 万一还有别的原因复现，这一行直接把 `s_cur`/`s_count`/坐标摆到面前，不用再靠猜
-
-**歌词：中日同一行拆成两行（0.7.19）**
-- 现象：有些 LRC 把原文和译文写进**同一条**（`[00:21.57]感じて 今夜は見事さ 用心感受的今夜 旖旎非常`），一个时间戳里混着两种语言，显示成 3~4 行糊在一起的一整段
-- 根因：`script_of()` 把汉字和假名归成同一类（`script_class()` 返回 100，日文才不会被切碎），于是**中文和日文在分类器眼里是同一个体系**，`split_scripts()` 永远切不开
-- 新增 `find_cn_break()`：整行有假名 → 找一个空格，其后到行尾**再无假名、无 ASCII 字母**，且汉字 ≥5 个或含一个**简体专用字**（的们这说为个时对就很没什么怎让还过现记觉谢语词谁爱听话读样种从关带开务边达进远那吗呢啦啊哦嗯，日文不用这些写法）→ 就在这里断一段
-- **只切不改**：正文原样保留，`ラストリヴ` 每行尾自带的 `(翻译：…)` 不剥（那是 LRC 里的文字，不是固件加的）
-- `LYR_MAX_SEGS` 4 → 5（原来最多按文字体系拆 4 段，加上这一刀要留余量）
-- 两个语料库实测（本地 268 首 + music4.2 129 首）：本地命中 98 行 / 3 首（NIGHT DANCER 44、Heaven 40、Episode 33 14），music4.2 命中 47 行 / 5 首；朴素版（只要"假名之后一串汉字"就切）会误切 `「ダイエット？」/不正解`、`求愛性 孤独/ドク 流るルル`、`ライフル/何口径？`、`検索中` 这些纯日文行，被"简体专用字 / 汉字≥5"两条挡下
-
-### 2026.11.13
-
-**自动休眠（0.7.14）**
-- 设置页新增第二项「自动休眠」：小时 **0~3** / 分钟 **0~60（步进 10）**，两个下拉各列可选值；`0 小时 0 分` 没有意义，「保存」按钮直接置灰不可点
-- 落盘只存一个**总分钟数**（10~240）：存小时+分钟两个字段会出现「1 小时 60 分」和「2 小时 0 分」两个等价状态，存总时长就只有一个真值，显示时再拆
-- 音乐页长按播放模式按钮弹出的面板从 120 加高到 **152**：顶部左边是「自动休眠」开关，右边是深色 `lv_switch`；打开后左边文字实时变成「将在X小时Y分钟后休眠」，关闭回到「自动休眠」（原来是说明文字，整体下移给开关腾位置）
-- 开关状态存 NVS（`sleep_on`），设定时长存 `sleep_min`；开机时若开关是开的，就从**开机那一刻**开始计
-- **剩余时间是纯内存量，不进 NVS**：重启即从头算，用户明确要求"重启了不用管它"
-- 计时只在音乐模式走：进菜单/设置/小说时**暂停但不清零**，回音乐接着走，不补扣暂停那段；息屏不算离开音乐（蓝牙还在放），照常计
-- 到点走与"蓝牙未连接时短按电源键"同一条淡出→深睡路径，但**不看蓝牙**：到点就是关机（GPIO22 断电，音乐结束），不是只熄屏。OTA 校验窗口 / WiFi 流程期间照旧不睡
-- 串口 `sleep` 看开关/设定/剩余，`sleep <秒>` 直接改剩余时间 —— 最短一档是 10 分钟，上机验证等不起
-- 下拉是自绘弹层，没开 `LV_USE_DROPDOWN`：`lv_conf.h` 里 dropdown/roller 都是 0（开了要全量重编 LVGL），而且 LVGL 8 的下拉列表固定往下展开，分钟那档 7 项在 172×320 上必然探出屏幕
-
-### 2026.11.8
-
-**设置（0.7.3）**
-- 菜单里的「设置」不再只是占位：点进去是**白底整屏 `lv_list`**，目前只有一项「固件版本」
-- 点「固件版本」→ 详情页：当前运行 APP 的**版本号**和**镜像真实大小**（本次 `2,319,776 字节` + `2.21 MB`），左上角 `‹` 回列表
-- 「检查更新」按钮先占位：**点了没有任何反应**（联网 OTA 还没做）
-- 设置是第三种模式（`APP_MODE_SETTINGS`），进出走黑场过渡；**仍然不写 NVS**，长按电源键回主菜单
-- 设置页 30 秒无操作自动熄屏（与菜单一致；设置里蓝牙已断开，实际是淡出后深睡）
-- 大小取 running 分区里镜像的长度：**读镜像头 + 段头自己算**（`esp_image_verify()` 会把整幅镜像 mmap 进 DROM 核 SHA256，64 页 MMU 里字库已占 50 页 → 必然 `No free MMU pages`），只读一百多字节，进设置时算一次并缓存
-
-### 2026.11.7
-
-**主菜单（0.7.2）**
-- 长按睡眠键不再直接切换音乐/小说，改为**进入主菜单**：整屏三张图标竖排（音乐 / 小说 / 设置），点图标进对应模式；设置只占位，点了无响应
-- 菜单是第四种模式（`APP_MODE_MENU`），进出都走原有的黑场过渡，切出时照旧清理音频 / 封面 / 蓝牙 —— 所以进菜单 = 停止播放，和以前长按切小说一模一样
-- **设置和菜单永不写入 NVS**，启动模式仍然只记音乐 / 小说；停在菜单时断电，下次开机回到上次的音乐或小说
-- 菜单 30 秒无操作自动熄屏（走原有短按动作；菜单里蓝牙已断开，所以实际是淡出后深睡）
-- 图标由 `tools/gen_menu_icons.py` 从 `image/` 的源图生成：裁到徽章外框 → 88×88 → 圆形 alpha 蒙版 → 合成菜单底色，三张共 46KB flash
-
-> ⚠️ 分区表再改一次：`ota_0 @0x30000` / `ota_1 @0x280000` / `font @0x4D0000`。
-> 从任何旧版升上来都必须 `tools\flash_step.ps1 once` 整片擦除重烧。
-
-**分区**
-- app 槽 2.19MB → **2.31MB**（余量 1.07% → 6.42%），nvs 88KB → **144KB**
-- 吃掉两处浪费：`0x22000-0x40000` 对齐空洞 + 末尾闲置 128KB，**248KB 浪费归零**
-- 字库分区 3.25MB → 3.19MB（内容 3,266,026 B，余 2.3%），地址 `0x4A0000` → `0x4D0000`
-
-**为网络升级腾 IRAM**
-- `ESP_WIFI_IRAM_OPT` / `ESP_WIFI_RX_IRAM_OPT` 关掉（IDF 对 "ESP32+蓝牙+PSRAM" 这
-  个组合**本来就是默认关**，本工程是历史遗留的 `y`）
-- `FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y`
-- 只做 STA：`SOFTAP_SUPPORT` / `WPA3_SAE` / `SAE_PK` / `SAE_H2E` / `SOFTAP_SAE` /
-  `WPA3_OWE_STA` 全关
-- `LWIP_IPV6=n`；HTTP 不做 HTTPS，不带 CA 证书包
-- 结果：把完整 WiFi + HTTP + OTA 栈链进来后 `.iram0.text` 118,119 B，IRAM 余
-  **11.9KB**；改之前不带 WiFi 只剩 2,517 B，一加就爆 27,340 B
-
-### 2026.11.6
-
-> ⚠️ 本版分区表改成 **OTA 双槽**（`ota_0 @0x40000` / `ota_1 @0x270000` / `font @0x4A0000`），
-> 从旧版升上来必须先整片擦除重烧一次（`tools\flash_step.ps1 once`），旧 NVS 设置会被清空。
-
-**新增**
-- OTA 双槽：新增 `otadata`，`ota_0` / `ota_1` 各 2.19MB，按 `(seq-1)%2` 选槽启动
-- 首启校验窗口：新固件第一次启动时盖一层**系统层**全屏遮罩（`lv_layer_sys`）+ 15 秒倒计时，期间禁止睡眠；走完自动 `esp_ota_mark_app_valid_cancel_rollback()` 打标
-- 启动失败自动回退：不做任何处理，未打标的镜像在下次重启被判 `ABORTED`，bootloader 自己退回旧槽
-- 字库拆到独立 3.25MB 分区（`font`，data 子类型 `0x40`），开机 `esp_partition_mmap` 进 DROM 窗口，app 从 5,013,280 B 瘦到 1,765,136 B（槽占 23%）
-- 串口命令：`version` / `ota` / `ota boot <0|1>` / `font crc`
-- 烧录器：写大文件按 1MB 分段 + 末段补齐 16KB，修掉 2MB 以上单段写坏末尾几百字节的问题；新增地址白名单拦截（见"烧录与升级"）
-
-**优化**
-- 冷启动不做字库全量校验。原先在"OTA 后首启"跑一次 3.27MB CRC（271ms），但 OTA 根本不写字库分区，时机是反的；改成手动命令 `font crc`，启动路径只留纯内存校验（magic / 长度 / 偏移 / mmap / `glyph_dsc` 首末抽检）
-- 同槽 `ota boot` 直接拒绝，不再写一条指向"正在运行的分区"的 otadata
-
-**修复**
-- `flash_step.ps1` 的 `$src` 与镜像源哈希表 `$SRC` 撞名（PowerShell 变量不区分大小写），不带 `-App2` 时参数解析成空
-- `build.ps1` 导入 ESP-IDF 时，`export.ps1` 里 python 往 stderr 打的横幅被 `$ErrorActionPreference='Stop'` 当成致命错误
-
-### 2026.11.1
-
-> 本版分区表扩容到 8MB，升级需要一次性 `erase-flash`，旧 NVS 设置会被清空。
-
-**新增**
-- 歌词显示：读取 MP3 的 USLT 帧与 FLAC 的 LYRICS 内嵌歌词，按 LRC 时间轴逐行滚动、当前行高亮；封面页短按进入，点击歌词区返回，无歌词时提示
-- 多语言歌词：同一时间戳（≤50ms）的原文 / 译文合并成一句，按 汉 / 日 / 韩 / 拉丁 / 西里尔 文字体系分行，作词作曲行保留显示
-- 字库扩充 19,956 → 28,876 字形（2.23MB → 3.18MB）：CJK 基本区 4E00–9FFF 整段取模，简繁与日文汉字全覆盖（修掉歌词里 558 个方框字），另加希腊、拉丁 IPA、货币、圈号、箭头、数学、制表、几何等约 2,000 字
-- 分区表扩容：NVS 24KB → 88KB，app 4MB → 7.875MB（起点 0x20000），8MB flash 用满
-- 工具：`tools/font_check.py` 字库覆盖率检查，`tools/lyrics_match.ps1` / `lyrics_apply.ps1` 歌词匹配与写入
-
-**优化**
-- 时长与进度：解码器直接给出精确时长（MP3 Xing 帧数 / FLAC 总采样 / WAV 数据长度），已播时间按解码样本累计，VBR 文件不再乱跳；FLAC 码率只算音频字节，seek 剔除元数据
-- 内存：LVGL 绘制缓冲 70% → 65% 屏（77,056 → 71,552 B），任务栈合计瘦身约 15KB（`.dram0.bss` 100,048 → 88,120，内部堆 146.1 → 157.8KB），小说页 6.4KB 缓冲移入 PSRAM
-- 自动熄屏：音乐封面 2 分钟 / 歌词与小说 5 分钟，触摸、按键、亮屏、切模式都会重置计时
-- 标签编码：ID3v2 / FLAC / WAV 标签统一转 UTF-8，支持 UTF-16 LE/BE、GBK、CP1251、Latin-1，并过滤零宽字符
-- SD 卡扫描：结果直接发布到 PSRAM，仅在命中缓存时回读 `index.bin`，修复重扫后列表偶发为空
-- 媒体扫描：只扫 MP3 / FLAC / WAV，移除 AAC，避免列出无法播放的文件
-
-**修复**
-- 蓝牙：L2CAP 拥塞错误累计 50 次自动 SUSPEND → START 重启 A2DP，带 2 秒静默清零与恢复冷却，抑制日志刷屏
-- FLAC 注释块上限 4KB → 32KB，修复带内嵌歌词的长注释块被整块丢弃、连标题与歌手一起丢失
-- 歌词计时扣除 ID3 与元数据偏移，大封面歌曲的歌词不再提前几十秒
+| 主控 | ESP32-D0WDR2-V3 · 双核 240 MHz · 片内 2 MB PSRAM · 外挂 8 MB Flash |
+| 屏幕 | 1.47" IPS · 172 × 320 · JD9853（SPI） |
+| 触摸 | CST816（I²C，中断触发） |
+| 音频 | 蓝牙 Classic A2DP 输出 · AVRCP 控制 |
+| 解码 | MP3 / FLAC / WAV · 最高 48 kHz / 16 bit / 320 kbps |
+| 存储 | MicroSD（卡座带插入检测，单文件索引） |
+| 无线 | 蓝牙 4.2 Classic · WiFi 2.4 GHz（只给 OTA 用） |
+| 电池 | 弹片触点，滑块式可插拔，整机不带固定电池 |
+| 尺寸 | 22 × 42 × 8 mm（不含电池） |
+| 功耗 | 播放 0.3 ~ 1.0 W · 深睡 ≈ 3 mW |
+
+## 02 / 设计
+
+### 2.1 外观
+
+全面屏，长方形机身，四角圆角过渡，右侧边框留出三颗按键的位置。
+Type-C 和 MicroSD 卡槽开在同一侧，背面是可推拉的电池仓盖。
 
 <p align="center">
-  <img src="docs/images/lyrics-1.jpg" width="240" alt="歌词页" />
+  <img src="docs/images/overview-1.jpg" width="200" alt="外观" />
+  <img src="docs/images/overview-2.jpg" width="200" alt="外观" />
+  <img src="docs/images/overview-3.jpg" width="200" alt="外观" />
+  <img src="docs/images/overview-4.jpg" width="200" alt="外观" />
 </p>
+<p align="center"><sub>图 2　正面外观与四种界面：蓝牙面板 / 播放页 / 歌曲列表 / 已连设备</sub></p>
 
-### 2026.9.30
+电池像推卡片一样滑进电池仓，靠弹片触点接触，不需要焊接也不需要插头：
 
-**新增**
-- 小说阅读模式：SD 卡小说分组扫描 + 复用文件浏览器选书，长按睡眠键在音乐/小说间切换（黑屏过渡 + 光圈缩放动画）
-- 小说阅读体验：GBK / UTF-8 / BOM 自动编码识别、分块渲染、阅读进度记忆与恢复，文件浏览器可定位当前小说
-- 蓝牙被动连接：耳机 / 手机可主动连入播放器，无需在播放器上操作
-- 音量细调 32 档：硬件 8 步进 + 低档 PCM 软件增益拉平，耳机回传的绝对音量映射到最近档位
-- 深睡省电：切电后将已配置 IO 复位为高阻，消除经断电外设的灌流
+<p align="center"><img src="docs/images/product-2.jpg" width="440" alt="与耳机对比" /></p>
+<p align="center"><sub>图 3　整机与一只 TWS 耳机，体积参照</sub></p>
 
-**优化**
-- 模式切换动画改为光圈缩放合成动画
-- SD 卡读取改流式：挂载时预置持久 DMA 缓冲 + 20KB PSRAM 线性预读，消除偶发读失败导致的秒切歌
-- 蓝牙配对改用 Just Works（无需比对数字），修复挂起时初始化竞态导致的卡死
-- 深睡放电延时、电池满电处理、列表滚动降耗等系统调优
-- 新增 `taskmem` 命令查看各任务栈峰值，`ram` 命令增加 DMA 余量打印
-
-**修复**
-- 修复 seek 后采样率/声道被误判导致的变速、变调（MP3 按真实帧头链式重同步并锁定每首首次格式；WAV 对齐 PCM 帧边界）
-- 修复小说编码识别失败时无提示，增加失败重扫弹窗
-- 内部稳定性修复若干
+外壳是三个独立件：
 
 <p align="center">
-  <img src="docs/images/update-20260930-1.jpg" width="220" alt="2026.9.30 更新" />
-  <img src="docs/images/update-20260930-2.jpg" width="220" alt="2026.9.30 更新" />
+  <img src="docs/images/hw-shell.png" width="380" alt="外壳装配体" />
+  <img src="docs/images/hw-section.png" width="480" alt="剖面" />
 </p>
-
-### 2026.9.25
-
-**新增**
-- 收藏：播放页长按封面可收藏/取消，文件浏览器显示爱心图标
-- 删除歌曲：长按封面二次确认删除，自动修正随机播放记录
-- 循环次数：长按模式键设置每首重复 1~9 次（仅收藏歌曲生效）
-- 随机去重：随机播放不再重复，全播完自动重新开始
-
-**优化**
-- 启动更快：开机提速约 200ms，文件浏览器响应 300ms → 80ms
-- 触摸改中断驱动，降低卡顿与功耗
-- 音乐库改用单文件索引，扫描更快、支持目录名含 `/`
-
-**修复**
-- 修复插拔 SD 卡偶发崩溃、蓝牙连接卡死、封面右边缘错位等问题
-- 内部稳定性修复（越界/内存泄漏/数据撕裂）若干
+<p align="center"><sub>图 4　左：外壳装配体；右：剖面，自上而下是屏幕、主板、电池</sub></p>
 
 <p align="center">
-  <img src="docs/images/update-20260925-1.jpg" width="180" alt="2026.9.25 更新" />
-  <img src="docs/images/update-20260925-2.jpg" width="180" alt="2026.9.25 更新" />
-  <img src="docs/images/update-20260925-3.jpg" width="180" alt="2026.9.25 更新" />
+  <img src="docs/images/hw-battery.png" width="340" alt="电池仓" />
+  <img src="docs/images/hw-battery-2.png" width="330" alt="电池仓触点" />
 </p>
+<p align="center"><sub>图 5　电池仓盖与内侧弹片触点</sub></p>
 
-## 许可证
+### 2.2 电路
 
-本项目基于 [MIT License](LICENSE) 开源。第三方组件（LVGL、JPEGDEC、micro-mp3、micro-flac、esp_lcd_jd9853 等）遵循其各自许可证，详见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+#### 2.2.1 总体架构
+
+一块板解决全部问题：ESP32 做解码和界面，蓝牙把 PCM 推出去，USB 只用来供电和烧录。
+整页原理图如下，工程文件在立创开源硬件平台。
+
+<p align="center"><img src="docs/images/schematic.png" width="880" alt="原理图" /></p>
+<p align="center"><sub>图 6　原理图全图（V1.0，2026-11-07 更新）</sub></p>
+
+主板装在壳里的样子：
+
+<p align="center"><img src="docs/images/hw-assembly.png" width="620" alt="壳内装配" /></p>
+<p align="center"><sub>图 7　主板放进外壳，右侧三颗按键贴着侧边</sub></p>
+
+#### 2.2.2 主控
+
+ESP32-D0WDR2-V3，QFN-48 封装，片内 2 MB PSRAM，外挂一颗 **P25Q64SH**（8 MB SPI Flash）。
+40 MHz 无源晶振，板载 PCB 天线，EN 由 CH343P 的 RTS 经 1 kΩ 驱动做自动复位，
+GPIO0 走 DTR，构成常见的两线自动下载电路。
+
+固件与硬件的引脚对应关系如下，左边是原理图里的网络名：
+
+| 功能 | 原理图网络 | 封装引脚 | GPIO | 固件宏 |
+| --- | --- | :---: | :---: | --- |
+| 屏 SPI 时钟 | `LCD_CLK` | 35 | 18 | `PIN_LCD_SCLK` |
+| 屏 SPI 数据 | `LCD_SDA` | 36 | 23 | `PIN_LCD_MOSI` |
+| 屏 片选 | `LCD_CS` | 34 | 5 | `PIN_LCD_CS` |
+| 屏 复位 | `LCD_RST` | 14 | 25 | `PIN_LCD_RST_HW` |
+| 屏 数据/命令 | `LCD_RS` | 12 | 32 | `PIN_LCD_DC` |
+| 背光 PWM | `LEDK` → Q3 | 24 | 4 | `PIN_LCD_BL` |
+| 触摸 SCL | `TP_SCL` | 16 | 27 | `TOUCH_SCL_IO` |
+| 触摸 SDA | `TP_SDA` | 15 | 26 | `TOUCH_SDA_IO` |
+| 触摸 INT | `TP_INT` | 13 | 33 | `TOUCH_INT_IO` |
+| 音量 + | `SW3` | 5 | 36 | `PIN_VOL_UP` |
+| 电源键 | `SW4` | 6 | 37 | `PIN_PWR_KEY` |
+| 音量 − | `SW5` | 7 | 38 | `PIN_VOL_DOWN` |
+| 外设断电 | `GPIO22` → Q1 | 39 | 22 | `PIN_PWR_CUT` |
+| SD 插入检测 | `CD` | 20 | 13 | `PIN_SD_DETECT` |
+| 电池电压 | 分压节点 | 11 | 35 | ADC1_CH7 |
+
+#### 2.2.3 电源与充电
+
+两路电源，各自负责一件事：
+
+- **3V7**：USB 5V 进来先过 SLM6305（开关充电 + 路径管理），4.7 µH 电感、150 mΩ 采样电阻，
+  同时接电池弹片。电池满电 4.2 V，走 3V7 这一路。
+- **3V3**：ME6217C33M5G（800 mA LDO）把 3V7 降到 3.3 V，给主控供电。
+- **3V3_2**：Q1（AO3401 P-MOS）受 GPIO22 控制，是外设总闸。深睡前拉高 GPIO22 断开这一路，
+  把屏、卡、触摸一起断电，只剩主控，静态功耗降到毫瓦级。
+
+电池电压用 20 kΩ / 10 kΩ 分压进 GPIO35，100 nF 滤一下，软件查表换算成电压和百分比；
+充电状态由 GPIO39 读 SLM6305 的 `NCHRG`。
+
+#### 2.2.4 屏幕与触摸
+
+屏幕和触摸用一个 15 针 FPC（0.3 mm 间距）
+
+- 屏：JD9853，172 × 320，4 线 SPI 写命令和像素，背光走 GPIO4 的 PWM
+  （Q3 三极管低边驱动），复位脉冲由 bootloader 钩子在开机最早期打完
+- 触摸：CST816，I²C 地址 0x15，INT 接 GPIO33 做下降沿中断，软件不用轮询
+
+#### 2.2.5 存储与按键
+
+- MicroSD 走 1 线 SDIO，卡座 503398-1892，`CD` 脚接 GPIO13 做插入检测（高 = 未插入）
+- 三颗 TS24CA 轻触开关接 GPIO36 / 37 / 38，各带 10 kΩ 下拉，按下为高电平
+
+固件里这三个键分工如下：
+
+| 键 | 音乐模式 | 小说模式 | 设置页 |
+| --- | --- | --- | --- |
+| 音量 +（36） | 音量 +1 档 | 亮度 +8 | 忽略 |
+| 音量 −（38） | 音量 −1 档 | 亮度 −8 | 忽略 |
+| 电源（37） | 短按息屏/亮屏，长按 0.8 s 进主菜单 | 同左 | 同左 |
+
+音量键 10 ms 轮询一次，点一下走一档；按住超过 600 ms 后每 150 ms 连发，调大范围不用一直点。
+
+#### 2.2.6 USB
+
+Type-C 16P 母座，CC1 / CC2 各 5.1 kΩ 下拉，只认 5 V 输入。
+USB 的 D+ / D- 只接到 CH343P，不进 ESP32 —— 它只是串口，不是 USB 设备。
+DTR / RTS 两根控制线经 1 kΩ 分别驱动 GPIO0 和 EN，一根线就能烧录。
+
+#### 2.2.7 PCB
+
+板子外形就是外壳内腔的形状，一头圆角大、一头收窄：MicroSD 卡座和 Type-C 开在同一侧边缘，
+屏 FPC 座在对侧，天线留净空区。
+
+<p align="center">
+  <img src="docs/images/hw-pcb-3d-top.png" width="210" alt="PCB 3D 顶面" />
+  <img src="docs/images/hw-pcb-3d-bot.png" width="215" alt="PCB 3D 底面" />
+</p>
+<p align="center"><sub>图 8　PCB 3D：顶层（左）与底层（右），丝印上留了仓库地址</sub></p>
+
+<p align="center">
+  <img src="docs/images/hw-pcb-real-top.jpg" width="420" alt="实物正面" />
+  <img src="docs/images/hw-pcb-real-bot.jpg" width="420" alt="实物背面" />
+</p>
+<p align="center"><sub>图 9　实物：正面是按键与屏座，背面是 ESP32、TF 卡座和 Type-C</sub></p>
+
+### 2.3 软件设计
+
+固件基于 ESP-IDF 5.5.5 + FreeRTOS + LVGL 8.3。解码和蓝牙在 core 0，界面、扫描、封面在 core 1；
+但两者不是一条单向流水线——界面下发命令，解码回传状态，耳机上的按键绕一圈又驱动界面：
+
+```mermaid
+flowchart LR
+  SD[(MicroSD)]
+  IDX[(内存索引)]
+  UI["LVGL<br/>core 1"]
+  DEC["audio 解码<br/>core 0"]
+  BT["bt_a2dp<br/>core 0"]
+  COV["cover<br/>core 1"]
+
+  SD -->|挂载后扫描| IDX
+  IDX -->|用户选 / 历史 / 自动| UI
+  SD -->|按路径打开| DEC
+
+  UI -->|"命令队列 PLAY / PAUSE / SEEK"| DEC
+  DEC -->|"应答队列 播放完 / 文件不存在"| UI
+  DEC -.->|"g_song_info 快照 标题 · 时长 · elapsed_ms"| UI
+  DEC -->|PCM 流| BT
+  DEC -->|内嵌 JPEG| COV
+  COV -->|100×100 封面| UI
+
+  UI -->|"扫描 / 连接 / 断开"| BT
+  BT -->|"连接状态 / 耳机按键"| UI
+```
+
+| 任务 | 核 | 栈 | 职责 |
+| --- | :---: | ---: | --- |
+| `audio` | 0 | 4 KB | 打开文件、解码、重采样、推流 |
+| `bt_a2dp` | 0 | 4 KB | A2DP / AVRCP、设备扫描与连接 |
+| `lvgl` | 1 | 6 KB | 界面、触摸、歌词滚动 |
+| `cover` | 1 | PSRAM | 把内嵌 JPEG 在 RAM 里解成 100×100 |
+| `sys_monitor` | 1 | 5 KB | SD 挂载与扫描、电池电压、CPU 温度 |
+| `sys_serial` | 1 | 3 KB | 串口控制台 |
+| `wifi` | 1 | — | 只在升级时创建，用完销毁 |
+
+任务之间只有四种通道：
+
+- **命令队列**（UI → 解码）：`PLAY` 带文件路径、`PAUSE`、`SEEK`（千分比，不是字节偏移）、
+  `BT_CONNECTED` / `BT_DISCONNECTED`
+- **应答队列**（解码 → UI）：`SONG_FINISHED`、`FILE_NOT_FOUND`、`BT_CHECK`
+- **全局快照**（解码 → UI）：`g_song_info` 里有标题、格式、采样率、总时长和 `elapsed_ms`，
+  还带一个 `path_hash` 让界面认领"这是哪首歌"；`song_info_snapshot()` 一次拷贝防撕裂
+- **事件队列**（蓝牙和界面之间双向）：搜索到设备、连接、断开、耳机上的播放暂停与上下曲；
+  断开时界面再给解码补一条 `BT_DISCONNECTED` 停推
+
+core 0 那条链要连续喂数据，慢一拍耳机就断音；core 1 上卡一下只是掉帧。所以界面再忙也不会
+把解码饿着，反过来也不会有解码抢走了 CPU 导致界面卡死这一说。
+
+**启动流程**（`main.c`）
+
+`app_main()` 里是一条直线，各任务由对应的 `*_init()` 在内部创建：
+
+1. **bootloader**：拉外设电源、放 LCD 复位脉冲，见 2.2 那个钩子
+2. **`power_mgr_early_init()` + `lcd_init_early()`**：外设上电、SPI 总线、面板 SLPOUT，只做前半段，
+   剩下的 120 ms 留给后面几步去填
+3. **`power_batt_boot_check()`**：ADC 三次采样求平均，低于 3.35 V 就显示低电量图两秒后深睡，不再往下走
+4. **`nvs_flash_init()` → `font_part_init()`**：字库分区 mmap 进 DROM，必须早于任何文字绘制
+5. **`app_mode_read_saved()`**：只认音乐 / 小说，决定这次建哪一组界面
+6. **三个队列**：app 10 / audio 10 / rsp 5
+7. **六个 `*_init()`**：见下表，每个都顺手建一个任务
+8. **上次停在小说模式**：音频 / 封面 / 蓝牙任务先挂起，把 core 1 让出来
+9. **`ota_init()`**：刚升级上来的固件开 15 秒校验窗口，走完才 `mark_valid`
+10. **`vTaskSuspend(NULL)`**：入口任务退场，之后只剩各任务在跑
+
+| init | 起的任务 | 起来后先干什么 |
+| --- | --- | --- |
+| `bt_a2dp_init()` | `bt_a2dp`（core 0） | 按控制器 → Bluedroid host → profile 三段把栈拉起来，然后等命令 |
+| `console_init()` | `sys_serial`（core 1） | 读 UART，解析成 app 命令投进队列 |
+| `ui_core_init()` | `lvgl`（core 1） | 恢复音量/亮度 → 显示与触摸 → 建界面 → 队列集 → `lcd_init_finish()` |
+| `audio_task_init()` | `audio`（core 0） | 建解码器和重采样，然后阻塞在命令队列上 |
+| `sys_monitor_init()` | `sys_monitor`（core 1） | 等 150 ms，读 SD 检测脚，卡已插就挂载并扫描 |
+| `cover_init()` | `cover`（core 1，栈在 PSRAM） | 等解码器把内嵌 JPEG 递过来 |
+
+`lvgl` 任务的开场在 `ui_loop.c` 里，顺序有讲究：`ui_core_display_init()` → `ui_shell_init()` →
+`bt_list_init()` → `app_mode_init()`（按启动模式只建一组界面）→ 创建队列集 → `lcd_init_finish()`
+（这时距 SLPOUT 正好过了 120 ms）→ 先跑一帧 → `autosleep_init()` → `power_mgr_init()`（背光渐入）。
+文件浏览器不在启动时一次建完，改成主循环里每轮最多 10 ms 分片建，卡顿被 300 ms 的背光渐入盖住。
+
+**模式切换**（`app_mode.c`）
+
+所有切换都从 `app_mode_request()` 进：同一模式直接返回，切换中防重入。真正的切换发生在
+`power_mgr_mode_transition()` 给的过渡窗口里——先关触摸，能跑光圈动画就跑，跑不动就淡背光到黑再切。
+
+| 模式 | 退出时 | 进入时 |
+| --- | --- | --- |
+| 音乐 | 停播 → 等解码器放开 SD（最多 300 ms）→ 挂起音频/封面/蓝牙 → 销毁播放器界面 | 恢复三个任务 → 切回音乐库 → 重建界面 → 载入上次那首（不自动播） |
+| 小说 | 只销毁阅读界面 | 切到小说库 → 建阅读界面 |
+| 设置 | 只删页面，它不持有音频资源 | 白底列表 |
+| 菜单 | 删菜单 | 建三图标 |
+
+两个细节：
+
+- **只有音乐和小说写 NVS**。停在菜单时断电，下次开机仍然回到上一首所在的模式
+- **过渡方式分两种**：涉及设置页就只淡背光。设置页是整屏大白底，黑白交界最长，任何带写入都会在
+  交界处留一道亮度台阶，看起来像"一根灰线在 Y 上乱跳"；菜单/音乐/小说底色本来就是黑的，
+  接缝看不出来，就走光圈缩放
+
+**SD 卡只有三处会碰，全都过同一把锁**
+
+- **音乐界面一次盘都不读**：列表、封面、歌词全走内存索引 `g_fs_cache`；封面由 `audio` 从解码器里
+  取出内嵌 JPEG 交给 `cover` 任务，后者用 `JPEG_openRAM()` 在内存里解，也不碰 SD
+- 真正读盘的是三处：`sys_monitor`（扫描 / 挂载 / 卸载）、`audio`（`fopen` / `fread` / `fseek` / `fclose`）、
+  以及**小说阅读器**——它是唯一在 UI 线程里读盘的例外，翻页时持锁读 1 KB
+- 拔卡是一条确定的时序：`g_sd_ready = false` 让解码器自己关文件 → 每 10 ms 试锁确认没有在途
+  FATFS 调用（最多等 3 s）→ 拿到锁才 `esp_vfs_fat_sdcard_unmount()`，否则会触发卷锁断言
+- 扫描完**不**立刻回读索引文件：刚写完马上读会偶发校验失败（音乐/小说只坏一个），直接用内存那份
+
+四处值得一看的地方，注释里都写了"为什么"：
+
+- **开机在 bootloader 里就把屏点亮** —— `bootloader_components/lcd_boot_hooks/` 编进 bootloader，
+  直接用寄存器拉外设电源、打复位脉冲，省掉 app 起来后再等 120 ms 的 LCD 稳定时间；
+  顺带清掉 RTC 域的 pad hold，否则从深睡唤醒会黑屏
+- **下载时把屏的绘制缓冲借给 WiFi** —— WiFi 起来要 ~27 KB 内部 RAM，`wifi_arena.c` 把 LVGL
+  让出的那块静态缓冲用 `multi_heap_register()` 注册成 WiFi 私有堆，换掉 `wifi_osi_funcs_t`
+  里的分配函数，下载完再整块还回 LVGL
+- **睡眠是一条只能往下走的梯子** —— 息屏 / 浅睡 / 深睡收敛成 4 个事件 + 一张十几行的决策表，
+  "要不要看蓝牙、要不要浅睡"全工程只有这一处判断
+- **全整数定点** —— ESP32 没有 FPU，解码与重采样都是纯整数实现，整套流程大约 15% CPU
+
+Flash 分区（8 MB，OTA 双槽）：
+
+```
+nvs       0x009000  144 KB
+phy_init  0x02D000    4 KB
+otadata   0x02E000    8 KB
+ota_0     0x030000  2.875 MB   app 槽
+ota_1     0x310000  2.875 MB   app 槽
+font      0x5F0000  2.0625 MB  字库（只在线烧写时写入）
+```
+
+小分区终点正好落在 `0x30000`，对齐空洞为 0，8 MB 一字节不剩。
+
+## 03 / 复刻
+
+### 3.1 物料
+
+BOM、坐标文件、原理图与 PCB 都在立创工程里
+**[oshwhub.com/coconet/project_bxhxmpkd](https://oshwhub.com/coconet/project_bxhxmpkd)**，复刻成本约 ¥50。
+
+除板子外还需要：1.47 寸 172×320 的 JD9853 屏（带 CST816 触摸，15P FPC）、
+P25Q64SH 或同容量 SPI Flash、滑块电池与外壳（三个 STEP 文件）、
+电池充电弹片座（1.27 mm 2P）和对应的公座（2.95H）。
+
+### 3.2 打样与焊接
+
+嘉立创打样：4 层板，厚 1 mm。
+焊电池充电弹片的公座时位置要对准，偏了会让电池接触不良。
+
+### 3.3 烧录
+
+| 方式 | 适用场景 | 怎么做 |
+| --- | --- | --- |
+| 网页一键烧录 | 第一次玩，不想装环境 | 打开[在线烧录](https://coconute.dpdns.org/flash/)，Chrome / Edge 加一根 USB 线，约 12 分钟 |
+| 线烧全量 | 换分区表、芯片全空 | `tools\flash_step.ps1 once` |
+| 本地构建 | 想改代码 | ESP-IDF 5.5.5，`idf.py build` |
+
+需要 **ESP-IDF 5.5.5**，必须这个版本：WiFi 协议栈是随 IDF 发布的预编译库，
+表布局与版本绑定，本工程还整表替换了分配器并 `--wrap=free`。
+
+仓库里另有 `build.ps1`（过滤噪声的构建包装）与 `mem-analyze.ps1`（ELF 内存占用分析），详见 [BUILD.md](BUILD.md)。
+
+## 04 / 更新
+
+| 时间 | 版本 | 内容 |
+| --- | --- | --- |
+| 2026.09 | 0.1 | 蓝牙 A2DP 出声，屏幕点亮，三任务架构 |
+| 2026.09 | 0.4 | MP3 / FLAC 解码，文件浏览器，封面 |
+| 2026.09 末 | 0.6 | 三图标主菜单、设置页、小说阅读 |
+| 2026.10 | 0.7.3 ~ 0.7.9 | 歌词、字库分区、OTA 双槽、WiFi 升级 |
+| 2026.11 | 0.7.12 ~ 0.7.14 | 自动休眠、自动熄屏、浅睡三级梯 |
+| 2026.11 | 0.8.x | 自建 OTA 服务器，10 块压缩下载 |
+
+逐版本的详细记录（改了什么、为什么这么改、踩了哪些坑）在 **[docs/CHANGELOG_zh.md](docs/CHANGELOG_zh.md)**。
+
+## 05 / 链接
+
+| 资料 | 说明 |
+| --- | --- |
+| [docs/CHANGELOG_zh.md](docs/CHANGELOG_zh.md) | 逐版本开发记录 |
+| [docs/OTA_TEST_zh.md](docs/OTA_TEST_zh.md) | OTA 协议、实测数据与踩过的坑 |
+| [BUILD.md](BUILD.md) | 构建脚本与内存分析 |
+| [docs/STATS_zh.md](docs/STATS_zh.md) | 代码量统计 |
+| [THIRD_PARTY.md](THIRD_PARTY.md) | 第三方组件与各自许可证 |
+| [ESP-IDF](https://github.com/espressif/esp-idf) | 5.5.5 |
+| [LVGL](https://github.com/lvgl/lvgl) | 8.3 |
+| [立创开源工程](https://oshwhub.com/coconet/project_bxhxmpkd) | 原理图 / PCB / BOM / STEP |
+
+---
+
+<div align="center"><sub>
+
+**软件** MIT © coconut-E 　·　 **硬件**（立创工程）GPL-3.0
+
+</sub></div>

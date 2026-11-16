@@ -3,8 +3,7 @@
 > 现状：**协议 v0，不保留任何兼容层**。这个项目还没有已发布的旧设备，所以接口
 > 可以随时改，改了固件和服务器两边一起跟。
 >
-> 服务器端代码**不在本仓库**（见下面「仓库边界」），本文件只记录固件侧的行为、
-> 接口形状和实测数据。
+> 服务器端代码不在本仓库，本文件只记录固件侧的行为、接口形状和实测数据。
 
 ---
 
@@ -69,22 +68,7 @@ GET https://coconute.dpdns.org/ota/v1/manifest.json?channel=stable&device=<MAC>
 ESP32 ROM 里那份 miniz 只有 `TINFL_FLAG_PARSE_ZLIB_HEADER`，没有 gzip 头支持。
 文件名虽然叫 `c0.gz`，内容其实是 zlib。
 
-## 4. 仓库边界
-
-**服务器侧的东西不在本仓库**，包括：
-
-| 移走的东西 | 现在在哪 |
-|---|---|
-| `ota_server.py`（清单 + 分块 + 下载） | `D:\mi cc 9e\server\ota\` |
-| `build_release.py`（发布脚本） | 同上 |
-| `ota_cert.ps1`、`tools/ota_cert/`（含 `ca.key`、`server.key`） | 同上（`certs/`） |
-
-**留在仓库里的只有** `main/certs/ota_ca.pem`：ISRG Root X1 + X2 两张公共根证书，
-是固件的构建依赖，纯公钥，公开安全。
-
-`.gitignore` 里有 `*.key` / `*.p12` / `secrets/` / `.env` 兜底，防止以后误提交。
-
-## 5. 发布一版
+## 4. 发布一版
 
 ```powershell
 # PC: 编出 build/music_nano.bin, 推给手机
@@ -100,7 +84,7 @@ python build_release.py /data/local/tmp/fw.bin --version 0.8.7 --channel stable
 
 ⚠️ `--notes` 里不要带空格：通过 `adb shell` / `ssh` 传参时引号容易被吃掉。
 
-## 6. 实测数据
+## 5. 实测数据
 
 | 场景 | 传输量 | 耗时 | 备注 |
 |---|---|---|---|
@@ -110,7 +94,7 @@ python build_release.py /data/local/tmp/fw.bin --version 0.8.7 --channel stable
 | **10 块 zlib（0.8.6）** | **1.48 MB** | **372 s** | 10 块零重试，全程没有 20 秒超时 |
 | 10 块 zlib（0.8.7，下午） | 1.48 MB | 首块 230 s 超时 → 重试后跑完 | 重试机制第一次真正生效 |
 
-## 7. 踩过的坑
+## 6. 踩过的坑
 
 1. **`tinfl_decompress_mem_to_mem()` 不能用**
    它把 `tinfl_decompressor`（带 32 KB 字典窗口）放在**栈**上，8 KB 的 wifi
@@ -134,7 +118,7 @@ python build_release.py /data/local/tmp/fw.bin --version 0.8.7 --channel stable
    低速 TCP 流每秒只有两三个包，丢一个就要等 RTO（1s→2s→4s…），恢复比快流慢。
    实测 10 KB/s 限速下设备只有 0.4 KB/s，不限制反而有 5~6 KB/s。
 
-## 8. 排查
+## 7. 排查
 
 设备串口看这几行就够判断卡在哪：
 
@@ -150,7 +134,7 @@ python build_release.py /data/local/tmp/fw.bin --version 0.8.7 --channel stable
 `esp_ota_set_boot_partition` 只在最后一步调用，中途任何失败都不会动 otadata，
 设备照常跑原固件。
 
-## 9. 历史
+## 8. 历史
 
 本文原先记录的是 0.7.x 时代的 GitHub Releases + gh-proxy 方案（分区布局、字库
 拆分区、证书 pin、`ota server` 串口命令）。那套东西在 0.8.7 全部移除：
